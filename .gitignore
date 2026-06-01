@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+.venv*
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database (runtime data, not source)
+diffdynamic.db
+diffdynamic.db-shm
+diffdynamic.db-wal
+
+# Server runtime config (generated at runtime)
+server/server_config.json
+
+# Large data files (download separately)
+DiffDynamic/data/
+DiffDynamic/outputs/
+DiffDynamic/pretrained_models/
+DiffDynamic/docktmp/
+DiffDynamic/configs/prop/
+DiffDynamic/configs/backups/
+
+# LMDB databases (generated at runtime)
+*.lmdb
+*.lmdb-lock
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# SDF molecule files
+*.sdf
+
+# Excel/CSV data exports
+*.xlsx
+*.csv
+
+# Pickle data files
+*.pkl
+*.pkl.gz
+
+# Logs
+*.log
+
+# Data file formats
+*.npy
+*.npz
+*.lmdb
+*.lmdb-lock
+*.h5
+*.hdf5
+
+# Large data directories
+DiffDynamic/configs/分析文件/
+
+# Claude Code
+.claude/
+CLAUDE.md
