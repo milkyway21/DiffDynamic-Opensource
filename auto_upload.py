@@ -55,13 +55,16 @@ def get_files_to_add():
     """获取需要添加的文件列表"""
     files_to_add = []
 
-    # 需要排除的目录
+    # 需要排除的目录（精确匹配）
     exclude_dirs = {
-        ".git", "__pycache__", "node_modules", ".venv", "venv",
+        ".git", "__pycache__", "node_modules", "venv",
         "data", "outputs", "pretrained_models", "docktmp", "batchsummary",
         "third_party", "targetdiff-main", "backups", ".mypy_cache",
-        ".pytest_cache", "dist", "build", "*.egg-info",
+        ".pytest_cache", "dist", "build",
     }
+
+    # 需要排除的目录前缀（匹配 .venv, .venv_ifit_test 等）
+    exclude_prefixes = (".venv",)
 
     # 需要排除的文件扩展名
     exclude_extensions = {".xlsx", ".xls", ".pyc", ".pyo", ".pyd", ".pt", ".pth", ".ckpt"}
@@ -69,15 +72,18 @@ def get_files_to_add():
     # 允许上传的扩展名
     allowed_extensions = {".py", ".md", ".yml", ".yaml", ".sh", ".txt", ".json", ".toml", ".cfg", ".ini"}
 
+    def is_excluded(d):
+        return d in exclude_dirs or d.startswith(exclude_prefixes)
+
     for root, dirs, files in os.walk(REPO_DIR):
         # 排除不需要的目录
-        dirs[:] = [d for d in dirs if d not in exclude_dirs]
+        dirs[:] = [d for d in dirs if not is_excluded(d)]
 
         root_path = Path(root)
         # 跳过排除的目录（只检查相对于 REPO_DIR 的子目录）
         try:
             rel = root_path.relative_to(REPO_DIR)
-            if any(part in exclude_dirs for part in rel.parts):
+            if any(is_excluded(part) for part in rel.parts):
                 continue
         except ValueError:
             continue
