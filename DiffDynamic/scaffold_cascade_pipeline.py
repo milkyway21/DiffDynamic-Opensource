@@ -55,12 +55,12 @@ def write_patched_config(base_config, out_path, scaffold_num_samples, seed, extr
 
     grow_cfg = cfg["sample"]["scaffold"].get("grow", {})
     grow_cfg["num_samples"] = scaffold_num_samples
-    grow_cfg.setdefault("start_t", 450)
+    grow_cfg.setdefault("start_t", 357)
     grow_cfg.setdefault("stride", 15)
-    grow_cfg.setdefault("step_size", 0.33)
-    grow_cfg.setdefault("lambda_coeff_a", 40)
-    grow_cfg.setdefault("lambda_coeff_b", 5)
-    grow_cfg.setdefault("n_extra_mode", "prior_minus_scaffold")
+    grow_cfg.setdefault("step_size", 0.3262)
+    grow_cfg.setdefault("lambda_coeff_a", 47)
+    grow_cfg.setdefault("lambda_coeff_b", 11)
+    grow_cfg.setdefault("n_extra_mode", "pocket_prior")
     grow_cfg.setdefault("n_extra_fixed", 8)
     grow_cfg.setdefault("n_extra_min", 3)
     grow_cfg.setdefault("n_extra_max", 20)

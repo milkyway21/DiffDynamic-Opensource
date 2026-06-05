@@ -42,33 +42,6 @@ sample:
       sa_weight: 1
     prudent:
       enable: false
-      n_sampling: 20
-      segment_evolution_mode: true
-      checkpoint_frame: 24
-      total_frames: 24
-      max_checkpoint_rounds: 1
-      advance_top_k: 5
-      vina_weight: 0.5
-      qed_weight: 0.15
-      sa_weight: 0.15
-      lipinski_weight: 0.1
-      lilly_demerit_weight: 0.1
-      vina_exhaustiveness: 1
-      log_per_chain_scores: true
-      advance_top_k_mode: cap
-      continue_when_no_advance: true
-      fallback_keep_top_k: 1
-      min_qed_for_docking: 0
-      min_sa_for_docking: 0
-      max_vina_affinity_for_advance: null
-      winner_select_by_composite: true
-      save_checkpoint_every_segment: true
-      segment_checkpoint_subdirectory: null
-      save_segment_breakpoint_pt: false
-      save_segment_generation_pool_pt: true
-      segment_generation_pt_seeds: first
-      async_vina_max_workers: 2
-      protein_root: null
     refine:
       n_sampling: 1
       cycles: 1
@@ -86,45 +59,13 @@ sample:
       max_grad_fusion_iterations: 15
   optimization:
     enable: false
-    after_dynamic: true
-    molecule_path: null
-    num_samples: 2
-    keep_original: true
-    start_t: 16
-    stride: 2
-    step_size: 0.2
-    noise_scale: 0
-    schedule: linear
-    cycles: 5
-    use_with_noise: true
-    use_adaptive_step: true
-    use_time_scale: false
-    lambda_coeff_a: 1
-    lambda_coeff_b: 1
-    pos_clip: null
-    v_clip: null
-    selector:
-      enable_filter: true
-      filter_incomplete: true
-      max_survivors_per_cycle: 10
-      max_survivors_total: 300
-      min_qed: 0.3
-      min_sa: 0.3
-      qed_weight: 1
-      sa_weight: 1
-    mask_repaint:
-      enable: false
-    property_guidance:
-      enable: false
   scaffold:
-    enable: false
+    enable: true
     mode: grow
     after_dynamic: false
     save_dynamic_before_scaffold: true
     optimization_style_naming: true
     scaffold_source: auto_murcko
-    scaffold_atom_indices: null
-    scaffold_smarts: null
     fix_scaffold_pos: true
     fix_scaffold_type: true
     schedule: lambda
@@ -144,17 +85,6 @@ sample:
       max_tanimoto: 0.9
       fingerprint_radius: 2
       fingerprint_nbits: 2048
-    evolve:
-      population_size: 50
-      n_generations: 5
-      children_per_parent: 10
-      start_t_high: 200
-      start_t_low: 30
-      noise_anneal: true
-      stride: 2
-      step_size: 0.2
-      lambda_coeff_a: 10
-      lambda_coeff_b: 1
     grow:
       n_extra_mode: pocket_prior
       n_extra_fixed: 8
@@ -162,20 +92,17 @@ sample:
       n_extra_max: 20
       n_extra_min_clamp: 1
       n_extra_max_clamp: 45
-      num_samples: 200
-      start_t: 357
+      num_samples: 5
+      start_t: 416
       stride: 15
-      step_size: 0.3262
-      lambda_coeff_a: 47
-      lambda_coeff_b: 11
+      step_size: 0.23562275268038252
+      lambda_coeff_a: 33
+      lambda_coeff_b: 13
       min_qed: 0.2
       min_sa: 0.2
       filter_incomplete: false
   targetdiff_baseline_refine:
     enable: false
-    start_t: 9
-    run_every_prudent_round: true
-    refine_batch_size: null
   pre_docking:
     etkdg_reembed: false
     mmff_minimize: false
@@ -183,7 +110,3 @@ sample:
     use_uff_fallback: false
   step_trajectory_save:
     enable: false
-    output_dir: ./diffway
-    bond_threshold: 500
-    merge_pymol_sdf: true
-    merge_sdf_filename: trajectory_pymol.sdf

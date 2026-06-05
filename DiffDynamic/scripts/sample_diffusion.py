@@ -6026,7 +6026,7 @@ def _sample_n_extra_atoms(
     Returns:
         n_extra: 要新生成的原子数（>= 1）。
     """
-    mode = grow_cfg.get('n_extra_mode', 'prior_minus_scaffold')
+    mode = grow_cfg.get('n_extra_mode', 'pocket_prior')
     min_clamp = int(grow_cfg.get('n_extra_min_clamp', 1))
     max_clamp = int(grow_cfg.get('n_extra_max_clamp', 40))
 
@@ -6333,18 +6333,18 @@ def scaffold_grow_molecule(
 
     # ---- 生成参数 ------------------------------------------------------------
     num_samples = int(grow_cfg.get('num_samples', 10))
-    start_t = int(np.clip(grow_cfg.get('start_t', 950), 1, model.num_timesteps - 1))
+    start_t = int(np.clip(grow_cfg.get('start_t', 357), 1, model.num_timesteps - 1))
     stride = int(grow_cfg.get('stride', 15))
-    step_size = float(grow_cfg.get('step_size', 0.33))
-    schedule = grow_cfg.get('schedule', 'linear')
+    step_size = float(grow_cfg.get('step_size', 0.3262))
+    schedule = grow_cfg.get('schedule', 'lambda')
     use_with_noise = bool(grow_cfg.get('use_with_noise', True))
     use_adaptive_step = bool(grow_cfg.get('use_adaptive_step', True))
     use_time_scale = bool(grow_cfg.get('use_time_scale', False))
 
     # ---- 构建反扩散时间索引 --------------------------------------------------
     if schedule == 'lambda':
-        lambda_a = float(grow_cfg.get('lambda_coeff_a', 40.0))
-        lambda_b = float(grow_cfg.get('lambda_coeff_b', 5.0))
+        lambda_a = float(grow_cfg.get('lambda_coeff_a', 47.0))
+        lambda_b = float(grow_cfg.get('lambda_coeff_b', 11.0))
         time_indices = model._build_lambda_schedule(
             start_t=start_t, end_t=0, coeff_a=lambda_a, coeff_b=lambda_b
         )

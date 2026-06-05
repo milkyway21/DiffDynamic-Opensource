@@ -34,11 +34,11 @@ def get_round_configs():
     generation strategies. Returns list of (name, grow_params) tuples.
     """
     configs = [
-        # Round 1: Baseline — default scaffold grow params
+        # Round 1: Baseline — Bayesian-optimized scaffold grow params
         ("baseline", {
-            "start_t": 450, "stride": 15, "step_size": 0.33,
-            "lambda_coeff_a": 40, "lambda_coeff_b": 5,
-            "n_extra_mode": "prior_minus_scaffold",
+            "start_t": 357, "stride": 15, "step_size": 0.3262,
+            "lambda_coeff_a": 47, "lambda_coeff_b": 11,
+            "n_extra_mode": "pocket_prior",
         }),
         # Round 2: Lower start_t — start denoising earlier
         ("low_start_t", {

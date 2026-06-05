@@ -874,6 +874,88 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False):
         return None, error_info
 
 
+def dock_reference_ligand(ligand_sdf_path, protein_path, exhaustiveness=8, vina_timeout=20):
+    """Dock the reference ligand with Vina score_only to get baseline affinity.
+
+    Returns:
+        float or None: Vina score_only affinity (kcal/mol), None if failed.
+    """
+    try:
+        from vina import Vina
+        supplier = Chem.SDMolSupplier(str(ligand_sdf_path), sanitize=False)
+        ref_mol = supplier[0] if supplier and len(supplier) > 0 else None
+        if ref_mol is None:
+            print(f"  ⚠️  参考配体加载失败: {ligand_sdf_path}")
+            return None
+
+        # Write temp SDF for Vina
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.sdf', delete=False) as tmp:
+            tmp_path = tmp.name
+            w = Chem.SDWriter(tmp_path)
+            w.write(ref_mol)
+            w.close()
+
+        # Convert to PDBQT
+        tmp_pdbqt = tmp_path.replace('.sdf', '.pdbqt')
+        try:
+            from meeko import MoleculePreparation
+            preparator = MoleculePreparation()
+            mol_setups = preparator.prepare(ref_mol)
+            with open(tmp_pdbqt, 'w') as f:
+                for setup in mol_setups:
+                    f.write(setup.make_pdbqt_string())
+        except ImportError:
+            # Fallback: use obabel
+            import subprocess as sp
+            sp.run(['obabel', tmp_path, '-opdbqt', '-O', tmp_pdbqt, '--gen3d'],
+                   capture_output=True, timeout=30)
+
+        if not os.path.exists(tmp_pdbqt):
+            print(f"  ⚠️  参考配体 PDBQT 转换失败")
+            os.unlink(tmp_path)
+            return None
+
+        # Run Vina score_only
+        vina = Vina(sf_type='vina')
+        vina.set_receptor(str(protein_path))
+        vina.set_ligand_from_file(tmp_pdbqt)
+
+        # Use reference ligand center for search box
+        conf = ref_mol.GetConformer()
+        coords = [list(conf.GetAtomPosition(i)) for i in range(ref_mol.GetNumAtoms())]
+        center = [np.mean([c[0] for c in coords]),
+                  np.mean([c[1] for c in coords]),
+                  np.mean([c[2] for c in coords])]
+        box_size = [30, 30, 30]
+        vina.compute_vina_maps(center=center, box_size=box_size)
+
+        import signal
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("Vina score_only timeout")
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(vina_timeout)
+        try:
+            vina.score_only(exhaustiveness=exhaustiveness)
+            energy = vina.energies()[0][0]
+        except TimeoutError:
+            print(f"  ⚠️  参考配体 Vina score_only 超时 ({vina_timeout}s)")
+            energy = None
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+        # Cleanup
+        os.unlink(tmp_path)
+        if os.path.exists(tmp_pdbqt):
+            os.unlink(tmp_pdbqt)
+
+        return energy
+    except Exception as e:
+        print(f"  ⚠️  参考配体对接失败: {e}")
+        return None
+
+
 def evaluate_single_molecule(mol, ligand_filename, protein_root,
                             exhaustiveness=8, n_poses=1, size_factor=1.0, buffer=5.0,
                             debug=False, tmp_dir=None, protein_path=None,
@@ -1829,7 +1911,7 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                      receptor_pdb=None, index_pkl=None, data_id_override=None,
                      benchmark_ligands_csv=None, reference_ligand_rel=None,
                      vina_modes=None, save_distribution_plots=True,
-                     remove_fragments=False):
+                     remove_fragments=True):
     """
     评估整个.pt文件
     
@@ -2198,7 +2280,38 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
     if save_sdf:
         print(f"保存SDF: 是")
     print(f"{'='*70}\n")
-    
+
+    # 2.5 对接参考配体（获取 baseline Vina 分数用于对比）
+    ref_vina_score = None
+    ref_ligand_sdf_path = None
+    if ligand_filename and str(ligand_filename).strip() not in ('', 'N/A', 'n/a'):
+        candidate_paths = []
+        lf = Path(ligand_filename)
+        if lf.is_absolute() and lf.exists():
+            candidate_paths.append(str(lf))
+        else:
+            candidate_paths.append(str(Path(protein_root) / ligand_filename))
+            # Also try resolved_protein_path's sibling
+            if resolved_protein_path:
+                rp = Path(resolved_protein_path)
+                sibling = rp.parent / Path(ligand_filename).name
+                if sibling.exists():
+                    candidate_paths.append(str(sibling))
+        for cp in candidate_paths:
+            if os.path.exists(cp):
+                ref_ligand_sdf_path = cp
+                break
+    if ref_ligand_sdf_path and resolved_protein_path and 'score_only' in _vina_modes:
+        print(f"对接参考配体: {ref_ligand_sdf_path}")
+        ref_vina_score = dock_reference_ligand(
+            ref_ligand_sdf_path, resolved_protein_path,
+            exhaustiveness=exhaustiveness, vina_timeout=20
+        )
+        if ref_vina_score is not None:
+            print(f"参考配体 Vina score_only: {ref_vina_score:.3f} kcal/mol")
+        else:
+            print(f"参考配体对接失败，跳过对比")
+
     # 3. 重建和评估
     results = []
     n_reconstruct_success = 0
@@ -2547,8 +2660,10 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
             # 优先使用预处理后的分子（MMFF/ETKDG 优化后键长合理化），否则使用原始重建分子
             mol_to_save = eval_result.get('mol') or mol
             # 不保存 comprehensive_score=0 的分子（通常表示评估失败，与 selector 筛选一致）
+            # 但当 Vina 未运行时（score=0 且无 Vina 数据），仍保存分子
             comp_score = eval_result.get('comprehensive_score')
-            skip_save_low_score = (comp_score is not None and comp_score <= 0)
+            _has_vina = bool(eval_result.get('vina_dock') or eval_result.get('vina_score_only') is not None or eval_result.get('vina_minimize') is not None)
+            skip_save_low_score = (comp_score is not None and comp_score <= 0 and _has_vina)
             # 根据模式选择保存目录：分存原分子/优化变体 或 统一 reconstructed_molecules
             target_sdf_dir = None
             if save_sdf and mol_to_save is not None and not skip_save_low_score:
@@ -2883,7 +2998,36 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
             print(f"最小值 (Min):   {np.min(vina_minimize_scores):>8.3f} kcal/mol")
             print(f"最大值 (Max):   {np.max(vina_minimize_scores):>8.3f} kcal/mol")
             print(f"{'='*70}")
-    
+
+        # 5.4 参考配体对比统计
+        if ref_vina_score is not None:
+            print(f"\n{'='*70}")
+            print(f"参考配体对比统计（Vina score_only）")
+            print(f"{'='*70}")
+            print(f"参考配体亲和力: {ref_vina_score:.3f} kcal/mol")
+
+            if vina_score_only_scores:
+                n_better_score = sum(1 for s in vina_score_only_scores if s < ref_vina_score)
+                pct_better_score = n_better_score / len(vina_score_only_scores) * 100
+                print(f"Score_only 优于参考: {n_better_score}/{len(vina_score_only_scores)} ({pct_better_score:.1f}%)")
+                print(f"  生成分子均值: {np.mean(vina_score_only_scores):.3f} kcal/mol")
+                print(f"  生成分子最佳: {np.min(vina_score_only_scores):.3f} kcal/mol")
+
+            if vina_dock_scores:
+                n_better_dock = sum(1 for s in vina_dock_scores if s < ref_vina_score)
+                pct_better_dock = n_better_dock / len(vina_dock_scores) * 100
+                print(f"Dock 优于参考: {n_better_dock}/{len(vina_dock_scores)} ({pct_better_dock:.1f}%)")
+                print(f"  生成分子均值: {np.mean(vina_dock_scores):.3f} kcal/mol")
+                print(f"  生成分子最佳: {np.min(vina_dock_scores):.3f} kcal/mol")
+
+            if vina_minimize_scores:
+                n_better_min = sum(1 for s in vina_minimize_scores if s < ref_vina_score)
+                pct_better_min = n_better_min / len(vina_minimize_scores) * 100
+                print(f"Minimize 优于参考: {n_better_min}/{len(vina_minimize_scores)} ({pct_better_min:.1f}%)")
+                print(f"  生成分子均值: {np.mean(vina_minimize_scores):.3f} kcal/mol")
+                print(f"  生成分子最佳: {np.min(vina_minimize_scores):.3f} kcal/mol")
+            print(f"{'='*70}")
+
     # 6. 化学指标统计
     qed_values = []  # 初始化
     sa_values = []   # 初始化
@@ -3280,7 +3424,8 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                 n_reconstruct_success=n_reconstruct_success,
                 n_reconstruct_fail=n_reconstruct_fail,
                 n_eval_success=n_eval_success,
-                failure_stats=failure_stats
+                failure_stats=failure_stats,
+                ref_vina_score=ref_vina_score
             )
             # 8.1 记录完整分子到专用Excel（分初次生成、优化后两个表）
             record_complete_molecules_to_excel(
@@ -3413,7 +3558,7 @@ def record_evaluation_results_to_excel(results, output_dir, pt_file, ligand_file
                                       num_samples=None, n_reconstruct_success=None,
                                       n_reconstruct_fail=None, n_eval_success=None,
                                       failure_stats=None, meta_records=None, pt_mode=None,
-                                      sampling_meta=None):
+                                      sampling_meta=None, ref_vina_score=None):
     """
     将评估结果记录到Excel表格中（与原来的dock_generated_molecules.py格式一致）
     
@@ -3637,7 +3782,29 @@ def record_evaluation_results_to_excel(results, output_dir, pt_file, ligand_file
                         vina_minimize_affinity.max(),
                         vina_minimize_affinity.std(),
                     ])
-                
+
+                # 添加参考配体对比统计
+                if ref_vina_score is not None:
+                    stats_items.extend(['参考配体_Vina_ScoreOnly', '优于参考配体比例_ScoreOnly(%)'])
+                    if len(vina_score_only_affinity) > 0:
+                        n_better = sum(1 for s in vina_score_only_affinity if s < ref_vina_score)
+                        pct = n_better / len(vina_score_only_affinity) * 100
+                        stats_values.extend([ref_vina_score, pct])
+                    else:
+                        stats_values.extend([ref_vina_score, 'N/A'])
+
+                    if len(vina_dock_affinity) > 0:
+                        n_better_d = sum(1 for s in vina_dock_affinity if s < ref_vina_score)
+                        pct_d = n_better_d / len(vina_dock_affinity) * 100
+                        stats_items.extend(['优于参考配体比例_Dock(%)'])
+                        stats_values.extend([pct_d])
+
+                    if len(vina_minimize_affinity) > 0:
+                        n_better_m = sum(1 for s in vina_minimize_affinity if s < ref_vina_score)
+                        pct_m = n_better_m / len(vina_minimize_affinity) * 100
+                        stats_items.extend(['优于参考配体比例_Minimize(%)'])
+                        stats_values.extend([pct_m])
+
                 # 添加化学指标统计
                 stats_items.extend([
                     '平均QED',
@@ -4865,8 +5032,10 @@ def main():
                        help='保存重建成功的分子为SDF文件（默认: True）')
     parser.add_argument('--no_sdf', dest='save_sdf', action='store_false',
                        help='不保存SDF文件')
-    parser.add_argument('--remove-fragments', action='store_true', default=False,
-                       help='对接前去除小碎片，仅保留最大连通片段（默认: 关闭）')
+    parser.add_argument('--remove-fragments', action='store_true', default=True,
+                       help='对接前去除小碎片，仅保留最大连通片段（默认: 开启）')
+    parser.add_argument('--no-remove-fragments', dest='remove_fragments', action='store_false',
+                       help='禁用碎片去除')
     parser.add_argument('--debug', action='store_true',
                        help='启用调试模式（显示详细信息）')
     parser.add_argument('--tmp_dir', type=str, default=None,

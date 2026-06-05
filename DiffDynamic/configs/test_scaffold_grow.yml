@@ -156,18 +156,18 @@ sample:
       lambda_coeff_a: 10
       lambda_coeff_b: 1
     grow:
-      n_extra_mode: prior_minus_scaffold
+      n_extra_mode: pocket_prior
       n_extra_fixed: 8
       n_extra_min: 3
       n_extra_max: 20
       n_extra_min_clamp: 1
       n_extra_max_clamp: 45
       num_samples: 5
-      start_t: 450
+      start_t: 357
       stride: 15
-      step_size: 0.33
-      lambda_coeff_a: 40
-      lambda_coeff_b: 5
+      step_size: 0.3262
+      lambda_coeff_a: 47
+      lambda_coeff_b: 11
       min_qed: 0.2
       min_sa: 0.2
       filter_incomplete: false
