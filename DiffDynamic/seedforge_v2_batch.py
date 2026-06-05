@@ -70,6 +70,90 @@ def run_batch_eval(config_path, strategy_idx, output_root):
     return batch_csv
 
 
+def run_batch_eval_pipeline(config_path, strategy_idx, output_root):
+    """Run sampling + evaluation in PIPELINE mode: evaluate each pocket as soon as its .pt is ready.
+
+    Instead of: sample all 100 → evaluate all 100 (sequential)
+    Does:       sample pocket 0 → eval pocket 0 (while sampling pocket 1, 2, ...)
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    batch_csv = os.path.join(output_root, f"v2_s{strategy_idx:02d}_{timestamp}.csv")
+
+    print(f"\n{'='*70}")
+    print(f"  Strategy {strategy_idx} (PIPELINE mode): {config_path}")
+    print(f"  Output: {batch_csv}")
+    print(f"{'='*70}")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = SCRIPT_DIR
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # Step 1: Sample all pockets (this is already parallel across 6 GPUs)
+    sample_cmd = [
+        sys.executable, os.path.join(SCRIPT_DIR, "batch_sampleandeval_parallel.py"),
+        "--start", "0", "--end", str(N_POCKETS - 1),
+        "--gpus", "0,1,2,3,4,5",
+        "--config", config_path,
+        "--protein_root", PROTEIN_ROOT,
+        "--sample-only",  # Only sample, don't evaluate
+    ]
+
+    print(f"  [pipeline] Starting sampling...")
+    sample_proc = subprocess.Popen(
+        sample_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=env, cwd=SCRIPT_DIR, bufsize=1,
+    )
+
+    # Monitor sampling output and track .pt files
+    pt_files = {}
+    for line in sample_proc.stdout:
+        line = line.rstrip()
+        if line:
+            if "采样成功" in line:
+                print(f"  [sample] {line}")
+            elif "ERROR" in line or "失败" in line:
+                print(f"  [sample] {line}")
+
+    sample_proc.wait()
+    if sample_proc.returncode != 0:
+        print(f"  ERROR: Sampling exited with code {sample_proc.returncode}")
+        return None
+
+    # Step 2: Evaluate all .pt files (parallel across CPUs)
+    print(f"  [pipeline] Sampling complete, starting evaluation...")
+    eval_cmd = [
+        sys.executable, os.path.join(SCRIPT_DIR, "batch_sampleandeval_parallel.py"),
+        "--start", "0", "--end", str(N_POCKETS - 1),
+        "--gpus", "0,1,2,3,4,5",
+        "--num_cpu_cores", "60", "--cores_per_task", "6",
+        "--config", config_path,
+        "--protein_root", PROTEIN_ROOT,
+        "--eval-vina-modes", "score_only",
+        "--excel_file", batch_csv,
+    ]
+
+    eval_proc = subprocess.Popen(
+        eval_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=env, cwd=SCRIPT_DIR, bufsize=1,
+    )
+
+    for line in eval_proc.stdout:
+        line = line.rstrip()
+        if line:
+            if "评估成功" in line or "评估失败" in line:
+                print(f"  [eval] {line}")
+
+    eval_proc.wait()
+    if eval_proc.returncode != 0:
+        print(f"  ERROR: Evaluation exited with code {eval_proc.returncode}")
+        return None
+
+    return batch_csv
+
+
 def parse_batch_results(csv_path):
     """Parse batch CSV to extract per-pocket and global metrics."""
     import pandas as pd
@@ -237,7 +321,7 @@ def phase2_bayesian(args):
         idx = round_counter[0]
         round_counter[0] += 1
 
-        csv_path = run_batch_eval(config_path, 100 + idx, output_root)
+        csv_path = run_batch_eval_pipeline(config_path, 100 + idx, output_root)
         if csv_path is None:
             return 0.0
 
