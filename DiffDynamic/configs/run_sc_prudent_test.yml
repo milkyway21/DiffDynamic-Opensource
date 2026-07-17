@@ -1,0 +1,74 @@
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  use_grad_fusion: true
+  grad_fusion_lambda:
+    mode: quadratic
+    start: 1
+    end: 0
+    power: 2
+sample:
+  seed: 42
+  mode: dynamic
+  num_steps: 1000
+  sample_num_atoms: prior
+  center_pos_mode: protein
+  pos_only: false
+  dynamic:
+    method: legacy
+    time_boundary: 650
+    skip_refine: false
+    large_step:
+      batch_size: 1
+      n_repeat: 1
+      schedule: lambda
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      step_size: 0.33
+      stride: 15
+      noise_scale: 0.1
+      use_adaptive_step: true
+      use_time_scale: false
+    refine:
+      n_sampling: 1
+      cycles: 1
+      schedule: lambda
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      step_size: 0.47
+      stride: 5
+      time_lower: 0
+      noise_scale: 0.05
+      use_adaptive_step: true
+      use_time_scale: false
+      max_grad_fusion_iterations: 15
+  scaffold:
+    enable: true
+    mode: prudent
+    scaffold_source: auto_murcko
+    fix_scaffold_pos: true
+    fix_scaffold_type: false
+    num_samples: 3
+    prudent:
+      n_generations: 2
+      n_chains_per_seed: 2
+      advance_top_k: 1
+      renoise_t: 600
+      qed_weight: 0.3
+      sa_weight: 0.3
+      vina_weight: 0.4
+      vina_exhaustiveness: 1
+      min_qed_for_docking: 0.0
+      min_sa_for_docking: 0.0
+      advance_top_k_mode: cap
+      continue_when_no_advance: true
+      fallback_keep_top_k: 1
+    grow:
+      n_extra_mode: pocket_prior
+      n_extra_fixed: 8
+      n_extra_min: 3
+      n_extra_max: 20
+      min_qed: 0.0
+      min_sa: 0.0
+      filter_incomplete: false
+      num_samples: 3

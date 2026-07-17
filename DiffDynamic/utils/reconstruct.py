@@ -61,25 +61,100 @@ def make_obmol(xyz, atomic_numbers):  # 将坐标与原子序号构建为 OBMol 
         x, y, z = xyz
         # ch = struct.channels[t]
         atom = mol.NewAtom()  # 创建新原子。
-        atom.SetAtomicNum(t)  # 设置原子序号。
-        atom.SetVector(x, y, z)  # 设置坐标。
+        atom.SetAtomicNum(int(t))  # 设置原子序数。
+        atom.SetVector(float(x), float(y), float(z))  # 设置坐标（强制 Python float，避免 numpy 标量被 SWIG 拒绝）。
         atoms.append(atom)  # 保存原子引用。
     return mol, atoms  # 返回分子及原子列表。
 
 
-def connect_the_dots(mol, atoms, indicators, covalent_factor=1.3):  # 根据原子位置尝试恢复键连接。
+def _pair_key(i: int, j: int):
+    return (i, j) if i < j else (j, i)
+
+
+def _normalize_scaffold_bonds(scaffold_bonds):
+    """归一化为 [(i, j, order, aromatic_flag), ...]；i/j 为 0-based 原子下标。"""
+    out = []
+    if not scaffold_bonds:
+        return out
+    for item in scaffold_bonds:
+        if item is None:
+            continue
+        if len(item) == 2:
+            i, j = int(item[0]), int(item[1])
+            order, aromatic = 1, False
+        elif len(item) == 3:
+            i, j, order = int(item[0]), int(item[1]), int(item[2])
+            aromatic = (order == 5) or (order == -1)
+            if order == -1:
+                order = 5
+        else:
+            i, j, order, aromatic = (
+                int(item[0]), int(item[1]), int(item[2]), bool(item[3]),
+            )
+        if i == j:
+            continue
+        out.append((i, j, max(1, int(order)), bool(aromatic)))
+    return out
+
+
+def seed_scaffold_bonds(mol, atoms, scaffold_bonds):
+    """在 connect_the_dots 之前写入参考骨架键；返回受保护的 0-based 原子对集合。"""
+    bonds = _normalize_scaffold_bonds(scaffold_bonds)
+    protected = set()
+    if not bonds or not atoms:
+        return protected
+    mol.BeginModify()
+    for i, j, order, aromatic in bonds:
+        if i < 0 or j < 0 or i >= len(atoms) or j >= len(atoms):
+            continue
+        a, b = atoms[i], atoms[j]
+        if mol.GetBond(a, b) is not None:
+            protected.add(_pair_key(i, j))
+            continue
+        # OpenBabel AddBond 不接受 order=5；芳香用单键 + AROMATIC flag
+        is_arom = bool(aromatic) or int(order) == 5
+        flag = ob.OB_AROMATIC_BOND if is_arom else 0
+        bond_order = 1 if is_arom else max(1, min(3, int(order)))
+        mol.AddBond(a.GetIdx(), b.GetIdx(), bond_order, flag)
+        if is_arom:
+            a.SetAromatic(True)
+            b.SetAromatic(True)
+        protected.add(_pair_key(i, j))
+    mol.EndModify()
+    return protected
+
+
+def connect_the_dots(
+    mol, atoms, indicators, covalent_factor=1.3,
+    protected_pairs=None, n_scaffold=None,
+):  # 根据原子位置尝试恢复键连接。
     '''Custom implementation of ConnectTheDots.  This is similar to
     OpenBabel's version, but is more willing to make long bonds 
     (up to maxbond long) to keep the molecule connected.  It also 
     attempts to respect atom type information from struct.
     atoms and struct need to correspond in their order
-    Assumes no hydrogens or existing bonds.
+    Assumes no hydrogens or existing bonds (except optional seeded scaffold bonds).
+
+    protected_pairs: set of (i,j) 0-based pairs that must not be deleted.
+    n_scaffold: if set, do not invent new scaffold–scaffold bonds outside protected_pairs.
     '''
 
     """
     for now, indicators only include 'is_aromatic'
     """
     pt = Chem.GetPeriodicTable()  # 获取周期表用于查找价数。
+    protected = set(protected_pairs or ())
+    n_sc = int(n_scaffold) if n_scaffold is not None else -1
+
+    # OB atom GetIdx -> 0-based index in atoms list
+    ob_to_i = {a.GetIdx(): i for i, a in enumerate(atoms)}
+
+    def _is_protected_bond(bond):
+        i = ob_to_i.get(bond.GetBeginAtom().GetIdx())
+        j = ob_to_i.get(bond.GetEndAtom().GetIdx())
+        if i is None or j is None:
+            return False
+        return _pair_key(i, j) in protected
 
     if len(atoms) == 0:  # 若没有原子直接返回。
         return
@@ -92,8 +167,17 @@ def connect_the_dots(mol, atoms, indicators, covalent_factor=1.3):  # 根据原�
     # types = [struct.channels[t].name for t in struct.c]
 
     for i, j in itertools.combinations(range(len(atoms)), 2):  # 遍历所有原子对。
+        # 骨架内部：只保留参考键，不按距离发明新骨架键
+        if n_sc > 0 and i < n_sc and j < n_sc:
+            if _pair_key(i, j) not in protected:
+                continue
+            # 已 seed 则跳过重复添加
+            if mol.GetBond(atoms[i], atoms[j]) is not None:
+                continue
         a = atoms[i]
         b = atoms[j]
+        if mol.GetBond(a, b) is not None:
+            continue
         a_r = ob.GetCovalentRad(a.GetAtomicNum()) * covalent_factor  # 原子 a 的共价半径（放大系数）。
         b_r = ob.GetCovalentRad(b.GetAtomicNum()) * covalent_factor  # 原子 b 的共价半径。
         if dists[i, j] < a_r + b_r:  # 若距离小于半径之和，认为可能有键连接。
@@ -119,7 +203,9 @@ def connect_the_dots(mol, atoms, indicators, covalent_factor=1.3):  # 根据原�
         atom_maxb[a.GetIdx()] = maxb  # 记录最大价键。
 
     # remove any impossible bonds between halogens
-    for bond in ob.OBMolBondIter(mol):  # 遍历现有键。
+    for bond in list(ob.OBMolBondIter(mol)):  # 遍历现有键。
+        if _is_protected_bond(bond):
+            continue
         a1 = bond.GetBeginAtom()
         a2 = bond.GetEndAtom()
         if atom_maxb[a1.GetIdx()] == 1 and atom_maxb[a2.GetIdx()] == 1:  # 若两端都只允许 1 个键。
@@ -143,6 +229,8 @@ def connect_the_dots(mol, atoms, indicators, covalent_factor=1.3):  # 根据原�
     binfo = get_bond_info(ob.OBMolBondIter(mol))  # 获取所有键的拉伸排序。
     # now eliminate geometrically poor bonds
     for stretch, bond in binfo:  # 遍历拉伸大的键。
+        if _is_protected_bond(bond):
+            continue
 
         # can we remove this bond without disconnecting the molecule?
         a1 = bond.GetBeginAtom()
@@ -168,6 +256,8 @@ def connect_the_dots(mol, atoms, indicators, covalent_factor=1.3):  # 根据原�
             continue
         binfo = get_bond_info(ob.OBAtomBondIter(a))  # 获取该原子相关键的拉伸信息。
         for stretch, bond in binfo:
+            if _is_protected_bond(bond):
+                continue
 
             if stretch < 0.9:  # the two atoms are too closed to remove the bond
                 continue
@@ -415,14 +505,18 @@ def postprocess_rd_mol_1(rdmol):  # 对 RDKit 分子进行第一阶段后处理�
     return rdmol
 
 
-def postprocess_rd_mol_2(rdmol):  # 对 RDKit 分子进行第二阶段后处理。
+def postprocess_rd_mol_2(rdmol, n_scaffold=None):  # 对 RDKit 分子进行第二阶段后处理。
     rdmol_edit = Chem.RWMol(rdmol)  # 创建可编辑副本。
+    n_sc = int(n_scaffold) if n_scaffold is not None else -1
 
     ring_info = rdmol.GetRingInfo()
     ring_info.AtomRings()
     rings = [set(r) for r in ring_info.AtomRings()]
     for i, ring_a in enumerate(rings):
         if len(ring_a) == 3:
+            # 骨架内三元环不拆键，避免破坏参考拓扑
+            if n_sc > 0 and all(int(a) < n_sc for a in ring_a):
+                continue
             non_carbon = []
             atom_by_symb = {}
             for atom_idx in ring_a:
@@ -434,15 +528,18 @@ def postprocess_rd_mol_2(rdmol):  # 对 RDKit 分子进行第二阶段后处理�
                 else:
                     atom_by_symb[symb].append(atom_idx)
             if len(non_carbon) == 2:
-                rdmol_edit.RemoveBond(*non_carbon)
+                if n_sc <= 0 or not all(int(a) < n_sc for a in non_carbon):
+                    rdmol_edit.RemoveBond(*non_carbon)
             if 'O' in atom_by_symb and len(atom_by_symb['O']) == 2:
-                rdmol_edit.RemoveBond(*atom_by_symb['O'])
-                rdmol_edit.GetAtomWithIdx(atom_by_symb['O'][0]).SetNumExplicitHs(
-                    rdmol_edit.GetAtomWithIdx(atom_by_symb['O'][0]).GetNumExplicitHs() + 1
-                )
-                rdmol_edit.GetAtomWithIdx(atom_by_symb['O'][1]).SetNumExplicitHs(
-                    rdmol_edit.GetAtomWithIdx(atom_by_symb['O'][1]).GetNumExplicitHs() + 1
-                )
+                o_pair = atom_by_symb['O']
+                if n_sc <= 0 or not all(int(a) < n_sc for a in o_pair):
+                    rdmol_edit.RemoveBond(*o_pair)
+                    rdmol_edit.GetAtomWithIdx(o_pair[0]).SetNumExplicitHs(
+                        rdmol_edit.GetAtomWithIdx(o_pair[0]).GetNumExplicitHs() + 1
+                    )
+                    rdmol_edit.GetAtomWithIdx(o_pair[1]).SetNumExplicitHs(
+                        rdmol_edit.GetAtomWithIdx(o_pair[1]).GetNumExplicitHs() + 1
+                    )
     rdmol = rdmol_edit.GetMol()
 
     for atom in rdmol.GetAtoms():
@@ -452,9 +549,15 @@ def postprocess_rd_mol_2(rdmol):  # 对 RDKit 分子进行第二阶段后处理�
     return rdmol
 
 
-def reconstruct_from_generated(xyz, atomic_nums, aromatic=None, basic_mode=True):  # 从生成的坐标和元素重建 RDKit 分子。
+def reconstruct_from_generated(
+    xyz, atomic_nums, aromatic=None, basic_mode=True,
+    scaffold_bonds=None, n_scaffold=None,
+):  # 从生成的坐标和元素重建 RDKit 分子。
     """
     will utilize data.ligand_pos, data.ligand_element, data.ligand_atom_feature_full to reconstruct mol
+
+    scaffold_bonds: optional list of (i, j[, order[, aromatic]]) for atoms 0..n_scaffold-1
+    to force-keep Murcko scaffold topology during OpenBabel distance bonding.
     """
     # xyz = data.ligand_pos.clone().cpu().tolist()
     # atomic_nums = data.ligand_element.clone().cpu().tolist()
@@ -468,7 +571,16 @@ def reconstruct_from_generated(xyz, atomic_nums, aromatic=None, basic_mode=True)
     mol, atoms = make_obmol(xyz, atomic_nums)  # 构建 OpenBabel 分子。
     fixup(atoms, mol, indicators)  # 根据指示器调整原子属性。
 
-    connect_the_dots(mol, atoms, indicators, covalent_factor=1.3)  # 根据距离连接键。
+    protected = seed_scaffold_bonds(mol, atoms, scaffold_bonds)
+    n_sc = int(n_scaffold) if n_scaffold is not None else None
+    if n_sc is None and protected:
+        # 从键表推断骨架前缀长度
+        n_sc = max(max(i, j) for i, j, *_ in _normalize_scaffold_bonds(scaffold_bonds)) + 1
+
+    connect_the_dots(
+        mol, atoms, indicators, covalent_factor=1.3,
+        protected_pairs=protected, n_scaffold=n_sc,
+    )  # 根据距离连接键（骨架内参考键受保护）。
     fixup(atoms, mol, indicators)  # 再次调整原子属性确保一致。
 
     mol.AddPolarHydrogens()  # 添加极性氢。
@@ -511,7 +623,7 @@ def reconstruct_from_generated(xyz, atomic_nums, aromatic=None, basic_mode=True)
     try:
         # Post-processing
         rd_mol = postprocess_rd_mol_1(rd_mol)
-        rd_mol = postprocess_rd_mol_2(rd_mol)
+        rd_mol = postprocess_rd_mol_2(rd_mol, n_scaffold=n_sc)
     except:
         raise MolReconsError()
 

@@ -1,0 +1,74 @@
+# Prudent + Murcko sites + 骨架完全锁定，生成 100 分子 (data_id=0)
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  use_grad_fusion: true
+  grad_fusion_lambda:
+    mode: quadratic
+    start: 1
+    end: 0
+    power: 2
+sample:
+  seed: 2021
+  mode: dynamic
+  num_steps: 1000
+  sample_num_atoms: prior
+  center_pos_mode: protein
+  pos_only: false
+  output_dir: ./outputs/pt
+  dynamic:
+    method: legacy
+    time_boundary: 650
+    skip_refine: false
+    large_step:
+      batch_size: 5
+      n_repeat: 1
+      schedule: lambda
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      step_size: 0.33
+      stride: 15
+      noise_scale: 0.1
+      use_adaptive_step: true
+      use_time_scale: false
+    refine:
+      n_sampling: 1
+      cycles: 1
+      schedule: lambda
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      step_size: 0.47
+      stride: 5
+      use_adaptive_step: true
+  scaffold:
+    enable: true
+    mode: prudent
+    scaffold_source: auto_murcko
+    fix_scaffold_pos: true
+    fix_scaffold_type: true
+    num_samples: 100
+    murcko_sites:
+      p_active: 0.5
+      max_per_site: 20
+      jitter_std: 1.0
+      save_json: true
+    prudent:
+      n_generations: 3
+      n_chains_per_seed: 2
+      advance_top_k: 3
+      renoise_t: 600
+      qed_weight: 0.2
+      sa_weight: 0.2
+      vina_weight: 0.6
+      vina_exhaustiveness: 1
+      min_qed_for_docking: 0.0
+      min_sa_for_docking: 0.0
+      advance_top_k_mode: cap
+      continue_when_no_advance: true
+      fallback_keep_top_k: 1
+    grow:
+      n_extra_mode: prior_minus_scaffold
+      num_samples: 100
+      filter_incomplete: false
+      min_qed: 0.0
+      min_sa: 0.0

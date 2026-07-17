@@ -70,35 +70,37 @@ def run_batch_eval(config_path, strategy_idx, output_root):
     return batch_csv
 
 
-def run_batch_eval_pipeline(config_path, strategy_idx, output_root):
-    """Run sampling + evaluation in PIPELINE mode: evaluate each pocket as soon as its .pt is ready.
+def run_batch_eval_pipeline(config_path, strategy_idx, output_root, gpus=None):
+    """Run sampling + evaluation in PIPELINE mode: sequential sample then eval.
 
-    Instead of: sample all 100 → evaluate all 100 (sequential)
-    Does:       sample pocket 0 → eval pocket 0 (while sampling pocket 1, 2, ...)
+    Sampling runs across all GPUs, then evaluation runs across CPU cores.
+    Uses --skip_existing to avoid re-sampling already-completed pockets.
     """
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import torch
+    if gpus is None:
+        n_gpus = torch.cuda.device_count()
+        gpus = ",".join(str(i) for i in range(n_gpus)) if n_gpus > 0 else "0"
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     batch_csv = os.path.join(output_root, f"v2_s{strategy_idx:02d}_{timestamp}.csv")
 
     print(f"\n{'='*70}")
     print(f"  Strategy {strategy_idx} (PIPELINE mode): {config_path}")
-    print(f"  Output: {batch_csv}")
+    print(f"  GPUs: {gpus}  Output: {batch_csv}")
     print(f"{'='*70}")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = SCRIPT_DIR
     env["PYTHONUNBUFFERED"] = "1"
 
-    # Step 1: Sample all pockets (this is already parallel across 6 GPUs)
+    # Step 1: Sample all pockets (parallel across GPUs)
     sample_cmd = [
         sys.executable, os.path.join(SCRIPT_DIR, "batch_sampleandeval_parallel.py"),
         "--start", "0", "--end", str(N_POCKETS - 1),
-        "--gpus", "0,1,2,3,4,5",
+        "--gpus", gpus,
         "--config", config_path,
         "--protein_root", PROTEIN_ROOT,
-        "--sample-only",  # Only sample, don't evaluate
+        "--sample-only",
     ]
 
     print(f"  [pipeline] Starting sampling...")
@@ -107,8 +109,6 @@ def run_batch_eval_pipeline(config_path, strategy_idx, output_root):
         text=True, env=env, cwd=SCRIPT_DIR, bufsize=1,
     )
 
-    # Monitor sampling output and track .pt files
-    pt_files = {}
     for line in sample_proc.stdout:
         line = line.rstrip()
         if line:
@@ -122,15 +122,16 @@ def run_batch_eval_pipeline(config_path, strategy_idx, output_root):
         print(f"  ERROR: Sampling exited with code {sample_proc.returncode}")
         return None
 
-    # Step 2: Evaluate all .pt files (parallel across CPUs)
+    # Step 2: Evaluate all .pt files (parallel across CPU cores, skip existing)
     print(f"  [pipeline] Sampling complete, starting evaluation...")
     eval_cmd = [
         sys.executable, os.path.join(SCRIPT_DIR, "batch_sampleandeval_parallel.py"),
         "--start", "0", "--end", str(N_POCKETS - 1),
-        "--gpus", "0,1,2,3,4,5",
+        "--gpus", gpus,
         "--num_cpu_cores", "60", "--cores_per_task", "6",
         "--config", config_path,
         "--protein_root", PROTEIN_ROOT,
+        "--skip_existing",
         "--eval-vina-modes", "score_only",
         "--excel_file", batch_csv,
     ]

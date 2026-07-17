@@ -25,12 +25,12 @@ env/
 Thumbs.db
 
 # Database (runtime data, not source)
-diffdynamic.db
-diffdynamic.db-shm
-diffdynamic.db-wal
+DiffDynamic/diffdynamic.db
+DiffDynamic/diffdynamic.db-shm
+DiffDynamic/diffdynamic.db-wal
 
 # Server runtime config (generated at runtime)
-server/server_config.json
+DiffDynamic/server/server_config.json
 
 # Large data files (download separately)
 DiffDynamic/data/
@@ -73,7 +73,35 @@ DiffDynamic/configs/backups/
 
 # Large data directories
 DiffDynamic/configs/分析文件/
+DiffDynamic/experiments/
+DiffDynamic/pics/
+DiffDynamic/fig7/
+DiffDynamic/pocket_quality_vis/
+DiffDynamic/jsdpt3010/
+DiffDynamic/molecules_score_*/
+DiffDynamic/tmp/
+DiffDynamic/third_party/
+DiffDynamic/docktmp/
 
-# Claude Code
+# Runtime / evaluation dumps
+DiffDynamic/eval_100_results.json
+DiffDynamic/*.xlsx
+DiffDynamic/docs/*.xlsx
+
+# Claude Code / IDE local
 .claude/
 CLAUDE.md
+.omicos/
+DiffDynamic/.cursorignore
+DiffSBDD/
+e-drug-lab/
+envs/
+conda/
+diffgui/
+hsvpol/
+molego/
+omicos/
+protein-ligand/
+protein-ligand-archive/
+tame-vs-data/
+tmp/

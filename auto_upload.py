@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-REPO_URL = "https://github.com/milkyway21/DiffDynamic-Opensource.git"
+REPO_URL = "git@github.com:milkyway21/DiffDynamic-Opensource.git"
 REPO_DIR = Path(__file__).parent.absolute()
 
 

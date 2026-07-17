@@ -1,0 +1,189 @@
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  grad_fusion_lambda:
+    end: 0
+    mode: quadratic
+    power: 2
+    start: 1
+  use_grad_fusion: true
+sample:
+  center_pos_mode: protein
+  dynamic:
+    large_step:
+      batch_size: 5
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      linear_step_lower: 15
+      linear_step_upper: 15
+      n_repeat: 1
+      noise_scale: 0.1
+      schedule: lambda
+      step_size: 0.33
+      stride: 15
+      use_adaptive_step: true
+      use_time_scale: false
+    method: legacy
+    prudent:
+      advance_top_k: 5
+      advance_top_k_mode: cap
+      async_vina_max_workers: 2
+      checkpoint_frame: 24
+      continue_when_no_advance: true
+      enable: false
+      fallback_keep_top_k: 1
+      lilly_demerit_weight: 0.1
+      lipinski_weight: 0.1
+      log_per_chain_scores: true
+      max_checkpoint_rounds: 1
+      max_vina_affinity_for_advance: null
+      min_qed_for_docking: 0
+      min_sa_for_docking: 0
+      n_sampling: 20
+      protein_root: null
+      qed_weight: 0.15
+      sa_weight: 0.15
+      save_checkpoint_every_segment: true
+      save_segment_breakpoint_pt: false
+      save_segment_generation_pool_pt: true
+      segment_checkpoint_subdirectory: null
+      segment_evolution_mode: true
+      segment_generation_pt_seeds: first
+      total_frames: 24
+      vina_exhaustiveness: 1
+      vina_weight: 0.5
+      winner_select_by_composite: true
+    refine:
+      cycles: 1
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      linear_step_lower: 3
+      linear_step_upper: 8
+      max_grad_fusion_iterations: 15
+      n_sampling: 1
+      noise_scale: 0.05
+      schedule: lambda
+      step_size: 0.47
+      stride: 5
+      time_lower: 0
+      use_adaptive_step: true
+      use_time_scale: false
+    selector:
+      enable_selection: false
+      min_qed: 0.1
+      min_sa: 0.1
+      qed_weight: 1
+      sa_weight: 1
+      selection_time: 250
+      top_n: 20
+      top_percent: 0.3
+    skip_refine: false
+    time_boundary: 650
+  mode: dynamic
+  num_steps: 1000
+  optimization:
+    after_dynamic: true
+    cycles: 5
+    enable: false
+    keep_original: true
+    lambda_coeff_a: 1
+    lambda_coeff_b: 1
+    mask_repaint:
+      enable: false
+    molecule_path: null
+    noise_scale: 0
+    num_samples: 2
+    pos_clip: null
+    property_guidance:
+      enable: false
+    schedule: linear
+    selector:
+      enable_filter: true
+      filter_incomplete: true
+      max_survivors_per_cycle: 10
+      max_survivors_total: 300
+      min_qed: 0.3
+      min_sa: 0.3
+      qed_weight: 1
+      sa_weight: 1
+    start_t: 16
+    step_size: 0.2
+    stride: 2
+    use_adaptive_step: true
+    use_time_scale: false
+    use_with_noise: true
+    v_clip: null
+  pos_only: false
+  pre_docking:
+    etkdg_reembed: false
+    mmff_max_iters: 2000
+    mmff_minimize: false
+    use_uff_fallback: false
+  sample_num_atoms: prior
+  scaffold:
+    after_dynamic: false
+    diversity_filter:
+      enable: true
+      fingerprint_nbits: 2048
+      fingerprint_radius: 2
+      max_tanimoto: 0.9
+    diversity_weight: 0.5
+    enable: true
+    evolve:
+      children_per_parent: 10
+      lambda_coeff_a: 10
+      lambda_coeff_b: 1
+      n_generations: 5
+      noise_anneal: true
+      population_size: 50
+      start_t_high: 200
+      start_t_low: 30
+      step_size: 0.2
+      stride: 2
+    filter_incomplete: true
+    fix_scaffold_pos: true
+    fix_scaffold_type: true
+    grow:
+      filter_incomplete: false
+      lambda_coeff_a: 37
+      lambda_coeff_b: 6
+      min_qed: 0.2
+      min_sa: 0.2
+      n_extra_fixed: 8
+      n_extra_max: 20
+      n_extra_max_clamp: 45
+      n_extra_min: 3
+      n_extra_min_clamp: 1
+      n_extra_mode: pocket_prior
+      num_samples: 50
+      start_t: 361
+      step_size: 0.3363
+      stride: 15
+    keep_original: true
+    min_qed: 0.15
+    min_sa: 0.15
+    mode: grow
+    optimization_style_naming: true
+    qed_weight: 1.0
+    rmsd_penalty_weight: 0
+    sa_weight: 1.0
+    save_dynamic_before_scaffold: true
+    scaffold_atom_indices: null
+    scaffold_smarts: null
+    scaffold_source: auto_murcko
+    schedule: lambda
+    use_adaptive_step: true
+    use_time_scale: false
+    use_with_noise: true
+  seed: 2021
+  step_trajectory_save:
+    bond_threshold: 500
+    enable: false
+    merge_pymol_sdf: true
+    merge_sdf_filename: trajectory_pymol.sdf
+    output_dir: ./diffway
+  targetdiff_baseline_refine:
+    enable: false
+    refine_batch_size: null
+    run_every_prudent_round: true
+    start_t: 9

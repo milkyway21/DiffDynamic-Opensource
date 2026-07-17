@@ -5,7 +5,7 @@
 # - 包含力场构建和构象能量计算，用于辅助稳定性分析。
 
 from collections import Counter  # 导入 Counter，用于计数。
-from copy import deepcopy  # 导入深拷贝，避免修改原分子。
+from copy import deepcopy  # 导入深拷贝，避免修改原分子（is_pains 使用）。
 
 import numpy as np  # 导入 NumPy。
 from rdkit import Chem  # 导入 RDKit 主模块。
@@ -32,8 +32,6 @@ def is_pains(mol):
 
 def obey_lipinski(mol):
     """统计分子满足多少条 Lipinski 五规则。"""
-    mol = deepcopy(mol)  # 深拷贝用于处理。
-    Chem.SanitizeMol(mol)  # 确保分子合法。
     rule_1 = Descriptors.ExactMolWt(mol) < 500
     rule_2 = Lipinski.NumHDonors(mol) <= 5
     rule_3 = Lipinski.NumHAcceptors(mol) <= 10
@@ -86,6 +84,17 @@ def get_rdkit_rmsd(mol, n_conf=20, random_seed=42):
 def get_logp(mol):
     """计算 Crippen logP（疏水性）。"""
     return Crippen.MolLogP(mol)
+
+
+def passes_veber(mol, rot_bonds=None):
+    """Veber 规则：可旋转键 <= 10 且 TPSA <= 140 Å²。返回 True/False。"""
+    try:
+        if rot_bonds is None:
+            rot_bonds = Chem.rdMolDescriptors.CalcNumRotatableBonds(mol)
+        tpsa = Descriptors.TPSA(mol)
+        return rot_bonds <= 10 and tpsa <= 140
+    except (ValueError, RuntimeError, AttributeError):
+        return False
 
 
 def get_chem(mol):

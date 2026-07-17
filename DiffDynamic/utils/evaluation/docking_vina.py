@@ -1,4 +1,5 @@
 # NumPy 1.24+ 移除 np.int 等别名；vina 等旧依赖在 import/运行期仍会引用
+import sys
 import numpy as np
 if not hasattr(np, 'int'):
     np.int = int
@@ -229,7 +230,8 @@ def _python_for_prepare_receptor():
     for name in ('python2.7', 'python2'):
         if shutil.which(name):
             return name
-    return None
+    # Fall back to current Python (Python 3 compatible prepare_receptor4.py)
+    return sys.executable
 
 
 def supress_stdout(func):
@@ -323,10 +325,6 @@ class PrepProt(object):
         if not os.path.isfile(pqr_path):
             raise RuntimeError('prepare_receptor 需要 pqr，但文件不存在: %s' % pqr_path)
         py = _python_for_prepare_receptor()
-        if py is None:
-            raise RuntimeError(
-                '未找到 Python2（prepare_receptor4.py 仅支持 Py2）。请安装 python2.7 或设置 ADT_PYTHON'
-            )
         r = subprocess.run(
             [py, prepare_receptor, '-r', pqr_path, '-o', prot_pdbqt],
             stdout=subprocess.PIPE,

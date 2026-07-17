@@ -1,0 +1,142 @@
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  grad_fusion_lambda:
+    end: 0
+    mode: quadratic
+    power: 2
+    start: 1
+  use_grad_fusion: true
+sample:
+  center_pos_mode: protein
+  dynamic:
+    large_step:
+      batch_size: 5
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      linear_step_lower: 15
+      linear_step_upper: 15
+      n_repeat: 1
+      noise_scale: 0.1
+      schedule: lambda
+      step_size: 0.33
+      stride: 15
+      use_adaptive_step: true
+      use_time_scale: false
+    method: legacy
+    refine:
+      cycles: 1
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      linear_step_lower: 3
+      linear_step_upper: 8
+      max_grad_fusion_iterations: 15
+      n_sampling: 1
+      noise_scale: 0.05
+      schedule: lambda
+      step_size: 0.47
+      stride: 5
+      time_lower: 0
+      use_adaptive_step: true
+      use_time_scale: false
+    skip_refine: true
+    time_boundary: 650
+  mode: dynamic
+  num_steps: 1000
+  pos_only: false
+  sample_num_atoms: prior
+  scaffold:
+    adaptive_gates:
+      enable: false
+    enable: true
+    fix_scaffold_pos: true
+    fix_scaffold_type: true
+    grow:
+      filter_incomplete: false
+      min_qed: 0.0
+      min_sa: 0.0
+      n_extra_max_clamp: 20
+      n_extra_min_clamp: 6
+      n_extra_mode: prior_minus_scaffold
+      seed: 42
+    mode: prudent
+    murcko_sites:
+      dedup_dist: 0.5
+      fragment_sizes:
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 16
+      - 18
+      - 20
+      fragment_weights:
+      - 0.02
+      - 0.02
+      - 0.02
+      - 0.02
+      - 0.03
+      - 0.16
+      - 0.1
+      - 0.09
+      - 0.08
+      - 0.12
+      - 0.12
+      - 0.1
+      - 0.05
+      - 0.04
+      - 0.015
+      - 0.01
+      - 0.005
+      include_exit_vectors: false
+      jitter_mode: gaussian
+      jitter_std: 1.0
+      max_active_sites: n_removed_sidechains
+      max_per_site: 20
+      min_per_site: 0
+      overflow_mode: cap
+      p_active: 0.5
+      per_site_add_mode: fragment_prior
+      per_site_count_mode: sequential_random
+      prefer_murcko_sites: true
+      preserve_zero_allocation_sidechains: true
+      radial_bulk: 0.35
+      radial_bulk_start: 4
+      radial_step: 0.25
+      save_json: true
+    num_samples: 5
+    prudent:
+      advance_top_k: 1
+      advance_top_k_mode: cap
+      async_vina_max_workers: 4
+      continue_when_no_advance: true
+      fallback_keep_top_k: 1
+      lilly_demerit_weight: 0.1
+      lipinski_weight: 0.0
+      min_qed_for_docking: 0.0
+      min_sa_for_docking: 0.0
+      n_chains_per_seed: 2
+      n_generations: 2
+      qed_weight: 0.2
+      renoise_t: 600
+      sa_weight: 0.2
+      target_final_count: null
+      vina_exhaustiveness: 8
+      vina_weight: 0.0
+    scaffold_source: auto_murcko
+  seed: 42
+  targetdiff_baseline_refine:
+    after_scaffold_init_only: false
+    enable: true
+    lock_prefix: types_and_pos
+    start_t: 9

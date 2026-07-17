@@ -1,0 +1,61 @@
+# Smoke test: Murcko 侧链位点 + scaffold grow (num_samples=5, data_id=0)
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  use_grad_fusion: true
+  grad_fusion_lambda:
+    mode: quadratic
+    start: 1
+    end: 0
+    power: 2
+sample:
+  seed: 2021
+  mode: dynamic
+  num_steps: 1000
+  sample_num_atoms: prior
+  center_pos_mode: protein
+  pos_only: false
+  dynamic:
+    method: legacy
+    time_boundary: 650
+    skip_refine: true
+    large_step:
+      batch_size: 5
+      n_repeat: 1
+      schedule: lambda
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      step_size: 0.33
+      stride: 15
+      noise_scale: 0.1
+      use_adaptive_step: true
+      use_time_scale: false
+    refine:
+      n_sampling: 1
+      cycles: 1
+      schedule: lambda
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      step_size: 0.47
+      stride: 5
+      use_adaptive_step: true
+  scaffold:
+    enable: true
+    mode: grow
+    scaffold_source: auto_murcko
+    fix_scaffold_pos: true
+    fix_scaffold_type: true
+    murcko_sites:
+      p_active: 0.5
+      max_per_site: 20
+      jitter_std: 1.0
+      save_json: true
+    grow:
+      n_extra_mode: prior_minus_scaffold
+      num_samples: 5
+      start_t: 200
+      stride: 15
+      step_size: 0.33
+      lambda_coeff_a: 40
+      lambda_coeff_b: 5
+      filter_incomplete: false

@@ -1,1 +1,38 @@
 backups/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Database (runtime data, not source)
+diffdynamic.db
+diffdynamic.db-shm
+diffdynamic.db-wal
+
+# Server runtime config (generated at runtime)
+server/server_config.json
+
+# Large data / runtime outputs
+data/
+outputs/
+experiments/
+pretrained_models/
+docktmp/
+configs/prop/
+configs/backups/
+
+# LMDB databases
+*.lmdb
+*.lmdb-lock
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
+
+# Virtual environments
+.venv*

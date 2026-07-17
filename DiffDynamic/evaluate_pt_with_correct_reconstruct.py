@@ -899,13 +899,11 @@ def dock_reference_ligand(ligand_sdf_path, protein_path, exhaustiveness=8, vina_
         # Convert to PDBQT
         tmp_pdbqt = tmp_path.replace('.sdf', '.pdbqt')
         try:
-            from meeko import MoleculePreparation
-            preparator = MoleculePreparation()
-            mol_setups = preparator.prepare(ref_mol)
-            with open(tmp_pdbqt, 'w') as f:
-                for setup in mol_setups:
-                    f.write(setup.make_pdbqt_string())
-        except ImportError:
+            # 复用 PrepLig：meeko 0.1.dev3 仅接受 OBMol，PrepLig 已正确处理版本差异
+            from utils.evaluation.docking_vina import PrepLig
+            lig = PrepLig(tmp_path, 'sdf')
+            lig.get_pdbqt(tmp_pdbqt)
+        except Exception as _e:
             # Fallback: use obabel
             import subprocess as sp
             sp.run(['obabel', tmp_path, '-opdbqt', '-O', tmp_pdbqt, '--gen3d'],

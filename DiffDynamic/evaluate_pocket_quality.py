@@ -5,12 +5,15 @@
 基于扩散模型（DiffSBDD/DiffDynamic）的分子生成输出，综合八个评估维度对蛋白质口袋（结合位点）进行质量评估，
 并提供完整的可视化分析套件。
 
+说明：本评分为「生成结果驱动的口袋可药性综合分」，不是与生成无关的纯口袋物理评分。
+  A/C/D/H（尤其 FPocket）科学支撑较强；E/G 偏生成质量；B/F 偏采样行为代理。
+
 评估维度：
   想法A：Vina 对接分数与口袋质量
   想法B：原子分布聚类（结合模式收敛性）—— DBSCAN + KMeans；可选按原子子集做 DBSCAN 密度评分
     做法说明（--idea_b_atom_subset）：
-      all — 全原子参与 DBSCAN（默认）。
-      hetero_heavy — 非 H、非 C 的重原子（极性/药效相关，弱化碳骨架主导）。
+      all — 全原子参与 DBSCAN。
+      hetero_heavy — 非 H、非 C 的重原子（极性/药效相关，弱化碳骨架主导；**默认**）。
       edge_heavy — 重原子中，非氢重邻居数 ≤ edge_max_heavy_neighbors（默认 2）的原子，
         用图论近似「暴露在外的边缘」。
       hetero_edge — 上两者交集：非碳且偏边缘的重原子，最接近「除碳以外、尤其分子边缘」。
@@ -25,21 +28,31 @@
   想法C：配体效率 (Ligand Efficiency, LE)
     $LE = -\\Delta G / N_{heavy}$，$\\Delta G$ 取 Vina 亲和力 (kcal/mol，负值有利)，$N_{heavy}$ 为非氢原子数。
     默认假设 Vina 分数与 `molecules_with_pos` 中分子**下标顺序**一致（与 complete_molecules Excel / eval 导出一致）。
-    将 LE 均值线性映射到 0–1 质量分（默认约 0.12–0.45 kcal·mol⁻¹·重原子⁻¹ 为弱→强参考区间，可调常量）。
-  想法D：药物相似性 (QED/SA/Lipinski/PAINS)
-  想法E：完整分子比例（SMILES 不含 '.' 的单组分分子数 / 应生成或 .pt 槽位数）
-  想法F：分子唯一性与多样性（含指纹 Tanimoto 多样性）
-  想法G：分子尺寸一致性
-  想法H：口袋体积。默认 **MC**：质心均值 10 Å 球内配体占据，满分区间 400–600 Å³。
-    指定 ``--fpocket_protein_pdb`` 且 FPocket 成功：**配体 FPocket Volume 按 400–600（及 100/900）参与 H 分**；
+    失败对接（vina≥0）不参与 LE。将 LE 均值线性映射到 0–1（参考区间约 0.18–0.45）。
+  想法D：药物相似性 (QED/SA/Lipinski/PAINS/Veber)
+  想法E：完整分子比例（SMILES 不含 '.' 的单组分分子数 / 应生成或 .pt 槽位数）——生成质量门控
+  想法F：分子唯一性（unique_ratio 进分；指纹余弦相异度为参考，不进总分）。
+    满分门槛：unique_ratio ≥0.95（约 100 个中 ≥95 个不同 SMILES）；分段映射见 evaluate_idea_f_uniqueness。
+  想法G：分子尺寸一致性（MW CV）——生成质量相关
+  想法H：口袋体积。默认 **MC**：质心均值 **12 Å** 球内配体占据，满分区间 **300–800** Å³（归零尾 80 / 2000）。
+    指定 ``--fpocket_protein_pdb`` 且 FPocket 成功：**配体 FPocket Volume 按同一 300–800 带计分**；
     蛋白 FPocket Volume 作参考；仅当配体侧 FPocket 失败时用蛋白体积 + 宽区间回退评分。
+
+默认权重（和=1.00）：A0.28 / B0.15 / C0.15 / D0.15 / E0.05 / F0.08 / G0.07 / H0.07
+  （F 以 ≥95% unique 为满分，可区分；区分力主要靠 A/C/F）
+
+质量标签阈值（按维）：
+  A：high≥0.5 / medium≥0.2
+  H：high≥0.8 / medium≥0.5
+  其余：high≥0.6 / medium≥0.3
+  overall：high≥0.65 / medium≥0.3
 
 可视化模块：
   - 原子分布聚类图（PCA/t-SNE降维 + DBSCAN/KMeans，6子图）
   - Vina 分数分布图（直方图 + 箱线图 + 小提琴图）
   - 配体效率 LE（每分子：C_le_hist / C_le_box 箱线+抖动散点 / C_le_cdf；与 A 同布局，含 _notext）
   - 药物相似性多维散点图（QED vs SA，属性雷达图）
-  - 分子指纹相似性热图（Morgan fingerprint Tanimoto 矩阵）
+  - 分子指纹相似性热图（Morgan fingerprint；参考多样性用余弦相异度）
   - 分子尺寸分布图（分子量 + 原子数双直方图）
   - 综合雷达图（8 维质量指标，含 LE）
 
@@ -49,16 +62,16 @@
     # 想法 H 使用 FPocket 分别算蛋白口袋与配体侧口袋体积（需已安装 fpocket，且在 .pt 同目录下用临时副本运行，避免并行冲突）
     python evaluate_pocket_quality.py --pt_file outputs/result_custom_20260319_001000.pt  --fpocket_protein_pdb shoc2/shoc2.pdb --visualize
     # 仅想法 H 的配体 FPocket 使用外部构象（A–G 仍用 .pt 内分子）
-    python3 evaluate_pocket_quality.py --pt_file outputs/result_custom_20260319_001000.pt \
-  --fpocket_protein_pdb shoc2/shoc2.pdb --idea_h_ligand_path shoc2/shoc2ligand.sdf \
+    python3 evaluate_pocket_quality.py --pt_file outputs/result_custom_20260319_001000.pt \\
+  --fpocket_protein_pdb shoc2/shoc2.pdb --idea_h_ligand_path shoc2/shoc2ligand.sdf \\
   --idea_e_expected_n_molecules 400 --visualize
-    python3 evaluate_pocket_quality.py --pt_file outputs/result_custom_20260319_001000.pt \
+    python3 evaluate_pocket_quality.py --pt_file outputs/result_custom_20260319_001000.pt \\
       --fpocket_protein_pdb shoc2/shoc2.pdb --idea_h_ligand_path shoc2/shoc2ligand.sdf --visualize
     # 想法 E：.pt 中 pred_ligand_pos 条数不可靠时，用手动应生成数作分母（成功率=解析到的分子数/N）
-    python3 evaluate_pocket_quality.py --pt_file outputs/result_custom_20260319_001000.pt \
+    python3 evaluate_pocket_quality.py --pt_file outputs/result_custom_20260319_001000.pt \\
       --idea_e_expected_n_molecules 1000 --visualize
     # 输出目录结构result_custom_20260319_001000.pt：pocket_quality_vis/蛋白质编号_时间戳/A_vina_hist.png, B_clustering_dbscan.png, ...
-    # 口袋评估记录表：pocket_quality_vis/evaluation_records.csv（每次评估追加一行）
+    # 口袋评估记录表：pocket_quality_vis/evaluation_records.csv（每次评估追加一行，含 vis_dir）
 
     # 批量评估并可视化（支持 CPU 并行，与 batch_sampleandeval_parallel 一致）
     python evaluate_pocket_quality.py --run_batch --start 0 --end 9 --gpus "0" --visualize
@@ -190,7 +203,7 @@ try:
     import utils.transforms as trans
     from utils.evaluation.scoring_func import (
         get_molecule_force_field, get_conformer_energies,
-        get_chem, is_pains, obey_lipinski,
+        get_chem, is_pains, obey_lipinski, passes_veber,
     )
 except ImportError as e:
     print(f"⚠️  导入项目模块失败: {e}")
@@ -201,6 +214,7 @@ except ImportError as e:
     get_chem = None
     is_pains = None
     obey_lipinski = None
+    passes_veber = None
 
 BATCH_SCRIPT = REPO_ROOT / 'batch_sampleandeval_parallel.py'
 OUTPUT_DIR = REPO_ROOT / 'outputs'
@@ -213,13 +227,20 @@ VIS_ROOT = REPO_ROOT / 'pocket_quality_vis'
 
 # 口袋评估记录表文件名
 EVAL_RECORDS_CSV = 'evaluation_records.csv'
+EVAL_RECORD_FIELDS = (
+    'pocket_id', 'timestamp', 'n_molecules',
+    'score_a', 'score_b', 'score_c', 'score_d',
+    'score_e', 'score_f', 'score_g', 'score_h',
+    'overall_score', 'overall_label', 'pt_path', 'vis_dir',
+)
 
 
 def append_evaluation_record(result, record_path, timestamp=None):
     """
     Append one evaluation record to the pocket evaluation log (CSV).
 
-    Columns: pocket_id, timestamp, n_molecules, score_a..h, overall_score, overall_label, pt_path
+    Columns: pocket_id, timestamp, n_molecules, score_a..h, overall_score,
+    overall_label, pt_path, vis_dir
     """
     record_path = Path(record_path)
     record_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,14 +275,29 @@ def append_evaluation_record(result, record_path, timestamp=None):
         'overall_score': f"{result.get('overall_score', 0):.4f}",
         'overall_label': result.get('overall_label', 'unknown'),
         'pt_path': result.get('pt_path') or result.get('ligand_path') or '',
+        'vis_dir': result.get('vis_dir') or '',
     }
 
     file_exists = record_path.exists()
+    if file_exists:
+        with open(record_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            old_fields = list(reader.fieldnames or [])
+            old_rows = list(reader)
+        if 'vis_dir' not in old_fields:
+            with open(record_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=EVAL_RECORD_FIELDS)
+                writer.writeheader()
+                for old in old_rows:
+                    writer.writerow({k: old.get(k, '') for k in EVAL_RECORD_FIELDS})
+                writer.writerow({k: row.get(k, '') for k in EVAL_RECORD_FIELDS})
+            return
+
     with open(record_path, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer = csv.DictWriter(f, fieldnames=EVAL_RECORD_FIELDS)
         if not file_exists:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow({k: row.get(k, '') for k in EVAL_RECORD_FIELDS})
 
 
 # =============================================================================
@@ -567,12 +603,36 @@ def _build_idea_b_coord_mask(molecules_with_pos, subset_mode, edge_max_heavy_nei
     return np.concatenate(masks)
 
 
-def _idea_b_cluster_score_from_n_clusters(n_clusters, max_clusters_for_high):
+def _idea_b_cluster_score_from_n_clusters(n_clusters, max_clusters_for_high,
+                                           silhouette=None, compactness=None):
     if n_clusters <= 1:
-        return 1.0
-    if n_clusters <= max_clusters_for_high:
-        return max(0.0, 1.0 - (n_clusters - 1) / max_clusters_for_high)
-    return max(0.0, 0.5 - (n_clusters - max_clusters_for_high) * 0.1)
+        base = 1.0
+    elif n_clusters <= max_clusters_for_high:
+        base = max(0.0, 1.0 - (n_clusters - 1) / max_clusters_for_high)
+    else:
+        base = max(0.0, 0.5 - (n_clusters - max_clusters_for_high) * 0.1)
+    # 轮廓系数修正（多簇时）
+    if silhouette is not None and np.isfinite(silhouette):
+        if silhouette < 0.1:
+            base *= 0.6
+        elif silhouette < 0.2:
+            base *= 0.8
+        elif silhouette > 0.3:
+            base = min(1.0, base * 1.1)
+    # 紧凑度修正（单簇或轮廓系数不可用时）：avg_dist_to_centroid
+    # 越小越紧凑，说明结合模式越收敛
+    if compactness is not None and np.isfinite(compactness):
+        if compactness < 2.0:
+            base *= 1.0   # 非常紧凑，不扣分
+        elif compactness < 3.0:
+            base *= 0.9
+        elif compactness < 4.0:
+            base *= 0.75
+        elif compactness < 5.0:
+            base *= 0.6
+        else:
+            base *= 0.4   # 非常分散，大幅扣分
+    return base
 
 
 def _dbscan_metrics_idea_b(X, eps, min_samples, max_clusters_for_high):
@@ -582,6 +642,7 @@ def _dbscan_metrics_idea_b(X, eps, min_samples, max_clusters_for_high):
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = int(np.sum(labels == -1))
     silhouette = None
+    compactness = None
     unique_labels = set(labels) - {-1}
     if len(unique_labels) >= 2 and len(X) > len(unique_labels):
         try:
@@ -597,11 +658,25 @@ def _dbscan_metrics_idea_b(X, eps, min_samples, max_clusters_for_high):
                 )
         except Exception:
             pass
-    score = _idea_b_cluster_score_from_n_clusters(n_clusters, max_clusters_for_high)
+    # 紧凑度：per-cluster 平均点到质心距离（Å），仅多簇时有意义
+    # 单簇不做 compactness 惩罚（大口袋中分子天然分散，不代表聚类差）
+    if n_clusters >= 2:
+        compactness_vals = []
+        for lbl in unique_labels:
+            mask = labels == lbl
+            if mask.sum() > 1:
+                X_cluster = X[mask]
+                centroid = X_cluster.mean(axis=0)
+                dists = np.linalg.norm(X_cluster - centroid, axis=1)
+                compactness_vals.append(float(np.mean(dists)))
+        if compactness_vals:
+            compactness = float(np.mean(compactness_vals))
+    score = _idea_b_cluster_score_from_n_clusters(n_clusters, max_clusters_for_high, silhouette, compactness)
     return {
         'n_clusters': n_clusters,
         'n_noise': n_noise,
         'silhouette': silhouette,
+        'compactness': compactness,
         'dbscan_labels': labels,
         'score': score,
     }
@@ -781,9 +856,32 @@ def evaluate_idea_a_vina(pt_path=None, data_id=None, wait_timeout=300,
         vina_pct_good = float(np.mean(vina_arr <= -7.0))
         n = len(vina_arr)
 
-        # 质量映射：-12 kcal/mol → 1.0，-6 kcal/mol → 0.0
-        raw_score = (-vina_mean - 6) / 6
-        score = float(np.clip(raw_score, 0.0, 1.0))
+        # 过滤正值（docking 失败通常返回正值，如 +50 kcal/mol）
+        vina_arr_filtered = vina_arr[vina_arr < 0]
+        if len(vina_arr_filtered) == 0:
+            return {
+                'score': 0.0, 'vina_mean': None, 'vina_median': None, 'vina_std': None,
+                'num_scores': 0, 'quality_label': 'unknown', 'success': False,
+                'vina_scores': vina_arr.tolist(),
+                'message': '所有 Vina 对接均返回正值（可能全部失败）'
+            }
+        # 使用过滤后的数据重新计算统计量
+        vina_mean   = float(np.mean(vina_arr_filtered))
+        vina_median = float(np.median(vina_arr_filtered))
+        vina_std    = float(np.std(vina_arr_filtered)) if len(vina_arr_filtered) > 1 else 0.0
+        vina_best   = float(np.min(vina_arr_filtered))
+        vina_worst  = float(np.max(vina_arr_filtered))
+        vina_pct_good = float(np.mean(vina_arr_filtered <= -7.0))
+        n = len(vina_arr_filtered)
+        n_bad = len(vina_arr) - n
+
+        # 综合评分：均值(50%) + 最佳分数(30%) + 命中率(20%)
+        # 均值反映整体结合质量，最佳分数奖励发现强结合分子，命中率衡量口袋可药性
+        mean_component = float(np.clip((-vina_mean - 6) / 6, 0.0, 1.0))
+        best_component = float(np.clip((-vina_best - 6) / 6, 0.0, 1.0))
+        hit_component = float(vina_pct_good)
+        score = 0.5 * mean_component + 0.3 * best_component + 0.2 * hit_component
+        score = float(np.clip(score, 0.0, 1.0))
 
         if score >= 0.5:
             label = 'high'
@@ -801,10 +899,16 @@ def evaluate_idea_a_vina(pt_path=None, data_id=None, wait_timeout=300,
             'vina_worst': vina_worst,
             'vina_pct_good': vina_pct_good,
             'num_scores': n,
+            'num_bad_scores': n_bad,
+            # 保留与分子下标对齐的完整列表（含失败正值）；想法 C 会跳过 vina>=0
             'vina_scores': vina_arr.tolist(),
+            'vina_scores_valid': vina_arr_filtered.tolist(),
+            'mean_component': mean_component,
+            'best_component': best_component,
+            'hit_component': hit_component,
             'quality_label': label,
             'success': True,
-            'message': f'Vina 平均={vina_mean:.2f} kcal/mol, 最佳={vina_best:.2f}, 良好比例={vina_pct_good*100:.1f}%'
+            'message': f'Vina 平均={vina_mean:.2f}, 最佳={vina_best:.2f}, 命中率={vina_pct_good*100:.1f}%, 综合={score:.3f} (均值{mean_component:.2f}*0.5+最佳{best_component:.2f}*0.3+命中{hit_component:.2f}*0.2)'
         }
     except Exception as e:
         return {
@@ -821,11 +925,11 @@ def evaluate_idea_a_vina(pt_path=None, data_id=None, wait_timeout=300,
 
 def evaluate_idea_b_clustering(
     molecules_with_pos,
-    eps=2.0,
+    eps=1.5,
     min_samples=3,
     max_clusters_for_high=5,
     n_kmeans=5,
-    atom_coord_subset='all',
+    atom_coord_subset='hetero_heavy',
     edge_max_heavy_neighbors=2,
     combined_focus_weight=0.5,
 ):
@@ -833,11 +937,13 @@ def evaluate_idea_b_clustering(
     想法B：对生成分子的原子坐标做 DBSCAN（密度/簇数）并结合质心 KMeans。
 
     atom_coord_subset（DBSCAN 所用 3D 点集）：
-        all          — 全部原子（默认，与旧版一致）
-        hetero_heavy — 非氢、非碳重原子
+        all          — 全部原子
+        hetero_heavy — 非氢、非碳重原子（默认，聚焦药效团相关原子）
         edge_heavy   — 重原子且非氢重邻居数 <= edge_max_heavy_neighbors（近似分子边缘）
         hetero_edge  — 非碳边缘重原子（极性/表面位点，常用于结合模式）
         combined     — (1-w)*全原子 + w*hetero_edge 加权分，w=combined_focus_weight
+
+    eps=1.5 A（默认）比 2.0 A 更好区分不同结合模式（2.0 A 约为 C-C 键长，过于粗糙）。
 
     KMeans 始终对整条分子的质心，不受子集影响。
     """
@@ -1080,8 +1186,9 @@ def evaluate_idea_b_clustering(
 # 想法C：配体效率 LE = (-ΔG) / N_heavy（Vina 近似 ΔG，kcal/mol）
 # =============================================================================
 
-# 将 LE 均值映射到 [0,1] 的参考区间（kcal·mol⁻¹·重原子⁻¹），可按项目口径调整
-IDEA_C_LE_SCORE_LOW = 0.12
+# 将 LE 均值映射到 [0,1] 的参考区间（kcal·mol⁻¹·重原子⁻¹）
+# 典型药物样分子 LE 范围 0.2-0.4 (Hopkins et al., 2014)，下限从 0.12 收紧至 0.18
+IDEA_C_LE_SCORE_LOW = 0.18
 IDEA_C_LE_SCORE_HIGH = 0.45
 
 
@@ -1104,7 +1211,7 @@ def evaluate_idea_c_ligand_efficiency(
     ΔG 采用与想法 A 相同的 Vina 亲和力（kcal/mol，负值表示有利结合），故 LE = -vina_score / N_heavy。
 
     假设 ``vina_scores[i]`` 与 ``molecules_with_pos[i]`` 一一对应（与 batch 导出顺序一致）；
-    仅对 mol 非空且 N_heavy > 0 的条目计算；有效样本数不足时失败。
+    仅对 mol 非空、N_heavy > 0 且 ``vina < 0``（对接成功）的条目计算；跳过失败对接以免负 LE。
 
     Returns:
         dict: score, le_mean, le_median, le_std, le_list, n_valid, n_heavy_per_mol,
@@ -1121,6 +1228,7 @@ def evaluate_idea_c_ligand_efficiency(
         'n_molecules': 0,
         'n_vina_scores': 0,
         'n_aligned': 0,
+        'n_skipped_failed_vina': 0,
         'quality_label': 'unknown',
         'success': False,
         'message': '',
@@ -1141,6 +1249,7 @@ def evaluate_idea_c_ligand_efficiency(
 
     le_list = []
     n_heavy_list = []
+    n_skipped_failed_vina = 0
     for i in range(n_aligned):
         mol, _ = molecules_with_pos[i]
         if mol is None:
@@ -1149,6 +1258,10 @@ def evaluate_idea_c_ligand_efficiency(
         if nh <= 0:
             continue
         dg = float(v_arr[i])
+        # 失败对接常返回正值；跳过以保持下标对齐且不产生负 LE
+        if not np.isfinite(dg) or dg >= 0.0:
+            n_skipped_failed_vina += 1
+            continue
         le = -dg / nh
         if not np.isfinite(le):
             continue
@@ -1160,7 +1273,11 @@ def evaluate_idea_c_ligand_efficiency(
         empty['n_molecules'] = n_mol
         empty['n_vina_scores'] = n_v
         empty['n_aligned'] = n_aligned
-        empty['message'] = '无有效 (分子, Vina) 对可计算 LE（检查 mol 与重原子数）'
+        empty['n_skipped_failed_vina'] = n_skipped_failed_vina
+        empty['message'] = (
+            '无有效 (分子, Vina) 对可计算 LE'
+            f'（跳过失败对接 {n_skipped_failed_vina}；检查 mol 与重原子数）'
+        )
         return empty
 
     arr = np.array(le_list, dtype=np.float64)
@@ -1186,6 +1303,8 @@ def evaluate_idea_c_ligand_efficiency(
         f'LE_mean={le_mean:.4f} kcal·mol⁻¹·重原子⁻¹ (n={n_valid})',
         f'LE_median={le_median:.4f}',
     ]
+    if n_skipped_failed_vina:
+        msg_parts.append(f'跳过失败对接 {n_skipped_failed_vina}')
     if n_aligned < n_mol or n_aligned < n_v:
         msg_parts.append(f'对齐: 前 {n_aligned} 条 (分子 {n_mol}, Vina {n_v})')
     msg = '; '.join(msg_parts)
@@ -1201,6 +1320,7 @@ def evaluate_idea_c_ligand_efficiency(
         'n_molecules': n_mol,
         'n_vina_scores': n_v,
         'n_aligned': n_aligned,
+        'n_skipped_failed_vina': n_skipped_failed_vina,
         'le_low_for_score': le_low_for_score,
         'le_high_for_score': le_high_for_score,
         'quality_label': label,
@@ -1219,12 +1339,12 @@ def evaluate_idea_d_druglikeness(molecules_with_pos):
 
     Returns:
         dict: {score, qed_mean, qed_std, qed_list, sa_mean, sa_std, sa_list,
-               lipinski_mean, lipinski_list, pains_ratio, n_valid, quality_label, success}
+               lipinski_mean, lipinski_list, pains_ratio, veber_ratio, n_valid, quality_label, success}
     """
     if not molecules_with_pos or get_chem is None or is_pains is None or obey_lipinski is None:
         return {
             'score': 0.0, 'qed_mean': None, 'sa_mean': None,
-            'lipinski_mean': None, 'pains_ratio': None,
+            'lipinski_mean': None, 'pains_ratio': None, 'veber_ratio': None,
             'qed_list': [], 'sa_list': [], 'lipinski_list': [],
             'quality_label': 'unknown', 'success': False,
             'message': '无分子数据或 scoring_func 未安装'
@@ -1232,6 +1352,7 @@ def evaluate_idea_d_druglikeness(molecules_with_pos):
 
     qed_list, sa_list, lipinski_list = [], [], []
     pains_hits = 0
+    veber_passes = 0
     n_valid = 0
 
     for mol, _ in molecules_with_pos:
@@ -1250,6 +1371,10 @@ def evaluate_idea_d_druglikeness(molecules_with_pos):
                 lipinski_list.append(int(lip) / 5.0)
             if is_pains(mol):
                 pains_hits += 1
+            if passes_veber is not None:
+                rot_bonds = Chem.rdMolDescriptors.CalcNumRotatableBonds(mol)
+                if passes_veber(mol, rot_bonds=rot_bonds):
+                    veber_passes += 1
             n_valid += 1
         except Exception:
             pass
@@ -1257,7 +1382,7 @@ def evaluate_idea_d_druglikeness(molecules_with_pos):
     if n_valid == 0:
         return {
             'score': 0.0, 'qed_mean': None, 'sa_mean': None,
-            'lipinski_mean': None, 'pains_ratio': None,
+            'lipinski_mean': None, 'pains_ratio': None, 'veber_ratio': None,
             'qed_list': [], 'sa_list': [], 'lipinski_list': [],
             'quality_label': 'unknown', 'success': False,
             'message': '无有效化学指标'
@@ -1269,13 +1394,18 @@ def evaluate_idea_d_druglikeness(molecules_with_pos):
     sa_std   = float(np.std(sa_list)) if len(sa_list) > 1 else 0.0
     lipinski_mean = float(np.mean(lipinski_list)) if lipinski_list else 0.0
     pains_ratio = pains_hits / n_valid
+    veber_ratio = veber_passes / n_valid
 
-    # 综合分数：QED(40%) + SA(30%) + Lipinski(20%) + PAINS惩罚(10%)
+    # 综合分数：QED(35%) + SA(25%) + Lipinski(15%) + Veber(10%) + PAINS惩罚(15%)
+    # PAINS 权重从 10% 提升至 15%（假阳性风险高）；新增 Veber 规则
+    weights = (0.35, 0.25, 0.15, 0.10, 0.15)
+    assert abs(sum(weights) - 1.0) < 1e-6, f"Druglikeness weights must sum to 1.0, got {sum(weights)}"
     score = (
-        0.4 * min(1.0, qed_mean) +
-        0.3 * min(1.0, sa_mean) +
-        0.2 * lipinski_mean +
-        0.1 * (1.0 - pains_ratio)
+        weights[0] * min(1.0, qed_mean) +
+        weights[1] * min(1.0, sa_mean) +
+        weights[2] * lipinski_mean +
+        weights[3] * veber_ratio +
+        weights[4] * (1.0 - pains_ratio)
     )
     score = float(np.clip(score, 0.0, 1.0))
 
@@ -1292,10 +1422,11 @@ def evaluate_idea_d_druglikeness(molecules_with_pos):
         'sa_mean': sa_mean,   'sa_std': sa_std,   'sa_list': sa_list,
         'lipinski_mean': lipinski_mean, 'lipinski_list': lipinski_list,
         'pains_ratio': pains_ratio,
+        'veber_ratio': veber_ratio,
         'n_valid': n_valid,
         'quality_label': label,
         'success': True,
-        'message': f'QED={qed_mean:.2f}, SA={sa_mean:.2f}, Lipinski={lipinski_mean:.2f}, PAINS={pains_ratio*100:.1f}%'
+        'message': f'QED={qed_mean:.2f}, SA={sa_mean:.2f}, Lipinski={lipinski_mean:.2f}, Veber={veber_ratio*100:.1f}%, PAINS={pains_ratio*100:.1f}%'
     }
 
 
@@ -1326,12 +1457,14 @@ def _count_complete_molecules_smiles_no_dot(molecules_with_pos):
 
 
 def _idea_e_score_from_rate(rate_for_score):
-    """Map yield rate in [0, 1] to quality score and label (same thresholds as legacy E)."""
-    if rate_for_score >= 0.9:
+    """Map yield rate in [0, 1] to quality score and label (tightened thresholds)."""
+    if rate_for_score >= 0.95:
         return 1.0, 'high'
-    if rate_for_score >= 0.7:
-        return 0.5 + (rate_for_score - 0.7) / 0.2 * 0.5, 'medium'
-    return rate_for_score / 0.7 * 0.5, 'low'
+    if rate_for_score >= 0.80:
+        return 0.6 + (rate_for_score - 0.80) / 0.15 * 0.4, 'high'
+    if rate_for_score >= 0.60:
+        return 0.3 + (rate_for_score - 0.60) / 0.20 * 0.3, 'medium'
+    return rate_for_score / 0.60 * 0.3, 'low'
 
 
 def evaluate_idea_e_reconstruction(pt_path, molecules_with_pos, expected_n_molecules=None):
@@ -1447,18 +1580,19 @@ def evaluate_idea_e_reconstruction(pt_path, molecules_with_pos, expected_n_molec
 
 def evaluate_idea_f_uniqueness(molecules_with_pos):
     """
-    想法F：分子唯一性/多样性
+    想法F：分子唯一性（score 仅由 unique_ratio 决定）。
 
-    新增：计算 Morgan 指纹的平均 Tanimoto 多样性（1 - 相似度）
-
-    Returns:
-        dict: {score, unique_ratio, n_unique, n_total,
-               tanimoto_diversity, quality_label, success}
+    满分门槛 unique_full_at=0.95（约 100 个中 ≥95 个不同 SMILES）。
+    分段：≥0.95→1.0；[0.70,0.95)→0.70–1.0；[0.40,0.70)→0.30–0.70；<0.40→[0,0.30]。
+    ``fingerprint_dissimilarity`` 为参考指标（不进总分）；``tanimoto_diversity`` 为别名。
     """
+    unique_full_at = 0.95
     if not molecules_with_pos or Chem is None:
         return {
             'score': 0.0, 'unique_ratio': 0.0, 'n_unique': 0, 'n_total': 0,
-            'tanimoto_diversity': None,
+            'unique_full_at': unique_full_at,
+            'fingerprint_dissimilarity': None, 'tanimoto_diversity': None,
+            'fps_matrix': None,
             'quality_label': 'unknown', 'success': False, 'message': '无分子数据'
         }
 
@@ -1478,49 +1612,64 @@ def evaluate_idea_f_uniqueness(molecules_with_pos):
     if n_complete == 0:
         return {
             'score': 0.0, 'unique_ratio': 0.0, 'n_unique': 0, 'n_total': 0,
-            'tanimoto_diversity': None,
+            'unique_full_at': unique_full_at,
+            'fingerprint_dissimilarity': None, 'tanimoto_diversity': None,
+            'fps_matrix': None,
             'quality_label': 'unknown', 'success': False, 'message': '无有效 SMILES'
         }
 
     n_unique = len(smiles_set)
     unique_ratio = n_unique / n_complete
 
-    # Tanimoto 多样性（采样计算，避免 O(N^2) 全量）
-    tanimoto_diversity = None
+    # Tanimoto/余弦相异度（采样，避免 O(N^2)；不进总分）
+    fingerprint_dissimilarity = None
     fps_matrix, _ = _compute_morgan_fingerprints(molecules_with_pos)
     if fps_matrix is not None and len(fps_matrix) >= 2 and HAS_SKLEARN:
         n_fps = len(fps_matrix)
         sample_size = min(n_fps, 200)
         idx = np.random.choice(n_fps, sample_size, replace=False) if n_fps > sample_size else np.arange(n_fps)
         fps_sample = fps_matrix[idx]
-        # 近似 Tanimoto：用余弦距离
+        # 余弦相似度 → 相异度（历史字段曾误称 Tanimoto）
         sim_matrix = (fps_sample @ fps_sample.T) / (
             np.outer(np.linalg.norm(fps_sample, axis=1), np.linalg.norm(fps_sample, axis=1)) + 1e-8
         )
         upper_tri = sim_matrix[np.triu_indices(len(fps_sample), k=1)]
-        tanimoto_diversity = float(1.0 - np.mean(upper_tri))
+        fingerprint_dissimilarity = float(1.0 - np.mean(upper_tri))
 
-    # 理想唯一性区间 0.3-0.8
-    if 0.3 <= unique_ratio <= 0.8:
+    # ≥95% unique 满分；中等唯一性线性过渡；低唯一性惩罚 mode-collapse
+    r = unique_ratio
+    if r >= unique_full_at:
         score = 1.0
+    elif r >= 0.70:
+        score = 0.70 + (r - 0.70) / 0.25 * 0.30  # 0.70→0.70, 0.95→1.0
+    elif r >= 0.40:
+        score = 0.30 + (r - 0.40) / 0.30 * 0.40  # 0.40→0.30, 0.70→0.70
+    else:
+        score = r / 0.40 * 0.30  # 0→0, 0.40→0.30
+
+    if score >= 0.6:
         label = 'high'
-    elif 0.15 <= unique_ratio < 0.3 or 0.8 < unique_ratio <= 0.95:
-        score = 0.6
+    elif score >= 0.3:
         label = 'medium'
     else:
-        score = max(0.0, 0.4 - abs(unique_ratio - 0.5) * 0.5)
         label = 'low'
 
     return {
-        'score': min(1.0, score),
+        'score': min(1.0, float(score)),
         'unique_ratio': unique_ratio,
         'n_unique': n_unique,
         'n_total': n_complete,
-        'tanimoto_diversity': tanimoto_diversity,
+        'unique_full_at': unique_full_at,
+        'fingerprint_dissimilarity': fingerprint_dissimilarity,
+        'tanimoto_diversity': fingerprint_dissimilarity,  # legacy alias
         'fps_matrix': fps_matrix,
         'quality_label': label,
         'success': True,
-        'message': f'唯一性={unique_ratio*100:.1f}% ({n_unique}/{n_complete}), Tanimoto多样性={tanimoto_diversity}'
+        'message': (
+            f'唯一性={unique_ratio*100:.1f}% ({n_unique}/{n_complete}), '
+            f'满分线≥{unique_full_at*100:.0f}%, '
+            f'指纹余弦相异度={fingerprint_dissimilarity}'
+        ),
     }
 
 
@@ -1576,17 +1725,18 @@ def evaluate_idea_g_size_consistency(molecules_with_pos):
     mw_std  = float(np.std(mw_list))
     mw_cv   = mw_std / mw_mean if mw_mean > 0 else 0.0
 
-    if mw_cv < 0.2:
+    # CV 阈值：收紧以提高区分度
+    if mw_cv < 0.15:
         score = 1.0
         label = 'high'
-    elif mw_cv < 0.3:
+    elif mw_cv < 0.25:
         score = 0.8
         label = 'high'
-    elif mw_cv < 0.5:
+    elif mw_cv < 0.4:
         score = 0.5
         label = 'medium'
     else:
-        score = max(0.0, 0.5 - (mw_cv - 0.5))
+        score = max(0.0, 0.5 - (mw_cv - 0.4) * 0.8)
         label = 'low'
 
     return {
@@ -1611,11 +1761,11 @@ IDEA_H_FPOCKET_PROTEIN_FALLBACK_OPTIMAL_MAX = 2200.0
 IDEA_H_FPOCKET_PROTEIN_FALLBACK_ZERO_BELOW = 80.0
 IDEA_H_FPOCKET_PROTEIN_FALLBACK_ZERO_ABOVE = 4500.0
 
-# 可视化：与文档一致的「配体 / M.C.」参照刻度（400–600 满分，100 / 900 归零尾）
-IDEA_H_VIZ_REF_OPT_MIN = 400.0
-IDEA_H_VIZ_REF_OPT_MAX = 600.0
-IDEA_H_VIZ_REF_ZERO_BELOW = 100.0
-IDEA_H_VIZ_REF_ZERO_ABOVE = 900.0
+# 可视化：参照刻度（300–800 满分，80 / 2000 归零尾）
+IDEA_H_VIZ_REF_OPT_MIN = 300.0
+IDEA_H_VIZ_REF_OPT_MAX = 800.0
+IDEA_H_VIZ_REF_ZERO_BELOW = 80.0
+IDEA_H_VIZ_REF_ZERO_ABOVE = 2000.0
 # H volume figure: fixed axis cap (extend only if scored volume exceeds this)
 IDEA_H_VIZ_X_MAX_DEFAULT = 1500.0
 # Light orange for sub-optimal reference bands (between zero tails and full-score band)
@@ -1874,9 +2024,9 @@ def _sample_uniform_in_ball(center, radius, n, rng):
     return center + rad[:, None] * v
 
 
-def _evaluate_idea_h_mc_only(molecules_with_pos, optimal_min=400, optimal_max=600,
-                             zero_below=100.0, zero_above=900.0,
-                             centroid_radius=10.0, n_mc_samples=20000):
+def _evaluate_idea_h_mc_only(molecules_with_pos, optimal_min=300, optimal_max=800,
+                             zero_below=80.0, zero_above=2000.0,
+                             centroid_radius=12.0, n_mc_samples=20000):
     """
     想法H（MC）：质心均值点 + 球内 MC，配体 vdW 占据比例 × 球体积。
     """
@@ -1921,7 +2071,7 @@ def _evaluate_idea_h_mc_only(molecules_with_pos, optimal_min=400, optimal_max=60
 
     frac = n_hit / float(n_mc_samples)
     volume_ang3 = float(frac * v_ball)
-    volume_method = 'mean_centroid_10A_ligand_mc'
+    volume_method = 'mean_centroid_12A_ligand_mc'
 
     zb, za = float(zero_below), float(zero_above)
     score, label = _idea_h_score_from_volume(volume_ang3, optimal_min, optimal_max, zb, za)
@@ -1949,7 +2099,7 @@ def _evaluate_idea_h_mc_only(molecules_with_pos, optimal_min=400, optimal_max=60
         'fpocket_skipped': False,
         'fpocket_skip_reason': None,
         'fpocket_resolved_executable': None,
-        'volume_score_band': 'mc_centroid_10A',
+        'volume_score_band': 'mc_centroid_12A',
         'message': (
             f'口袋体积≈{volume_ang3:.0f} Å³ (质心均值点 {r:.0f}Å 球内配体占据, n分子={n_centroids}, '
             f'占据率={frac*100:.1f}%, 球体积上限≈{v_ball:.0f} Å³)'
@@ -1957,9 +2107,9 @@ def _evaluate_idea_h_mc_only(molecules_with_pos, optimal_min=400, optimal_max=60
     }
 
 
-def evaluate_idea_h_pocket_size(molecules_with_pos, optimal_min=400, optimal_max=600,
-                                 zero_below=100.0, zero_above=900.0,
-                                 centroid_radius=10.0, n_mc_samples=20000,
+def evaluate_idea_h_pocket_size(molecules_with_pos, optimal_min=300, optimal_max=800,
+                                 zero_below=80.0, zero_above=2000.0,
+                                 centroid_radius=12.0, n_mc_samples=20000,
                                  fpocket_protein_pdb=None, fpocket_cmd='fpocket',
                                  fpocket_pocket_index=1, fpocket_max_ligand_models=50,
                                  fpocket_timeout=600,
@@ -1968,10 +2118,10 @@ def evaluate_idea_h_pocket_size(molecules_with_pos, optimal_min=400, optimal_max
     """
     想法H：口袋体积。
 
-    - 未指定 ``fpocket_protein_pdb``：沿用 **MC**（质心均值 10 Å 球内配体 vdW 占据），
-      满分区间 ``optimal_min``–``optimal_max``（默认 400–600 Å³）。
+    - 未指定 ``fpocket_protein_pdb``：沿用 **MC**（质心均值 12 Å 球内配体 vdW 占据），
+      满分区间 ``optimal_min``–``optimal_max``（默认 300–800 Å³，归零尾 80 / 2000）。
     - 指定 ``fpocket_protein_pdb`` 且蛋白 FPocket 成功：**优先用配体 FPocket Volume** 按与 MC 相同的
-      ``optimal_min``–``optimal_max``（默认 400–600 Å³ 满分，100/900 归零尾）打分；配体 FPocket 失败时
+      ``optimal_min``–``optimal_max``（默认 300–800 Å³ 满分）打分；配体 FPocket 失败时
       才用蛋白 Volume + 宽区间回退（``IDEA_H_FPOCKET_PROTEIN_FALLBACK_*``，可由 ``fpocket_optimal_*`` 覆盖）。
     - 找不到 fpocket 可执行文件时 **自动退回 MC**（``fpocket_skipped=True``）。
     """
@@ -2270,6 +2420,9 @@ def visualize_clustering_2d(molecules_with_pos, idea_b_result=None,
 
     Subplots: DBSCAN / molecule index / KDE / KMeans / CPK / raw X-Y;
     若评估使用非全原子子集且返回 coords_focus，额外保存 B_clustering_dbscan_focus.png
+
+    注意：主图 DBSCAN 在 2D 投影上对全部原子重跑（eps≈0.8），仅为示意；
+    想法 B 打分使用 3D + 默认 hetero_heavy、eps=1.5（见 idea_b_result）。
     """
     if not HAS_MATPLOTLIB:
         print("⚠️ visualize_clustering_2d needs matplotlib")
@@ -2340,7 +2493,7 @@ def visualize_clustering_2d(molecules_with_pos, idea_b_result=None,
         _safe_savefig(fig, p)
         saved[name.replace('.png', '')] = str(p)
 
-    # ---- Fig 1: DBSCAN ----
+    # ---- Fig 1: DBSCAN (illustrative 2D; score uses 3D hetero_heavy eps=1.5) ----
     fig1, ax1 = plt.subplots(figsize=(7, 5))
     for li, lbl in enumerate(unique_lbls):
         mask = dbscan_labels == lbl
@@ -2350,6 +2503,11 @@ def visualize_clustering_2d(molecules_with_pos, idea_b_result=None,
         lname = f'Noise ({mask.sum()})' if lbl == -1 else f'Cluster {lbl} ({mask.sum()})'
         ax1.scatter(coords_2d[mask, 0], coords_2d[mask, 1],
                     c=[color], s=s, alpha=alpha, label=lname, rasterized=True)
+    ax1.set_title(
+        'Illustrative 2D DBSCAN (all atoms, eps≈0.8); '
+        'score uses 3D hetero_heavy eps=1.5',
+        fontsize=8, color='#444444',
+    )
     ax1.set_xlabel(ax_xlabel, fontsize=8)
     ax1.set_ylabel(ax_ylabel, fontsize=8)
     ax1.grid(True, alpha=0.3, linewidth=0.5)
@@ -2990,7 +3148,9 @@ def visualize_fingerprint_diversity(molecules_with_pos, idea_f_result=None,
         stats_labels = ['Unique', 'Duplicate']
         n_unique = idea_f_result.get('n_unique', 0)
         n_total  = idea_f_result.get('n_total', n_unique)
-        stats_vals = [n_unique, n_total - n_unique]
+        unique_ratio = idea_f_result.get('unique_ratio', n_unique / max(n_total, 1))
+        full_at = float(idea_f_result.get('unique_full_at', 0.95))
+        stats_vals = [n_unique, max(0, n_total - n_unique)]
         colors_pie = ['#4CAF50', '#FF5722']
         wedges, texts, autotexts = ax4.pie(
             stats_vals, labels=stats_labels, colors=colors_pie,
@@ -2999,6 +3159,11 @@ def visualize_fingerprint_diversity(molecules_with_pos, idea_f_result=None,
         )
         for at in autotexts:
             at.set_fontsize(10)
+        ax4.set_title(
+            f'unique_ratio={unique_ratio*100:.1f}% ({n_unique}/{n_total})\n'
+            f'full score @ ≥{full_at*100:.0f}% unique',
+            fontsize=9,
+        )
     else:
         ax4.text(0.5, 0.5, 'No uniqueness data', ha='center', va='center',
                  transform=ax4.transAxes, fontsize=10)
@@ -3099,10 +3264,9 @@ def visualize_pocket_volume(idea_h_result, output_dir=None, title_prefix=''):
     """
     Idea H - Pocket volume visualization
 
-    X-axis default limit 1500 Å³ (extends slightly if scored volume exceeds it). Background: 0-100 and
-    900-1500 use the same red zero-reference tint; 100-400 and 600-900 use light orange; 400-600 stays
-    green full-score. Protein FPocket fallback highlights use the same light orange (not a large
-    saturated block).
+    X-axis default limit 1500 Å³ (extends slightly if scored volume exceeds it). Background: below
+    80 and above 2000 use red zero-reference tint; between zero tails and the 300–800 full-score
+    band use light orange. Protein FPocket fallback highlights use the same light orange.
     """
     if not HAS_MATPLOTLIB:
         return {}
@@ -3123,8 +3287,8 @@ def visualize_pocket_volume(idea_h_result, output_dir=None, title_prefix=''):
     band = idea_h_result.get('volume_score_band') or ''
     prot_fb = band == 'fpocket_protein_fallback'
 
-    # 背景区：0–100 与 900–1500 为零分参照（同色系）；100–400、600–900 为淡橙；400–600 满分绿。
-    # 横轴默认上限 1500，避免右侧珊瑚色块随体积无限拉长。
+    # 背景区：零分尾 + 300–800 满分绿 + 中间淡橙（与 MC/配体 FPocket 打分带一致）
+    # 横轴默认上限 1500，避免右侧色块随体积无限拉长。
     vmin, vmax, zb, za = rmin, rmax, rzb, rza
 
     fig, ax = plt.subplots(figsize=(7, 4))
@@ -3138,7 +3302,7 @@ def visualize_pocket_volume(idea_h_result, output_dir=None, title_prefix=''):
     if rzb > 0:
         ax.axvspan(x_min, min(rzb, x_max), alpha=red_alpha, color='red',
                    label=f'Zero score: V < {rzb:.0f} (reference)')
-    # 100–400、600–900：淡橙（参照区间）
+    # 零尾与满分带之间：淡橙（参照区间）
     if rzb < vmin:
         ax.axvspan(
             max(x_min, rzb), min(vmin, x_max),
@@ -3173,7 +3337,7 @@ def visualize_pocket_volume(idea_h_result, output_dir=None, title_prefix=''):
                 label=f'H full-score band (protein) {act_lo:.0f}-{act_hi:.0f}',
             )
         note = (
-            f'Axis reference: ligand/M.C. 400-600 / tails 100-900; '
+            f'Axis reference: ligand/M.C. 300-800 / tails 80-2000; '
             f'scoring used protein volume, band [{act_lo:.0f}, {act_hi:.0f}], '
             f'zero if V<{a_zb:.0f} or V≥{a_za:.0f}'
         )
@@ -3203,12 +3367,13 @@ def visualize_radar_summary(result, output_dir=None, title_prefix=''):
     """
     Summary radar - 8-axis quality spider chart (A–H, including C ligand efficiency LE).
 
-    Subplots: radar / bar chart
+    Subplots: radar / bar chart.
+    Reference bands use overall thresholds (high≥0.65 / medium≥0.35).
     """
     if not HAS_MATPLOTLIB:
         return {}
     idea_keys = ['idea_a', 'idea_b', 'idea_c', 'idea_d', 'idea_e', 'idea_f', 'idea_g', 'idea_h']
-    idea_labels = ['A Vina', 'B Cluster', 'C LE', 'D Drug', 'E Recon', 'F Divers', 'G Size', 'H Pocket']
+    idea_labels = ['A Vina', 'B Cluster', 'C LE', 'D Drug', 'E Recon', 'F Unique', 'G Size', 'H Pocket']
     scores = []
     for k in idea_keys:
         r = result.get(k, {})
@@ -3226,7 +3391,7 @@ def visualize_radar_summary(result, output_dir=None, title_prefix=''):
     angles += angles[:1]
     vals = scores + scores[:1]
     ax_radar.set_facecolor('#f4f4f8')
-    for r_thresh, col, alpha in [(0.6, 'green', 0.07), (0.3, 'orange', 0.07)]:
+    for r_thresh, col, alpha in [(0.65, 'green', 0.07), (0.35, 'orange', 0.07)]:
         ax_radar.fill(angles, [r_thresh] * (N + 1), color=col, alpha=alpha)
     ax_radar.plot(angles, vals, 'o-', lw=2.2, color='steelblue', zorder=5)
     ax_radar.fill(angles, vals, alpha=0.30, color='steelblue')
@@ -3249,16 +3414,16 @@ def visualize_radar_summary(result, output_dir=None, title_prefix=''):
     fig2, ax_bar = plt.subplots(figsize=(7, 5))
     colors_bar = []
     for s in scores:
-        if s >= 0.6:
+        if s >= 0.65:
             colors_bar.append('#4CAF50')
-        elif s >= 0.3:
+        elif s >= 0.35:
             colors_bar.append('#FF9800')
         else:
             colors_bar.append('#F44336')
     bars = ax_bar.barh(idea_labels, scores, color=colors_bar,
                        edgecolor='white', height=0.6)
-    ax_bar.axvline(0.6, color='green', linestyle='--', lw=1.2, alpha=0.7, label='High threshold 0.6')
-    ax_bar.axvline(0.3, color='orange', linestyle='--', lw=1.2, alpha=0.7, label='Med threshold 0.3')
+    ax_bar.axvline(0.65, color='green', linestyle='--', lw=1.2, alpha=0.7, label='Overall high 0.65')
+    ax_bar.axvline(0.35, color='orange', linestyle='--', lw=1.2, alpha=0.7, label='Overall med≈0.35')
     ax_bar.axvline(overall, color='navy', linestyle='-', lw=2.0, alpha=0.9,
                    label=f'Overall {overall:.3f}')
     for bar, val in zip(bars, scores):
@@ -3268,9 +3433,9 @@ def visualize_radar_summary(result, output_dir=None, title_prefix=''):
     ax_bar.set_xlabel('Quality score (0-1)', fontsize=9)
     ax_bar.legend(fontsize=7, loc='lower right')
     ax_bar.grid(True, alpha=0.3, axis='x')
-    ax_bar.axvspan(0.6, 1.15, alpha=0.05, color='green')
-    ax_bar.axvspan(0.3, 0.6,  alpha=0.05, color='orange')
-    ax_bar.axvspan(0.0, 0.3,  alpha=0.05, color='red')
+    ax_bar.axvspan(0.65, 1.15, alpha=0.05, color='green')
+    ax_bar.axvspan(0.35, 0.65, alpha=0.05, color='orange')
+    ax_bar.axvspan(0.0, 0.35,  alpha=0.05, color='red')
     plt.tight_layout()
     _safe_savefig(fig2, output_dir / 'summary_bar.png')
     saved['summary_bar'] = str(output_dir / 'summary_bar.png')
@@ -3398,10 +3563,11 @@ def evaluate_pocket_quality(
     protein_root=None,
     data_id=None,
     atom_mode='add_aromatic',
-    weight_a=0.25, weight_b=0.15, weight_c=0.15,
-    weight_d=0.15, weight_e=0.10, weight_f=0.10, weight_g=0.10,
-    weight_h=0.08,
-    idea_b_atom_coord_subset='all',
+    weight_a=0.28, weight_b=0.15, weight_c=0.15,
+    weight_d=0.15, weight_e=0.05, weight_f=0.08, weight_g=0.07,
+    weight_h=0.07,
+    idea_b_atom_coord_subset='hetero_heavy',
+    idea_b_eps=1.5,
     idea_b_edge_max_heavy_neighbors=2,
     idea_b_combined_focus_weight=0.5,
     visualize=False, vis_dir=None, use_tsne=False,
@@ -3429,7 +3595,7 @@ def evaluate_pocket_quality(
 
     Args:
         idea_b_atom_coord_subset : 想法B 的 DBSCAN 点集（all / hetero_heavy / edge_heavy /
-            hetero_edge / combined），默认 all；combined 为全原子与 hetero_edge 加权。
+            hetero_edge / combined），默认 hetero_heavy；combined 为全原子与 hetero_edge 加权。
         idea_b_edge_max_heavy_neighbors : edge_heavy / hetero_edge 的非氢重邻居上限。
         idea_b_combined_focus_weight : combined 模式下 hetero_edge 分项权重 w。
         vina_pocket_id : 匹配 eval_{id}_* 的目录名片段；默认由 data_id 或 'custom' 决定。
@@ -3503,6 +3669,7 @@ def evaluate_pocket_quality(
     )
     idea_b = evaluate_idea_b_clustering(
         molecules,
+        eps=idea_b_eps,
         atom_coord_subset=idea_b_atom_coord_subset,
         edge_max_heavy_neighbors=idea_b_edge_max_heavy_neighbors,
         combined_focus_weight=idea_b_combined_focus_weight,
@@ -3561,7 +3728,7 @@ def evaluate_pocket_quality(
 
     overall_score = weighted_sum / total_weight if total_weight > 0 else 0.0
 
-    if overall_score >= 0.6:
+    if overall_score >= 0.65:
         overall_label = 'high'
     elif overall_score >= 0.3:
         overall_label = 'medium'
@@ -3593,6 +3760,7 @@ def evaluate_pocket_quality(
         'idea_h_ligand_path': idea_h_ligand_path_resolved,
         'idea_h_ligand_override_used': idea_h_ligand_override_used,
         'idea_e_expected_n_molecules': idea_e_expected_n_molecules,
+        'vis_dir': str(Path(vis_dir).resolve()) if vis_dir else None,
     }
 
     # 可视化：vis_dir 由调用方传入（已为 蛋白质编号_时间戳 结构）
@@ -3609,6 +3777,7 @@ def evaluate_pocket_quality(
             use_tsne=use_tsne,
         )
         result['visualizations'] = vis_paths
+        print(f"Visualization dir -> {result['vis_dir']}", flush=True)
 
     return result
 
@@ -3825,13 +3994,13 @@ def print_evaluation_report(result):
     print()
 
     f = result.get('idea_f', {})
-    print('【想法F】分子唯一性与多样性')
+    print('【想法F】分子唯一性（进分）与指纹相异度（参考）')
     print(f"  状态: {'成功' if f.get('success') else '失败'}")
     if f.get('success'):
         print(f"  唯一分子/有效分子: {f.get('n_unique')}/{f.get('n_total')}")
         print(f"  唯一性比例: {f.get('unique_ratio', 0)*100:.1f}%")
-        td = f.get('tanimoto_diversity')
-        print(f"  Tanimoto 多样性: {f'{td:.4f}' if td is not None else 'N/A'}")
+        fd = f.get('fingerprint_dissimilarity', f.get('tanimoto_diversity'))
+        print(f"  指纹余弦相异度(参考,不进分): {f'{fd:.4f}' if fd is not None else 'N/A'}")
         print(f"  质量分数: {f.get('score'):.3f} ({f.get('quality_label')})")
     else:
         print(f"  备注: {f.get('message', '')}")
@@ -3860,7 +4029,7 @@ def print_evaluation_report(result):
     elif h.get('ligand_fpocket_override_note'):
         print(f"  备注: {h.get('ligand_fpocket_override_note')}")
     else:
-        print('【想法H】口袋体积（质心均值 10Å 球内占据 / MC）')
+        print('【想法H】口袋体积（质心均值 12Å 球内占据 / MC，满分带 300–800 Å³）')
     print(f"  状态: {'成功' if h.get('success') else '失败'}")
     if h.get('success'):
         vol = h.get('volume_ang3')
@@ -3894,15 +4063,15 @@ def print_evaluation_report(result):
             vsref = h.get('single_sphere_ref_volume_ang3')
             frac = h.get('ligand_occupancy_fraction')
             if nc is not None and vsref is not None:
-                print(f"  分子数: {nc}；10Å 球体积上限≈{vsref:.0f} Å³", end='')
+                print(f"  分子数: {nc}；12Å 球体积上限≈{vsref:.0f} Å³", end='')
                 if frac is not None:
                     print(f"；MC 占据率={frac*100:.1f}%")
                 else:
                     print()
         if h.get('message'):
             print(f"  摘要: {h.get('message')}")
-        omin = h.get('optimal_vol_min', 400)
-        omax = h.get('optimal_vol_max', 600)
+        omin = h.get('optimal_vol_min', 300)
+        omax = h.get('optimal_vol_max', 800)
         zb = h.get('vol_score_zero_below', 100)
         za = h.get('vol_score_zero_above', 900)
         print(
@@ -3962,6 +4131,13 @@ def main():
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument('--pocket_pdb', type=str, help='口袋 PDB 文件路径（将调用 batch 脚本生成）')
     g.add_argument('--pt_file', type=str, help='已有 .pt 文件路径（跳过生成，直接评估）')
+    g.add_argument(
+        '--pt_dir',
+        type=str,
+        metavar='DIR',
+        help='已有 .pt 所在目录：与 --start/--end 联用，按 result_{i}_*.pt 批量评估（不重新生成）；'
+             '未指定 --vina_outputs_dir 时默认用该目录定位 eval_*',
+    )
     g.add_argument('--run_batch', action='store_true',
                    help='运行 batch_sampleandeval_parallel 后评估指定范围')
     g.add_argument(
@@ -4006,12 +4182,14 @@ def main():
                         help='每任务 CPU 核心数，并行数 = num_cpu_cores // cores_per_task（默认: 1）')
 
     parser.add_argument('--atom_mode', type=str, default='add_aromatic')
-    parser.add_argument('--weight_a', type=float, default=0.25)
+    parser.add_argument('--weight_a', type=float, default=0.28,
+                        help='想法A Vina 权重（默认 0.28）')
     parser.add_argument('--weight_b', type=float, default=0.15)
     parser.add_argument('--weight_c', type=float, default=0.15,
                         help='想法C 配体效率 LE 权重（默认 0.15）')
     parser.add_argument('--weight_d', type=float, default=0.15)
-    parser.add_argument('--weight_e', type=float, default=0.10)
+    parser.add_argument('--weight_e', type=float, default=0.05,
+                        help='想法E 完整性权重（默认 0.05；E 易饱和）')
     parser.add_argument(
         '--idea_e_expected_n_molecules',
         type=int,
@@ -4023,10 +4201,11 @@ def main():
             "仅 --eval_ligands 时也可凭此启用想法E"
         ),
     )
-    parser.add_argument('--weight_f', type=float, default=0.10)
-    parser.add_argument('--weight_g', type=float, default=0.10)
-    parser.add_argument('--weight_h', type=float, default=0.08,
-                        help='想法H 口袋体积权重（默认0.08）')
+    parser.add_argument('--weight_f', type=float, default=0.08,
+                        help='想法F 唯一性权重（默认 0.08；≥95% unique 满分）')
+    parser.add_argument('--weight_g', type=float, default=0.07)
+    parser.add_argument('--weight_h', type=float, default=0.07,
+                        help='想法H 口袋体积权重（默认0.07；默认权重和=1.00）')
     parser.add_argument(
         '--fpocket_protein_pdb',
         type=str,
@@ -4093,10 +4272,11 @@ def main():
     parser.add_argument(
         '--idea_b_atom_subset',
         type=str,
-        default='all',
+        default='hetero_heavy',
         choices=('all', 'hetero_heavy', 'edge_heavy', 'hetero_edge', 'combined'),
-        help='想法B：DBSCAN 用的坐标子集。hetero_heavy=非H非C；edge_heavy=重邻居≤阈值的表面重原子；'
-             'hetero_edge=二者交；combined=(1-w)*全原子+w*hetero_edge（见下）',
+        help='想法B：DBSCAN 用的坐标子集（默认 hetero_heavy）。hetero_heavy=非H非C；'
+             'edge_heavy=重邻居≤阈值的表面重原子；hetero_edge=二者交；'
+             'combined=(1-w)*全原子+w*hetero_edge（见下）',
     )
     parser.add_argument(
         '--idea_b_edge_max_neighbors',
@@ -4201,6 +4381,20 @@ def main():
         if not pt_files_to_eval:
             pt_files_to_eval = pt_files
 
+    elif args.pt_dir:
+        pt_dir = Path(args.pt_dir).resolve()
+        if not pt_dir.is_dir():
+            print(f'❌ --pt_dir 不是目录或不存在: {pt_dir}')
+            sys.exit(1)
+        if args.vina_outputs_dir is None:
+            args.vina_outputs_dir = str(pt_dir)
+            print(f'--vina_outputs_dir 未指定，默认使用 --pt_dir: {pt_dir}')
+        pt_files_to_eval = find_pt_files_for_range(args.start, args.end, output_dir=pt_dir)
+        if not pt_files_to_eval:
+            print(f'❌ 在 {pt_dir} 未找到 result_{{{args.start}..{args.end}}}_*.pt')
+            sys.exit(1)
+        print(f'从 --pt_dir 收集到 {len(pt_files_to_eval)} 个 .pt（data_id {args.start}..{args.end}）')
+
     elif args.pocket_pdb:
         protein_path = Path(args.pocket_pdb)
         if not protein_path.exists():
@@ -4227,6 +4421,9 @@ def main():
             print(f'❌ .pt 文件不存在: {pt_path}')
             sys.exit(1)
         pt_files_to_eval = [str(pt_path)]
+        # 单文件时若未指定 vina_outputs_dir，用 .pt 所在目录
+        if args.vina_outputs_dir is None:
+            args.vina_outputs_dir = str(pt_path.parent.resolve())
 
     if not pt_files_to_eval:
         print('❌ 未找到可评估的 .pt 文件')

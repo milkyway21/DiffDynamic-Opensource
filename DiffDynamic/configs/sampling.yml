@@ -17,7 +17,7 @@ sample:
   dynamic:
     method: legacy
     time_boundary: 650
-    skip_refine: false
+    skip_refine: true
     large_step:
       batch_size: 5
       n_repeat: 1
@@ -117,8 +117,8 @@ sample:
     property_guidance:
       enable: false
   scaffold:
-    enable: false
-    mode: grow
+    enable: true
+    mode: dynamic_locked
     after_dynamic: false
     save_dynamic_before_scaffold: true
     optimization_style_naming: true
@@ -131,10 +131,10 @@ sample:
     use_with_noise: true
     use_adaptive_step: true
     use_time_scale: false
-    qed_weight: 1
-    sa_weight: 1
+    qed_weight: 1.0
+    sa_weight: 1.0
     diversity_weight: 0.5
-    rmsd_penalty_weight: 0
+    rmsd_penalty_weight: 0.0
     min_qed: 0.15
     min_sa: 0.15
     keep_original: true
@@ -144,6 +144,31 @@ sample:
       max_tanimoto: 0.9
       fingerprint_radius: 2
       fingerprint_nbits: 2048
+    # Murcko 侧链质心位点：grow / dynamic_locked / prudent 共用，引导额外原子初始放置
+    # 在去除位点上释放；单样本内聚成一团（仿从头 center+randn），不沿射线离散外推
+    murcko_sites:
+      p_active: 0.5
+      max_per_site: 20
+      min_per_site: 0
+      per_site_count_mode: sequential_random
+      per_site_add_mode: fragment_prior
+      jitter_std: 1.0
+      jitter_mode: gaussian
+      # 多原子沿 attachment 径向外推（Å）
+      radial_step: 0.25
+      radial_bulk: 0.35
+      radial_bulk_start: 4
+      # 默认 = 去掉的侧链数量；也可写整数强制上限（如 1）
+      max_active_sites: n_removed_sidechains
+      prefer_murcko_sites: true
+      save_json: true
+      overflow_mode: cap
+      dedup_dist: 0.5
+      # 位点 count=0 时保留该位点原侧链原子；false=旧行为全剥侧链
+      preserve_zero_allocation_sidechains: true
+    # 有参考配体时默认按配体性质自适应放宽 Gen0/晋级门控（可 enable:false 关闭）
+    adaptive_gates:
+      enable: true
     evolve:
       population_size: 50
       n_generations: 5
@@ -156,24 +181,29 @@ sample:
       lambda_coeff_a: 10
       lambda_coeff_b: 1
     grow:
-      n_extra_mode: pocket_prior
+      n_extra_mode: prior_minus_scaffold
       n_extra_fixed: 8
       n_extra_min: 3
       n_extra_max: 20
-      n_extra_min_clamp: 1
-      n_extra_max_clamp: 45
+      n_extra_min_clamp: 6
+      n_extra_max_clamp: 20
       num_samples: 200
-      start_t: 357
+      start_t: 361
       stride: 15
-      step_size: 0.3262
-      lambda_coeff_a: 47
-      lambda_coeff_b: 11
+      step_size: 0.3363
+      lambda_coeff_a: 37
+      lambda_coeff_b: 6
       min_qed: 0.2
       min_sa: 0.2
       filter_incomplete: false
   targetdiff_baseline_refine:
-    enable: false
+    enable: true
     start_t: 9
+    # start_t+1 = 反扩散步数；默认 10 步结构修复（与从头生成一致）
+    # lock_prefix: types_only=只锁骨架/零分配侧链原子类型（位置可被 refine 微调）；
+    #              types_and_pos=类型+坐标都还原；none=不还原
+    lock_prefix: types_and_pos
+    after_scaffold_init_only: false
     run_every_prudent_round: true
     refine_batch_size: null
   pre_docking:

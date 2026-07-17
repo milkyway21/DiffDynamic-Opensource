@@ -1508,7 +1508,8 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
                                     pos_clip=None, v_clip=None, log_ligand_input_mode='auto',
                                     max_gradient_steps=GRAD_FUSION_CAP_UNSPECIFIED,
                                     max_grad_fusion_iterations=GRAD_FUSION_CAP_UNSPECIFIED,
-                                    grad_fusion_anchor_t=None):
+                                    grad_fusion_anchor_t=None,
+                                    repaint_cfg=None):
 
         if num_steps is None:  # 如果未指定步数。
             num_steps = self.num_timesteps  # 默认使用全部时间步。
@@ -1607,7 +1608,8 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
             pos_only=pos_only,  # 是否仅更新位置。
             use_with_noise=use_with_noise,  # 是否使用带噪声方法（大步阶段通常为 False）。
             use_adaptive_step=use_adaptive_step,  # 是否启用自适应步长机制。
-            use_time_scale=use_time_scale  # 是否启用时间步对步长的乘算。
+            use_time_scale=use_time_scale,  # 是否启用时间步对步长的乘算。
+            repaint_cfg=repaint_cfg  # 骨架位置锁定等双遮罩配置（透传给 _dynamic_diffusion）。
         )
 
         ligand_pos = ligand_pos + offset[batch_ligand]  # 将坐标移回原参考系。
@@ -1636,7 +1638,8 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
                                     log_ligand_input_mode='auto',
                                     max_grad_fusion_iterations=GRAD_FUSION_CAP_UNSPECIFIED,
                                     max_gradient_steps=GRAD_FUSION_CAP_UNSPECIFIED,
-                                    grad_fusion_anchor_t=None):
+                                    grad_fusion_anchor_t=None,
+                                    repaint_cfg=None):
 
         if center_pos_mode is None:  # 未指定中心化模式时使用默认值。
             center_pos_mode = self.center_pos_mode
@@ -1734,7 +1737,8 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
                 pos_only=pos_only,  # 是否仅更新位置。
                 use_with_noise=use_with_noise,  # 是否使用带噪声方法。
                 use_adaptive_step=use_adaptive_step,  # 是否启用自适应步长机制（从配置读取）。
-                use_time_scale=use_time_scale  # 是否启用时间步对步长的乘算（从配置读取）。
+                use_time_scale=use_time_scale,  # 是否启用时间步对步长的乘算（从配置读取）。
+                repaint_cfg=repaint_cfg  # 骨架位置锁定等双遮罩配置（透传给 _dynamic_diffusion）。
             )
             pos_traj_total.extend(pos_traj)  # 累积位置轨迹。
             log_v_traj_total.extend(log_v_traj)  # 累积类别轨迹。

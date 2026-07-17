@@ -56,6 +56,65 @@ from utils.gpu_monitor_recorder import log_gpu_monitor_record  # 导入GPU监控
 from utils.sampling_recorder import extract_sampling_params, log_sampling_record  # 导入采样记录工具。
 from show_sampling_steps import generate_sampling_steps_text  # 导入采样步骤生成函数。
 from utils.molecule_id import extract_protein_id, generate_molecule_id  # 分子身份证（不拉取 evaluate/meeko）
+from utils.scaffold_sites import (
+    build_extra_atom_positions,
+    cap_n_extra_for_sites,
+    get_murcko_sites_cfg,
+    load_or_extract_attachment_sites,
+    resolve_preserved_sidechains,
+    uses_site_budget_placement,
+)
+
+
+def _murcko_placement_cfg(grow_cfg: dict, sites_cfg: dict) -> dict:
+    """合并 grow 原子数 clamp 到 murcko_sites，供 random_per_site 等模式使用。"""
+    cfg = dict(sites_cfg)
+    if isinstance(grow_cfg, dict):
+        for k in ('n_extra_min_clamp', 'n_extra_max_clamp'):
+            if k in grow_cfg:
+                cfg[k] = grow_cfg[k]
+    return cfg
+
+
+def _resolve_init_preserved_atoms(
+    attachment_sites,
+    place_meta,
+    place_cfg,
+    ref_ligand_pos,
+    log_ref_v,
+    n_scaffold: int,
+    n_extra: int,
+    logger=None,
+    log_tag: str = '[MurckoSites]',
+    sample_idx: int = 0,
+):
+    """位点分配后解析零分配侧链保留，返回 (pos, log_v, indices, zero_ids, n_preserved, n_locked, n_total)。"""
+    preserved_pos, preserved_log_v, preserved_indices, zero_site_ids = resolve_preserved_sidechains(
+        attachment_sites, place_meta, place_cfg, ref_ligand_pos, log_ref_v,
+    )
+    n_preserved = int(preserved_pos.size(0))
+    n_locked = int(n_scaffold) + n_preserved
+    n_total = n_locked + int(n_extra)
+    if logger and (sample_idx == 0 or sample_idx % 10 == 0):
+        logger.info(
+            f'{log_tag} init atoms: n_scaffold={n_scaffold} n_preserved={n_preserved} '
+            f'n_extra={n_extra} n_total={n_total} zero_sites={zero_site_ids}'
+        )
+    return (
+        preserved_pos, preserved_log_v, preserved_indices, zero_site_ids,
+        n_preserved, n_locked, n_total,
+    )
+
+def _murcko_rng_offset(sample_idx: int, retry: int = 0) -> int:
+    """样本槽位 + 补足重试偏移（retry=0 与历史行为一致）。"""
+    return int(sample_idx) * 9973 + int(retry) * 100003
+
+
+def _murcko_sample_rng(
+    sample_cfg: dict, sample_idx: int, retry: int = 0,
+) -> np.random.Generator:
+    base = int(sample_cfg.get('seed', 42)) if isinstance(sample_cfg, dict) else 42
+    return np.random.default_rng(base + _murcko_rng_offset(sample_idx, retry))
 
 
 def _dynamic_subcfg_grad_cap_kwargs(subcfg):
@@ -818,6 +877,88 @@ def apply_targetdiff_baseline_refinement(model, data, pos_list, v_list, config, 
     return refined_pos_list, refined_v_list
 
 
+def _restore_locked_prefix_after_refine(
+    refined_pos_list,
+    refined_v_list,
+    orig_pos_list,
+    orig_v_list,
+    lock_counts,
+    logger=None,
+    tag='[TargetDiff Refine]',
+    restore_pos=False,
+    restore_type=True,
+):
+    """TargetDiff baseline 无 RePaint：按需还原前 n_locked 原子。
+
+    DiffDynamic 阶段用 pos_mask/type_mask 锁死骨架+零分配保留侧链；baseline
+    ~10 步会改动全部原子。默认只还原原子类型（``restore_type=True``），
+    **不还原坐标**（``restore_pos=False``）：允许 refine 微调位置/键角，
+    但禁止骨架/原自由基段改成别的元素。
+
+    说明：扩散状态无显式键；键在 OpenBabel/RDKit 重构时由坐标推断。
+    锁类型 ≠ 锁键拓扑；位置微移后个别键连通可能变化。
+    """
+    if not lock_counts or not refined_pos_list:
+        return refined_pos_list, refined_v_list
+    if not restore_pos and not restore_type:
+        return refined_pos_list, refined_v_list
+    n_restored = 0
+    out_pos, out_v = [], []
+    for i, (rp, rv) in enumerate(zip(refined_pos_list, refined_v_list)):
+        n_lock = int(lock_counts[i]) if i < len(lock_counts) else 0
+        if n_lock <= 0:
+            out_pos.append(rp)
+            out_v.append(rv)
+            continue
+        op = np.asarray(orig_pos_list[i], dtype=np.float64)
+        ov = np.asarray(orig_v_list[i], dtype=np.int64)
+        rp = np.asarray(rp, dtype=np.float64).copy()
+        rv = np.asarray(rv, dtype=np.int64).copy()
+        n_lock = min(n_lock, rp.shape[0], op.shape[0], rv.shape[0], ov.shape[0])
+        if n_lock > 0:
+            if restore_pos:
+                rp[:n_lock] = op[:n_lock]
+            if restore_type:
+                rv[:n_lock] = ov[:n_lock]
+            n_restored += 1
+        out_pos.append(rp)
+        out_v.append(rv)
+    if logger and n_restored:
+        mode = []
+        if restore_type:
+            mode.append('类型')
+        if restore_pos:
+            mode.append('坐标')
+        logger.info(
+            f'{tag} 已还原 {n_restored}/{len(refined_pos_list)} 个分子 locked 前缀的'
+            f'{"+".join(mode)}（骨架+零分配保留侧链；位置{"未" if not restore_pos else "已"}锁）'
+        )
+    return out_pos, out_v
+
+
+def _baseline_refine_lock_restore_flags(config):
+    """读 ``sample.targetdiff_baseline_refine.lock_prefix``。
+
+    - ``types_only``（默认）：只锁原子类型，位置交给 refine
+    - ``types_and_pos``：类型+坐标都还原（旧行为）
+    - ``none``：不还原
+    """
+    tbr = {}
+    if config is not None:
+        sample = getattr(config, 'sample', None)
+        if sample is not None:
+            tbr = sample.get('targetdiff_baseline_refine', {}) or {}
+        elif isinstance(config, dict):
+            tbr = (config.get('sample') or {}).get('targetdiff_baseline_refine', {}) or {}
+    mode = str(tbr.get('lock_prefix', 'types_only')).strip().lower()
+    if mode in ('none', 'off', 'false', '0'):
+        return False, False
+    if mode in ('types_and_pos', 'pos_and_type', 'both', 'all'):
+        return True, True
+    # types_only / type / types / default
+    return False, True
+
+
 def _prudent_apply_targetdiff_baseline_to_pool(
     model,
     data,
@@ -854,6 +995,10 @@ def _prudent_apply_targetdiff_baseline_to_pool(
         )
     pos_list = [np.asarray(c['pos'], dtype=np.float64) for c in pool]
     v_list = [np.asarray(c['v'], dtype=np.int64) for c in pool]
+    lock_counts = [
+        int(c.get('n_locked', int(c.get('n_scaffold', 0)) + int(c.get('n_preserved', 0))))
+        for c in pool
+    ]
     refine_out = apply_targetdiff_baseline_refinement(
         model, data, pos_list, v_list, config, device=device, logger=logger
     )
@@ -861,6 +1006,12 @@ def _prudent_apply_targetdiff_baseline_to_pool(
         refined_pos_list, refined_v_list = refine_out[0], refine_out[1]
     else:
         refined_pos_list, refined_v_list = refine_out
+    restore_pos, restore_type = _baseline_refine_lock_restore_flags(config)
+    refined_pos_list, refined_v_list = _restore_locked_prefix_after_refine(
+        refined_pos_list, refined_v_list, pos_list, v_list, lock_counts,
+        logger=logger, tag='[Prudent][TargetDiff Refine]',
+        restore_pos=restore_pos, restore_type=restore_type,
+    )
     for i, c in enumerate(pool):
         c['pos'] = np.asarray(refined_pos_list[i], dtype=np.float64).copy()
         c['v'] = np.asarray(refined_v_list[i], dtype=np.int64).copy()
@@ -889,6 +1040,20 @@ def apply_targetdiff_baseline_refine_to_sampling_result(model, data, result, con
         if logger:
             logger.warning('[TargetDiff Refine] result 配体列表为空或长度不一致，跳过优化后 refine')
         return
+    orig_pos = [np.asarray(p, dtype=np.float64).copy() for p in pos_list]
+    orig_v = [np.asarray(v, dtype=np.int64).copy() for v in v_list]
+    meta0 = result.get('meta') if isinstance(result.get('meta'), dict) else {}
+    records = meta0.get('meta_records') or meta0.get('records') or []
+    lock_counts = []
+    for i in range(len(pos_list)):
+        n_lock = 0
+        if i < len(records) and isinstance(records[i], dict):
+            rec = records[i]
+            n_lock = int(rec.get(
+                'n_locked',
+                int(rec.get('n_scaffold', 0)) + int(rec.get('n_preserved', 0)),
+            ))
+        lock_counts.append(n_lock)
     refine_out = apply_targetdiff_baseline_refinement(
         model, data, pos_list, v_list, config, device=device, logger=logger
     )
@@ -896,8 +1061,13 @@ def apply_targetdiff_baseline_refine_to_sampling_result(model, data, result, con
     if not isinstance(meta, dict):
         meta = {}
         result['meta'] = meta
+    restore_pos, restore_type = _baseline_refine_lock_restore_flags(config)
     if len(refine_out) == 5:
         pos_list, v_list, refine_pos_traj, refine_v_traj, refine_time_indices = refine_out
+        pos_list, v_list = _restore_locked_prefix_after_refine(
+            pos_list, v_list, orig_pos, orig_v, lock_counts, logger=logger,
+            restore_pos=restore_pos, restore_type=restore_type,
+        )
         result['pred_ligand_pos'] = pos_list
         result['pred_ligand_v'] = v_list
         pos_traj = result.get('pred_ligand_pos_traj') or []
@@ -920,11 +1090,18 @@ def apply_targetdiff_baseline_refine_to_sampling_result(model, data, result, con
             logger.info(f'[TargetDiff Refine] 已在优化阶段之后对 {n} 个分子应用 refine')
     else:
         pos_list, v_list = refine_out
+        pos_list, v_list = _restore_locked_prefix_after_refine(
+            pos_list, v_list, orig_pos, orig_v, lock_counts, logger=logger,
+            restore_pos=restore_pos, restore_type=restore_type,
+        )
         result['pred_ligand_pos'] = pos_list
         result['pred_ligand_v'] = v_list
 
 
-def evaluate_candidate(pos_array, v_array, ligand_atom_mode, selector_cfg):  # 评估候选分子的化学指标。
+def evaluate_candidate(
+    pos_array, v_array, ligand_atom_mode, selector_cfg,
+    scaffold_bonds=None, n_scaffold=None,
+):  # 评估候选分子的化学指标。
     """根据采样结果评估分子质量，计算化学指标并返回评分。
 
     Args:
@@ -932,6 +1109,8 @@ def evaluate_candidate(pos_array, v_array, ligand_atom_mode, selector_cfg):  # �
         v_array: 原子类型索引数组。
         ligand_atom_mode: 配体原子编码模式（与训练配置保持一致）。
         selector_cfg: 筛选配置，包含权重及阈值。
+        scaffold_bonds: 可选参考骨架键表（0-based，前缀原子）。
+        n_scaffold: 骨架原子数（与 scaffold_bonds 配套）。
 
     Returns:
         dict: 包含化学指标、SMILES、筛选状态及综合评分。
@@ -945,7 +1124,13 @@ def evaluate_candidate(pos_array, v_array, ligand_atom_mode, selector_cfg):  # �
         v_tensor = torch.tensor(v_array, dtype=torch.long)  # 将类别数组转为张量。
         atom_numbers = trans.get_atomic_number_from_index(v_tensor, mode=ligand_atom_mode)  # 获取原子序号。
         aromatic_flags = trans.is_aromatic_from_index(v_tensor, mode=ligand_atom_mode)  # 获取芳香标记。
-        mol = reconstruct.reconstruct_from_generated(pos_array, atom_numbers, aromatic_flags)  # 重建分子。
+        basic_mode = str(ligand_atom_mode) == 'basic'
+        mol = reconstruct.reconstruct_from_generated(
+            pos_array, atom_numbers, aromatic_flags,
+            basic_mode=basic_mode,
+            scaffold_bonds=scaffold_bonds,
+            n_scaffold=n_scaffold,
+        )  # 重建分子。
         if mol is not None:
             smiles = Chem.MolToSmiles(mol)  # 转换为 SMILES。
             # 分子不完整：SMILES 含 '.' 表示多个不连通片段，直接过滤
@@ -1026,6 +1211,12 @@ def _prudent_copy_candidate(cand, logger=None, context=""):
         'v_traj': cand.get('v_traj') or [],
         'log_v_traj': cand.get('log_v_traj') or [],
     }
+    for key in (
+        'n_scaffold', 'n_preserved', 'n_locked', 'n_extra',
+        'preserved_atom_indices', 'scaffold_bond_pairs',
+    ):
+        if key in cand and cand[key] is not None:
+            out[key] = cand[key]
     if cand.get('log_v') is not None:
         out['log_v'] = np.array(cand['log_v'], copy=True, dtype=np.float32)
     sp = cand.get('prudent_renoise_snapshot_pos')
@@ -1336,7 +1527,10 @@ def _prudent_forward_diffuse_to_t(
     }
 
 
-def _prudent_reconstruct_mol(pos_array, v_array, ligand_atom_mode, logger=None, context=''):
+def _prudent_reconstruct_mol(
+    pos_array, v_array, ligand_atom_mode, logger=None, context='',
+    scaffold_bonds=None, n_scaffold=None,
+):
     """重建 RDKit Mol；失败返回 None。"""
     try:
         # 记录输入参数
@@ -1371,7 +1565,13 @@ def _prudent_reconstruct_mol(pos_array, v_array, ligand_atom_mode, logger=None, 
                 f'aromatic_flags={_step_traj_as_bool_list(aromatic_flags)}'
             )
 
-        mol = reconstruct.reconstruct_from_generated(pos_array, atom_numbers, aromatic_flags)
+        basic_mode = str(ligand_atom_mode) == 'basic'
+        mol = reconstruct.reconstruct_from_generated(
+            pos_array, atom_numbers, aromatic_flags,
+            basic_mode=basic_mode,
+            scaffold_bonds=scaffold_bonds,
+            n_scaffold=n_scaffold,
+        )
         
         if logger:
             if mol is not None:
@@ -1402,44 +1602,46 @@ def _prudent_score_one_round(
     ligand_atom_mode,
     vina_advance_thr,
     logger,
+    scaffold_bonds=None,
+    n_scaffold=None,
 ):
-    """一轮 GPU refine 之后：QED/SA →（条件）Vina → 晋级筛选。仅 CPU，可在工作线程中调用。"""
+    """一轮 GPU refine 之后：QED/SA/LogP →（条件）Vina → 晋级筛选。仅 CPU，可在工作线程中调用。"""
     min_q_dock = float(prudent_cfg.get('min_qed_for_docking', 0.3))
     min_s_dock = float(prudent_cfg.get('min_sa_for_docking', 0.3))
+    size_gates = _prudent_parse_size_gates(prudent_cfg)
 
     chem_round = []
     for ci, c in enumerate(pool):
+        bonds = c.get('scaffold_bond_pairs', scaffold_bonds)
+        n_sc = c.get('n_scaffold', n_scaffold)
         mol = _prudent_reconstruct_mol(
             c['pos'], c['v'], ligand_atom_mode,
             logger=logger,
-            context=f's{seed_idx}r{rnd}c{ci}'
+            context=f's{seed_idx}r{rnd}c{ci}',
+            scaffold_bonds=bonds,
+            n_scaffold=n_sc,
         )
-        qed, sa, chem_err = _prudent_chem_scores(mol, logger=logger)
-        chem_round.append((ci, c, mol, qed, sa, chem_err))
+        qed, sa, logp, chem_err = _prudent_chem_scores(mol, logger=logger)
+        chem_round.append((ci, c, mol, qed, sa, logp, chem_err))
 
     scored = []
     log_chains = prudent_cfg.get('log_per_chain_scores', True)
-    for ci, c, mol, qed, sa, chem_err in chem_round:
-        # 一票否决：QED/SA 先筛选
-        gate_ok = (
-            mol is not None
-            and np.isfinite(qed)
-            and np.isfinite(sa)
-            and qed >= min_q_dock
-            and sa >= min_s_dock
+    for ci, c, mol, qed, sa, logp, chem_err in chem_round:
+        # 一票否决：QED/SA/LogP/尺寸 先筛选
+        gate_ok, gate_reasons = _prudent_size_gate_ok(
+            mol, qed, sa, logp, prudent_cfg, gates=size_gates,
         )
 
         if not gate_ok:
-            # QED/SA 不达标：composite 设为 -inf，不跑 Vina，不参与 winner 评选
+            # QED/SA/LogP/尺寸 不达标：composite 设为 -inf，不跑 Vina，不参与 winner 评选
             comp = float('-inf')
-            reject_reason = 'qed_sa_rejected'
+            reject_reason = gate_reasons[0] if gate_reasons else 'qed_sa_rejected'
             if mol is None:
                 reject_reason = 'mol_reconstruct_failed_or_none'
-            elif not np.isfinite(qed) or not np.isfinite(sa):
-                reject_reason = 'qed_sa_not_finite'
             detail = {
                 'qed': qed,
                 'sa': sa,
+                'logp': logp,
                 'vina_affinity': float('nan'),
                 'vina_norm': 0.0,
                 'vina_skipped': True,
@@ -1449,13 +1651,15 @@ def _prudent_score_one_round(
             if logger and log_chains:
                 qed_s = f'{qed:.4f}' if np.isfinite(qed) else 'nan'
                 sa_s = f'{sa:.4f}' if np.isfinite(sa) else 'nan'
+                logp_s = f'{logp:.2f}' if np.isfinite(logp) else 'nan'
+                gate_hint = ', '.join(gate_reasons) if gate_reasons else reject_reason
                 logger.info(
                     f'[Prudent][score] seed={seed_idx} r={rnd + 1}/{n_rounds} chain={ci} | '
-                    f'QED={qed_s} SA={sa_s} | REJECTED ({reject_reason}, thresholds {min_q_dock}/{min_s_dock}), '
+                    f'QED={qed_s} SA={sa_s} LogP={logp_s} | REJECTED ({gate_hint}), '
                     f'composite=-inf'
                 )
         else:
-            # QED/SA 达标：跑 Vina，计算综合分
+            # QED/SA/LogP 达标：跑 Vina，计算综合分
             comp, detail = _prudent_composite_score(
                 mol,
                 prudent_cfg,
@@ -1463,7 +1667,7 @@ def _prudent_score_one_round(
                 lig_fn,
                 logger=logger,
                 protein_root=vina_protein_root,
-                prefetched_chem=(qed, sa, chem_err),
+                prefetched_chem=(qed, sa, logp, chem_err),
                 skip_vina=False,  # 达标必跑 Vina
             )
             if logger and log_chains:
@@ -1672,20 +1876,83 @@ def _prudent_eligible_for_advance(mol, qed, sa, detail, prudent_cfg, vina_advanc
 
 
 def _prudent_chem_scores(mol, logger=None):
-    """单分子 QED/SA；mol 无效或 get_chem 失败时返回 (nan, nan, error_or_none)。"""
+    """单分子 QED/SA/LogP；mol 无效或 get_chem 失败时返回 (nan, nan, nan, error_or_none)。"""
     if mol is None:
-        return float('nan'), float('nan'), 'mol_reconstruct_failed_or_none'
+        return float('nan'), float('nan'), float('nan'), 'mol_reconstruct_failed_or_none'
     try:
         chem = scoring_func.get_chem(mol)
         qed_raw = chem.get('qed')
         sa_raw = chem.get('sa')
+        logp_raw = chem.get('logp')
         qed = float(qed_raw) if qed_raw is not None else float('nan')
         sa = float(sa_raw) if sa_raw is not None else float('nan')
-        return qed, sa, None
+        logp = float(logp_raw) if logp_raw is not None else float('nan')
+        return qed, sa, logp, None
     except Exception as exc:
         if logger:
-            logger.debug(f'[Prudent] get_chem 失败（无效价态等），按 QED/SA=nan 处理: {exc}')
-        return float('nan'), float('nan'), str(exc)
+            logger.debug(f'[Prudent] get_chem 失败（无效价态等），按 QED/SA/LogP=nan 处理: {exc}')
+        return float('nan'), float('nan'), float('nan'), str(exc)
+
+
+def _prudent_struct_scores(mol):
+    """分子量 / 重原子数 / 环数；mol 无效时返回 nan。"""
+    if mol is None:
+        return float('nan'), float('nan'), float('nan')
+    try:
+        from rdkit.Chem import Descriptors, Lipinski
+        return (
+            float(Descriptors.MolWt(mol)),
+            float(mol.GetNumHeavyAtoms()),
+            float(Lipinski.RingCount(mol)),
+        )
+    except Exception:
+        return float('nan'), float('nan'), float('nan')
+
+
+def _prudent_parse_size_gates(prudent_cfg):
+    """解析可选的分子尺寸硬门控阈值。"""
+    gates = {}
+    for key, cfg_key in (
+        ('max_molwt', 'max_molwt'),
+        ('max_heavy_atoms', 'max_heavy_atoms'),
+        ('max_rings', 'max_rings'),
+    ):
+        val = prudent_cfg.get(cfg_key, None)
+        if val is not None:
+            gates[key] = float(val)
+    max_logp = prudent_cfg.get('max_logp', None)
+    if max_logp is not None:
+        gates['max_logp'] = float(max_logp)
+    return gates
+
+
+def _prudent_size_gate_ok(mol, qed, sa, logp, prudent_cfg, gates=None):
+    """QED/SA/LogP 及可选 molwt / heavy_atoms / rings 硬门控。"""
+    if gates is None:
+        gates = _prudent_parse_size_gates(prudent_cfg)
+    min_q = float(prudent_cfg.get('min_qed_for_docking', 0.15))
+    min_s = float(prudent_cfg.get('min_sa_for_docking', 0.15))
+    if mol is None:
+        return False, ['mol=None']
+    reasons = []
+    if not np.isfinite(qed) or qed < min_q:
+        reasons.append(f'QED={qed:.4f}<{min_q}' if np.isfinite(qed) else f'QED=nan<{min_q}')
+    if not np.isfinite(sa) or sa < min_s:
+        reasons.append(f'SA={sa:.4f}<{min_s}' if np.isfinite(sa) else f'SA=nan<{min_s}')
+    max_logp = gates.get('max_logp')
+    if max_logp is not None and np.isfinite(logp) and logp > max_logp:
+        reasons.append(f'LogP={logp:.2f}>{max_logp}')
+    molwt, heavy, rings = _prudent_struct_scores(mol)
+    max_molwt = gates.get('max_molwt')
+    if max_molwt is not None and np.isfinite(molwt) and molwt > max_molwt:
+        reasons.append(f'MolWt={molwt:.0f}>{max_molwt:.0f}')
+    max_heavy = gates.get('max_heavy_atoms')
+    if max_heavy is not None and np.isfinite(heavy) and heavy > max_heavy:
+        reasons.append(f'HeavyAtoms={heavy:.0f}>{max_heavy:.0f}')
+    max_rings = gates.get('max_rings')
+    if max_rings is not None and np.isfinite(rings) and rings > max_rings:
+        reasons.append(f'Rings={rings:.0f}>{max_rings:.0f}')
+    return len(reasons) == 0, reasons
 
 
 def _prudent_composite_score(
@@ -1701,7 +1968,7 @@ def _prudent_composite_score(
     ``protein_path`` 为可直接对接的 PDB；若无效则与 ``evaluate_pt`` 相同，用 ``protein_root`` +
     配体相对路径推断受体（``VinaDockingTask.from_generated_mol``）。
 
-    ``prefetched_chem``：``(qed, sa, chem_error)``，避免重复 get_chem；``skip_vina=True`` 时不跑对接（每轮先统一算 QED/SA，未过阈者跳过 Vina 以省算力）。
+    ``prefetched_chem``：``(qed, sa, logp, chem_error)`` 或旧的 ``(qed, sa, chem_error)``，避免重复 get_chem；``skip_vina=True`` 时不跑对接（每轮先统一算 QED/SA/LogP，未过阈者跳过 Vina 以省算力）。
     """
     w_v = max(0.0, float(prudent_cfg.get('vina_weight', 0.6)))
     w_q = max(0.0, float(prudent_cfg.get('qed_weight', 0.2)))
@@ -1718,12 +1985,17 @@ def _prudent_composite_score(
     if mol is None:
         return float('-inf'), {'reason': 'mol_none'}
 
+    _prefetched_logp = float('nan')
     if prefetched_chem is not None:
-        qed, sa, chem_error = prefetched_chem
+        if len(prefetched_chem) >= 4:
+            qed, sa, _prefetched_logp, chem_error = prefetched_chem[:4]
+        else:
+            qed, sa, chem_error = prefetched_chem
         qed = float(qed or 0.0)
         sa = float(sa or 0.0)
+        _prefetched_logp = float(_prefetched_logp or float('nan'))
     else:
-        qed, sa, chem_error = _prudent_chem_scores(mol, logger=logger)
+        qed, sa, _prefetched_logp, chem_error = _prudent_chem_scores(mol, logger=logger)
 
     aff = float('nan')
     vina_norm = 0.0
@@ -1818,6 +2090,7 @@ def _prudent_composite_score(
         'vina_norm': vina_norm,
         'qed': qed,
         'sa': sa,
+        'logp': _prefetched_logp,
         'lipinski': lipinski_count,
         'lipinski_frac': lipinski_frac,
         'lilly_demerit': lilly_demerit,
@@ -1849,11 +2122,14 @@ def _batch_refinement_forward_split(
     refine_cfg,
     refinement_grad_kwargs,
     error_prefix='[Refine batch]',
+    repaint_cfg=None,
 ):
     """与 large_step 同类：多候选拼 ``Batch``，一次 ``sample_diffusion_refinement``，再按配体原子数拆包。
 
     ``refinement_grad_kwargs`` 会并入 ``sample_diffusion_refinement``（如
     ``_dynamic_subcfg_grad_cap_kwargs(refine_cfg)`` 或 Prudent 的截断参数）。
+
+    ``repaint_cfg``（可选）：传入 sample_diffusion_refinement 用于 scaffold_prudent 模式下的骨架锁定。
 
     Returns:
         list[dict]: 每条链 ``pos`` / ``v`` / ``log_v`` / ``num_atoms`` / 本段 ``pos_traj_ref`` 等（未与历史轨迹合并）。
@@ -1900,6 +2176,9 @@ def _batch_refinement_forward_split(
         init_input = init_log_v.argmax(dim=-1)
         log_mode = 'auto'
 
+    _refine_kwargs = dict(refinement_grad_kwargs)
+    if repaint_cfg is not None:
+        _refine_kwargs['repaint_cfg'] = repaint_cfg
     res = model.sample_diffusion_refinement(
         protein_pos=batch.protein_pos,
         protein_v=batch.protein_atom_feature.float(),
@@ -1918,7 +2197,7 @@ def _batch_refinement_forward_split(
         time_lower=time_lower,
         num_cycles=refine_cfg.get('cycles', 1),
         log_ligand_input_mode='log_prob' if log_mode == 'log_prob' else 'auto',
-        **refinement_grad_kwargs,
+        **_refine_kwargs,
     )
 
     pos_all = res['pos'].detach().cpu().numpy().astype(np.float64)
@@ -5497,6 +5776,41 @@ def _detect_ring_based_scaffold_indices(mol, logger=None) -> list:
         return []
 
 
+def _extract_scaffold_bond_pairs(ref_mol, scaffold_indices, logger=None):
+    """从参考分子提取骨架内部键，映射到前缀下标 0..n_scaffold-1。
+
+    Returns:
+        list of (i_new, j_new, order, aromatic) 或空列表。
+    """
+    if ref_mol is None or not scaffold_indices:
+        return []
+    try:
+        index_map = {int(old): new for new, old in enumerate(scaffold_indices)}
+        scaffold_set = set(index_map.keys())
+        bonds = []
+        for bond in ref_mol.GetBonds():
+            bi = bond.GetBeginAtomIdx()
+            bj = bond.GetEndAtomIdx()
+            if bi not in scaffold_set or bj not in scaffold_set:
+                continue
+            i_new = index_map[bi]
+            j_new = index_map[bj]
+            aromatic = bool(
+                bond.GetIsAromatic() or bond.GetBondType() == Chem.BondType.AROMATIC
+            )
+            if aromatic:
+                order = 5
+            else:
+                order = int(round(bond.GetBondTypeAsDouble()))
+                order = max(1, min(3, order))
+            bonds.append((i_new, j_new, order, aromatic))
+        return bonds
+    except Exception as e:
+        if logger:
+            logger.warning(f'[_extract_scaffold_bond_pairs] 失败: {e}')
+        return []
+
+
 def _extract_scaffold_submol(ref_mol, scaffold_indices, logger=None):
     """
     从参考分子中提取骨架原子的子结构并创建新的 RDKit 分子。
@@ -5709,17 +6023,17 @@ def _resolve_scaffold_mask(
                 if logger:
                     logger.info(f'[ScaffoldMask] 重建分子成功: {mol.GetNumAtoms()} 个原子')
 
-                # 优先使用环检测法（更严格，保留更多生成自由度）
-                indices = _detect_ring_based_scaffold_indices(mol, logger)
+                # 优先使用 Murcko 骨架（Bemis-Murcko 分解，保留环系+链接体，移除侧链）
+                indices = _detect_murcko_scaffold_indices(mol)
                 if logger:
-                    logger.info(f'[ScaffoldMask] 环检测骨架: {len(indices)} 个骨架原子')
+                    logger.info(f'[ScaffoldMask] Murcko 骨架: {len(indices)} 个骨架原子')
 
-                # 环检测失败时回退到 Murcko
+                # Murcko 失败时回退到环检测法
                 if not indices:
                     if source == 'auto_murcko':
-                        indices = _detect_murcko_scaffold_indices(mol)
+                        indices = _detect_ring_based_scaffold_indices(mol, logger)
                         if logger:
-                            logger.info(f'[ScaffoldMask] Murcko 回退: {len(indices)} 个骨架原子')
+                            logger.info(f'[ScaffoldMask] 环检测回退: {len(indices)} 个骨架原子')
                         if not indices:
                             indices = _detect_generic_murcko_scaffold_indices(mol)
                             if logger:
@@ -6003,6 +6317,8 @@ def _sample_n_extra_atoms(
     protein_pos,
     n_scaffold_atoms: int,
     model_num_timesteps: int,
+    sample_idx: int = 0,
+    retry: int = 0,
 ) -> int:
     """
     根据策略决定在骨架之外新生成的原子数（N_extra）。
@@ -6014,6 +6330,7 @@ def _sample_n_extra_atoms(
       → 适合"在骨架基础上大幅扩展"场景
     - fixed：固定数量（n_extra_fixed）
     - range：在 [n_extra_min, n_extra_max] 内均匀随机采样
+    - ligand_size_normal_minus_scaffold：从已知配体重原子数 Normal(μ,σ) 离散采样总原子数，再减骨架
 
     结果均被 clamp 到 [n_extra_min_clamp, n_extra_max_clamp]。
 
@@ -6022,6 +6339,8 @@ def _sample_n_extra_atoms(
         protein_pos: 蛋白口袋原子坐标 Tensor [N_protein, 3]（用于先验采样）。
         n_scaffold_atoms: 骨架原子数。
         model_num_timesteps: 模型扩散步数（未使用，预留）。
+        sample_idx: 样本序号（ligand_size 模式可复现；与 murcko 位点 RNG 错开 +1）。
+        retry: 同槽位补足重试次数（0=首次，与历史一致）。
 
     Returns:
         n_extra: 要新生成的原子数（>= 1）。
@@ -6035,6 +6354,13 @@ def _sample_n_extra_atoms(
         pocket_size = atom_num.get_space_size(pos_np)
         if np.isnan(pocket_size) or np.isinf(pocket_size) or pocket_size <= 0:
             pocket_size = 30.0
+        # pocket prior 本身无固定 seed；补足重试时用偏移扰动采样
+        if int(retry) > 0:
+            _rng = np.random.default_rng(
+                int(grow_cfg.get('seed', 42)) + _murcko_rng_offset(sample_idx, retry) + 17
+            )
+            # 重复采样取第 retry 次风格的扰动：对 pocket_size 加小噪声再采样
+            pocket_size = float(pocket_size) * float(_rng.uniform(0.92, 1.08))
         total = int(atom_num.sample_atom_num(pocket_size))
         if mode == 'prior_minus_scaffold':
             n_extra = total - n_scaffold_atoms
@@ -6047,12 +6373,239 @@ def _sample_n_extra_atoms(
     elif mode == 'range':
         lo = int(grow_cfg.get('n_extra_min', 3))
         hi = int(grow_cfg.get('n_extra_max', 20))
-        n_extra = int(np.random.randint(max(lo, 1), max(hi, lo) + 1))
+        if int(retry) > 0:
+            _rng = np.random.default_rng(
+                int(grow_cfg.get('seed', 42)) + _murcko_rng_offset(sample_idx, retry) + 19
+            )
+            n_extra = int(_rng.integers(max(lo, 1), max(hi, lo) + 1))
+        else:
+            n_extra = int(np.random.randint(max(lo, 1), max(hi, lo) + 1))
+
+    elif mode in (
+        'ligand_size_normal_minus_scaffold',
+        'ligand_normal_minus_scaffold',
+        'active_size_normal_minus_scaffold',
+    ):
+        # 从已知配体重原子数的正态离散分布采样总原子数，再减骨架。
+        # 独立 seed 流：base + offset + 1，避免消耗 murcko 位点 RNG。
+        mu = float(grow_cfg.get('ligand_size_mean', grow_cfg.get('ligand_atom_mean', 35)))
+        sigma = float(grow_cfg.get('ligand_size_std', grow_cfg.get('ligand_atom_std', 4)))
+        size_min = int(grow_cfg.get('ligand_size_min', max(1, int(round(mu - 3 * sigma)))))
+        size_max = int(grow_cfg.get('ligand_size_max', int(round(mu + 3 * sigma))))
+        base = int(grow_cfg.get('seed', 42))
+        size_rng = np.random.default_rng(base + _murcko_rng_offset(sample_idx, retry) + 1)
+        if sigma <= 0:
+            total = int(round(mu))
+        else:
+            total = int(round(float(size_rng.normal(mu, sigma))))
+        total = int(np.clip(total, size_min, size_max))
+        n_extra = total - int(n_scaffold_atoms)
 
     else:
         n_extra = int(grow_cfg.get('n_extra_fixed', 8))
 
     return int(np.clip(n_extra, min_clamp, max_clamp))
+
+
+def _pin_place_cfg_to_n_extra(place_cfg: dict, n_extra: int, grow_cfg: dict) -> dict:
+    """当 n_extra 已由 ligand-size 正态等精确采样时，把位点 budget clamp 钉死为该值。
+
+    sequential_random / random_per_site 默认会在 [min,max] 内再随机 budget，
+    不钉死则无法落实「总原子数 = 配体正态采样」的意图。
+    """
+    mode = str((grow_cfg or {}).get('n_extra_mode', '')).strip().lower()
+    if mode not in (
+        'ligand_size_normal_minus_scaffold',
+        'ligand_normal_minus_scaffold',
+        'active_size_normal_minus_scaffold',
+        'fixed',
+    ):
+        return place_cfg
+    cfg = dict(place_cfg)
+    n = max(1, int(n_extra))
+    cfg['n_extra_min_clamp'] = n
+    cfg['n_extra_max_clamp'] = n
+    return cfg
+
+
+def _extract_scaffold_from_reference(data, sc_cfg, ligand_atom_mode,
+                                     ref_ligand_pos, ref_ligand_v, log_ref_v,
+                                     n_scaffold_ref, device, config=None, logger=None):
+    """从参考配体提取骨架原子索引（共享逻辑，供 scaffold_grow / scaffold_dynamic_locked 复用）。
+
+    流程：优先从原始配体文件加载 RDKit Mol → ring-based / Murcko / generic-Murcko 提取；
+    失败则从坐标重建分子再提取；最终回退到 _resolve_scaffold_mask；
+    若仍为空，强制使用全部原子作为骨架。
+
+    Returns:
+        (scaffold_indices, ref_mol, ref_ligand_name, n_scaffold)
+    """
+    # ---- 解析骨架掩码 ---------------------------------------------------------
+    scaffold_indices = []
+    ref_mol = None
+    ref_ligand_name = None
+
+    # 尝试从数据中获取原始参考分子的 RDKit Mol 对象
+    if hasattr(data, 'ligand_filename') and data.ligand_filename:
+        ref_ligand_path = data.ligand_filename
+        ref_ligand_name = Path(ref_ligand_path).stem
+
+        if logger:
+            logger.info(f'[ScaffoldExtract] 尝试加载配体文件: {ref_ligand_path}')
+            logger.info(f'[ScaffoldExtract] 文件存在性检查: {os.path.exists(ref_ligand_path)}')
+
+        # 如果文件不存在，尝试从数据集根目录解析
+        if not os.path.exists(ref_ligand_path):
+            dataset_root = None
+            try:
+                if config is not None:
+                    dataset_root = config.data.path
+            except Exception:
+                pass
+            if not dataset_root:
+                try:
+                    if config is not None and hasattr(config, 'sample'):
+                        dataset_root = getattr(config.sample, 'data', {}).get('path', None)
+                except Exception:
+                    pass
+
+            # 如果路径是相对路径，尝试在不同位置查找
+            possible_paths = [
+                Path(ref_ligand_path),
+            ]
+            if dataset_root:
+                possible_paths.append(Path(dataset_root) / ref_ligand_path)
+            possible_paths += [
+                Path('./data/crossdocked_pocket10_test_only') / ref_ligand_path,
+                Path('/workspace/data/crossdocked_v1.1_rmsd1.0') / ref_ligand_path,
+                Path('/workspace/data/crossdocked_v1.1_rmsd1.0_pocket10') / ref_ligand_path,
+            ]
+
+            for try_path in possible_paths:
+                if try_path.exists():
+                    ref_ligand_path = str(try_path)
+                    if logger:
+                        logger.info(f'[ScaffoldExtract] 找到配体文件: {ref_ligand_path}')
+                    break
+
+        if os.path.exists(ref_ligand_path):
+            try:
+                ref_mol = Chem.SDMolSupplier(ref_ligand_path)[0]
+                if ref_mol is not None:
+                    scaffold_source = sc_cfg.get('scaffold_source', 'auto_murcko')
+
+                    try:
+                        Chem.SanitizeMol(ref_mol)
+                        ri = ref_mol.GetRingInfo()
+                        if ri is None or ri.NumRings() < 0:
+                            Chem.GetSSSR(ref_mol)
+                        if logger:
+                            logger.info(f'[ScaffoldExtract] 分子环信息初始化成功: {ref_mol.GetNumAtoms()} 原子, {ref_mol.GetRingInfo().NumRings()} 个环')
+                    except Exception as e:
+                        if logger:
+                            logger.warning(f'[ScaffoldExtract] 初始化 RingInfo 失败: {e}')
+
+                    if scaffold_source in ('auto_murcko', 'auto_murcko_generic'):
+                        if logger:
+                            logger.info('[ScaffoldExtract] 尝试 Murcko 骨架提取...')
+                        indices = _detect_murcko_scaffold_indices(ref_mol)
+                        if logger:
+                            logger.info(f'[ScaffoldExtract] Murcko 检测到 {len(indices)} 个骨架原子')
+
+                        if not indices:
+                            if logger:
+                                logger.info('[ScaffoldExtract] Murcko 失败，尝试环检测骨架提取...')
+                            indices = _detect_ring_based_scaffold_indices(ref_mol, logger)
+                            if logger:
+                                logger.info(f'[ScaffoldExtract] 环检测到 {len(indices)} 个骨架原子')
+
+                            if not indices and scaffold_source == 'auto_murcko':
+                                indices = _detect_generic_murcko_scaffold_indices(ref_mol)
+                                if logger:
+                                    logger.info(f'[ScaffoldExtract] 通用 Murcko 检测到 {len(indices)} 个骨架原子')
+
+                        scaffold_indices = indices
+                        if logger and indices:
+                            logger.info(f'[ScaffoldExtract] 从原始配体文件提取骨架: {len(indices)} 个原子')
+                        elif logger:
+                            logger.warning('[ScaffoldExtract] 所有骨架提取方法均返回空列表')
+            except Exception as e:
+                if logger:
+                    logger.warning(f'[ScaffoldExtract] 从文件提取骨架失败: {e}')
+
+    # 如果无法从文件获取骨架，尝试从坐标重建
+    if not scaffold_indices:
+        if logger:
+            logger.info('[ScaffoldExtract] 从文件提取骨架失败，尝试从坐标重建...')
+
+        from utils import reconstruct
+        try:
+            pos_np = ref_ligand_pos.detach().cpu().numpy() if hasattr(ref_ligand_pos, 'detach') else np.array(ref_ligand_pos)
+            v_np = ref_ligand_v.detach().cpu().numpy() if hasattr(ref_ligand_v, 'detach') else np.array(ref_ligand_v)
+
+            reconstructed_mol = reconstruct.reconstruct_from_generated(pos_np, v_np, ligand_atom_mode)
+
+            if reconstructed_mol is not None and logger:
+                logger.info(f'[ScaffoldExtract] 坐标重建分子成功: {reconstructed_mol.GetNumAtoms()} 个原子')
+
+            if reconstructed_mol is not None:
+                if logger:
+                    logger.info('[ScaffoldExtract] 尝试对重建分子使用 Murcko 骨架提取...')
+                indices = _detect_murcko_scaffold_indices(reconstructed_mol)
+                if logger:
+                    logger.info(f'[ScaffoldExtract] Murcko 检测到 {len(indices)} 个骨架原子')
+
+                if not indices:
+                    indices = _detect_ring_based_scaffold_indices(reconstructed_mol, logger)
+                    if logger:
+                        logger.info(f'[ScaffoldExtract] 环检测到 {len(indices)} 个骨架原子')
+
+                if indices:
+                    scaffold_indices = indices
+                    if logger:
+                        logger.info(f'[ScaffoldExtract] 从重建分子提取骨架: {len(indices)} 个原子')
+                else:
+                    if logger:
+                        logger.info('[ScaffoldExtract] 骨架提取失败，回退到 _resolve_scaffold_mask...')
+                    scaffold_mask = _resolve_scaffold_mask(
+                        sc_cfg, ref_ligand_pos, ref_ligand_v, ligand_atom_mode, n_scaffold_ref, device
+                    )
+                    scaffold_mask_np = scaffold_mask.cpu().numpy()
+                    scaffold_indices = np.where(scaffold_mask_np > 0.5)[0].tolist()
+            else:
+                if logger:
+                    logger.warning('[ScaffoldExtract] 坐标重建分子失败，使用 _resolve_scaffold_mask...')
+                scaffold_mask = _resolve_scaffold_mask(
+                    sc_cfg, ref_ligand_pos, ref_ligand_v, ligand_atom_mode, n_scaffold_ref, device
+                )
+                scaffold_mask_np = scaffold_mask.cpu().numpy()
+                scaffold_indices = np.where(scaffold_mask_np > 0.5)[0].tolist()
+        except Exception as e:
+            if logger:
+                logger.warning(f'[ScaffoldExtract] 坐标重建过程失败: {e}')
+            scaffold_mask = _resolve_scaffold_mask(
+                sc_cfg, ref_ligand_pos, ref_ligand_v, ligand_atom_mode, n_scaffold_ref, device
+            )
+            scaffold_mask_np = scaffold_mask.cpu().numpy()
+            scaffold_indices = np.where(scaffold_mask_np > 0.5)[0].tolist()
+
+    n_scaffold = len(scaffold_indices)
+
+    if n_scaffold == 0:
+        if logger:
+            logger.warning('[ScaffoldExtract] 未找到骨架原子，将使用所有原子作为骨架（强制固定整个分子）')
+        scaffold_indices = list(range(n_scaffold_ref))
+        n_scaffold = n_scaffold_ref
+        if logger:
+            logger.info(f'[ScaffoldExtract] 强制使用所有 {n_scaffold} 个原子作为骨架')
+
+    if logger:
+        logger.info(
+            f'[ScaffoldExtract] 骨架原子: {n_scaffold}/{n_scaffold_ref} '
+            f'(来源: {sc_cfg.get("scaffold_source", "auto_murcko")})'
+        )
+
+    return scaffold_indices, ref_mol, ref_ligand_name, n_scaffold
 
 
 def scaffold_grow_molecule(
@@ -6113,170 +6666,11 @@ def scaffold_grow_molecule(
     ref_pos_np = ref_ligand_pos.detach().cpu().numpy().astype(np.float64)
     ref_v_np = np.argmax(log_ref_v.detach().cpu().numpy(), axis=-1).astype(np.int64)
 
-    # ---- 解析骨架掩码 ---------------------------------------------------------
-    # 首先尝试从原始配体文件加载分子并提取骨架（更可靠）
-    scaffold_indices = []
-    ref_mol = None
-    ref_ligand_name = None
-    
-    # 尝试从数据中获取原始参考分子的 RDKit Mol 对象
-    if hasattr(data, 'ligand_filename') and data.ligand_filename:
-        ref_ligand_path = data.ligand_filename
-        ref_ligand_name = Path(ref_ligand_path).stem
-        
-        if logger:
-            logger.info(f'[ScaffoldGrow] 尝试加载配体文件: {ref_ligand_path}')
-            logger.info(f'[ScaffoldGrow] 文件存在性检查: {os.path.exists(ref_ligand_path)}')
-        
-        # 如果文件不存在，尝试从数据集根目录解析
-        if not os.path.exists(ref_ligand_path):
-            # 尝试使用 protein_root 或 dataset_root 作为基准
-            dataset_root = None
-            try:
-                dataset_root = config.data.path
-            except Exception:
-                pass
-            if not dataset_root:
-                try:
-                    dataset_root = getattr(config.sample, 'data', {}).get('path', None) if hasattr(config, 'sample') else None
-                except Exception:
-                    pass
-
-            # 如果路径是相对路径，尝试在不同位置查找
-            possible_paths = [
-                Path(ref_ligand_path),  # 原始路径
-            ]
-            # 优先使用 dataset_root（配置文件中的数据路径）
-            if dataset_root:
-                possible_paths.append(Path(dataset_root) / ref_ligand_path)
-            # 回退到常见硬编码路径
-            possible_paths += [
-                Path('./data/crossdocked_pocket10_test_only') / ref_ligand_path,
-                Path('/workspace/data/crossdocked_v1.1_rmsd1.0') / ref_ligand_path,
-                Path('/workspace/data/crossdocked_v1.1_rmsd1.0_pocket10') / ref_ligand_path,
-            ]
-            
-            for try_path in possible_paths:
-                if try_path.exists():
-                    ref_ligand_path = str(try_path)
-                    if logger:
-                        logger.info(f'[ScaffoldGrow] 找到配体文件: {ref_ligand_path}')
-                    break
-        
-        if os.path.exists(ref_ligand_path):
-            try:
-                ref_mol = Chem.SDMolSupplier(ref_ligand_path)[0]
-                if ref_mol is not None:
-                    # 直接从原始分子提取 Murcko 骨架
-                    scaffold_source = grow_cfg.get('scaffold_source', 'auto_murcko')
-                    
-                    # 确保分子有完整的环信息和化学有效性
-                    try:
-                        Chem.SanitizeMol(ref_mol)
-                        # 显式初始化 RingInfo
-                        ri = ref_mol.GetRingInfo()
-                        if ri is None or ri.NumRings() < 0:
-                            Chem.GetSSSR(ref_mol)
-                        if logger:
-                            logger.info(f'[ScaffoldGrow] 分子环信息初始化成功: {ref_mol.GetNumAtoms()} 原子, {ref_mol.GetRingInfo().NumRings()} 个环')
-                    except Exception as e:
-                        if logger:
-                            logger.warning(f'[ScaffoldGrow] 初始化 RingInfo 失败: {e}')
-                        # 继续执行，不中断流程
-                    
-                    if scaffold_source in ('auto_murcko', 'auto_murcko_generic'):
-                        # 策略：优先使用基于环检测的算法（更稳定，不依赖 MurckoScaffold）
-                        if logger:
-                            logger.info('[ScaffoldGrow] 尝试基于环检测的骨架提取...')
-                        indices = _detect_ring_based_scaffold_indices(ref_mol, logger)
-                        
-                        # 如果环检测失败，回退到 Murcko 方法
-                        if not indices:
-                            if logger:
-                                logger.info('[ScaffoldGrow] 环检测失败，尝试 Murcko 骨架提取...')
-                            indices = _detect_murcko_scaffold_indices(ref_mol)
-                            if logger:
-                                logger.info(f'[ScaffoldGrow] Murcko 检测到 {len(indices)} 个骨架原子')
-                            
-                            # 若普通 Murcko 返回空，降级到通用骨架
-                            if not indices and scaffold_source == 'auto_murcko':
-                                indices = _detect_generic_murcko_scaffold_indices(ref_mol)
-                                if logger:
-                                    logger.info(f'[ScaffoldGrow] 通用 Murcko 检测到 {len(indices)} 个骨架原子')
-                        
-                        scaffold_indices = indices
-                        if logger and indices:
-                            logger.info(f'[ScaffoldGrow] 从原始配体文件提取骨架: {len(indices)} 个原子')
-                        elif logger:
-                            logger.warning('[ScaffoldGrow] 所有骨架提取方法均返回空列表')
-            except Exception as e:
-                if logger:
-                    logger.warning(f'[ScaffoldGrow] 从文件提取骨架失败: {e}')
-    
-    # 如果无法从文件获取骨架，尝试从坐标重建并使用基于环检测的方法
-    if not scaffold_indices:
-        if logger:
-            logger.info('[ScaffoldGrow] 从文件提取骨架失败，尝试从坐标重建...')
-        
-        # 从坐标重建分子
-        from utils import reconstruct
-        try:
-            pos_np = ref_ligand_pos.detach().cpu().numpy() if hasattr(ref_ligand_pos, 'detach') else np.array(ref_ligand_pos)
-            v_np = ref_ligand_v.detach().cpu().numpy() if hasattr(ref_ligand_v, 'detach') else np.array(ref_ligand_v)
-            
-            reconstructed_mol = reconstruct.reconstruct_from_generated(pos_np, v_np, ligand_atom_mode)
-            
-            if reconstructed_mol is not None and logger:
-                logger.info(f'[ScaffoldGrow] 坐标重建分子成功: {reconstructed_mol.GetNumAtoms()} 个原子')
-            
-            if reconstructed_mol is not None:
-                # 尝试基于环检测的方法（不依赖 MurckoScaffold）
-                if logger:
-                    logger.info('[ScaffoldGrow] 尝试对重建分子使用基于环检测的骨架提取...')
-                indices = _detect_ring_based_scaffold_indices(reconstructed_mol, logger)
-                
-                if indices:
-                    scaffold_indices = indices
-                    if logger:
-                        logger.info(f'[ScaffoldGrow] 从重建分子提取骨架: {len(indices)} 个原子')
-                else:
-                    # 环检测失败，使用 _resolve_scaffold_mask
-                    if logger:
-                        logger.info('[ScaffoldGrow] 环检测失败，回退到 _resolve_scaffold_mask...')
-                    scaffold_mask = _resolve_scaffold_mask(
-                        grow_cfg, ref_ligand_pos, ref_ligand_v, ligand_atom_mode, n_scaffold_ref, device
-                    )
-                    scaffold_mask_np = scaffold_mask.cpu().numpy()
-                    scaffold_indices = np.where(scaffold_mask_np > 0.5)[0].tolist()
-            else:
-                # 重建失败，使用 _resolve_scaffold_mask
-                if logger:
-                    logger.warning('[ScaffoldGrow] 坐标重建分子失败，使用 _resolve_scaffold_mask...')
-                scaffold_mask = _resolve_scaffold_mask(
-                    grow_cfg, ref_ligand_pos, ref_ligand_v, ligand_atom_mode, n_scaffold_ref, device
-                )
-                scaffold_mask_np = scaffold_mask.cpu().numpy()
-                scaffold_indices = np.where(scaffold_mask_np > 0.5)[0].tolist()
-        except Exception as e:
-            if logger:
-                logger.warning(f'[ScaffoldGrow] 坐标重建过程失败: {e}')
-            # 最终回退
-            scaffold_mask = _resolve_scaffold_mask(
-                grow_cfg, ref_ligand_pos, ref_ligand_v, ligand_atom_mode, n_scaffold_ref, device
-            )
-            scaffold_mask_np = scaffold_mask.cpu().numpy()
-            scaffold_indices = np.where(scaffold_mask_np > 0.5)[0].tolist()
-    
-    n_scaffold = len(scaffold_indices)
-
-    if n_scaffold == 0:
-        if logger:
-            logger.warning('[ScaffoldGrow] 未找到骨架原子，将使用所有原子作为骨架（强制固定整个分子）')
-        # 最终 fallback：使用所有原子作为骨架
-        scaffold_indices = list(range(n_scaffold_ref))
-        n_scaffold = n_scaffold_ref
-        if logger:
-            logger.info(f'[ScaffoldGrow] 强制使用所有 {n_scaffold} 个原子作为骨架')
+    # ---- 解析骨架掩码（复用共享提取逻辑）-------------------------------------
+    scaffold_indices, ref_mol, ref_ligand_name, n_scaffold = _extract_scaffold_from_reference(
+        data, grow_cfg, ligand_atom_mode, ref_ligand_pos, ref_ligand_v, log_ref_v,
+        n_scaffold_ref, device, config=config, logger=logger,
+    )
 
     if logger:
         logger.info(
@@ -6284,6 +6678,19 @@ def scaffold_grow_molecule(
             f'(来源: {grow_cfg.get("scaffold_source", "auto_murcko")}) | '
             f'额外原子策略: {grow_cfg.get("n_extra_mode", "prior_minus_scaffold")}'
         )
+
+    if output_dir is not None:
+        _grow_base_output_dir = Path(output_dir)
+    else:
+        _grow_base_output_dir = Path(config.sample.get('output_dir', './outputs'))
+
+    _murcko_sites_cfg = get_murcko_sites_cfg(grow_cfg)
+    _attachment_sites = load_or_extract_attachment_sites(
+        ref_mol, scaffold_indices,
+        grow_cfg.get('scaffold_source', 'auto_murcko'),
+        ref_pos_np, _grow_base_output_dir, ref_ligand_name,
+        _murcko_sites_cfg, logger=logger,
+    )
 
     # ---- 保存骨架 SDF 结构 ------------------------------------------------------
     # 从原始参考配体中提取并保存骨架结构（使用前面已加载的 ref_mol）
@@ -6299,10 +6706,7 @@ def scaffold_grow_molecule(
             scaffold_mol = _extract_scaffold_submol(ref_mol, scaffold_indices, logger)
             if scaffold_mol is not None:
                 # 确定输出路径（使用传入的 output_dir 或默认 outputs）
-                if output_dir is not None:
-                    base_output_dir = Path(output_dir)
-                else:
-                    base_output_dir = Path(config.sample.get('output_dir', './outputs'))
+                base_output_dir = _grow_base_output_dir
                 
                 # 创建 scaffold 子目录
                 scaffold_output_dir = base_output_dir / 'scaffold'
@@ -6373,10 +6777,17 @@ def scaffold_grow_molecule(
 
     # ---- 对每个样本独立采样 N_extra（每次可不同）-----------------------------
     for sample_idx in range(num_samples):
-        n_extra = _sample_n_extra_atoms(grow_cfg, data.protein_pos, n_scaffold, model.num_timesteps)
+        n_extra = _sample_n_extra_atoms(
+            grow_cfg, data.protein_pos, n_scaffold, model.num_timesteps, sample_idx=sample_idx,
+        )
+        _place_cfg = _pin_place_cfg_to_n_extra(
+            _murcko_placement_cfg(grow_cfg, _murcko_sites_cfg), n_extra, grow_cfg,
+        )
+        if not uses_site_budget_placement(_place_cfg):
+            n_extra = cap_n_extra_for_sites(n_extra, _attachment_sites, _murcko_sites_cfg)
         n_total = n_scaffold + n_extra
 
-        if logger and (sample_idx == 0 or n_extra != _sample_n_extra_atoms.__defaults__):
+        if logger and (sample_idx == 0 or sample_idx % 10 == 0):
             logger.info(
                 f'[ScaffoldGrow] 样本 {sample_idx + 1}/{num_samples} | '
                 f'骨架原子: {n_scaffold} + 新原子: {n_extra} = 总计: {n_total}'
@@ -6393,18 +6804,45 @@ def scaffold_grow_molecule(
         scaffold_pos_orig = ref_ligand_pos[scaffold_indices] if n_scaffold > 0 else torch.zeros(0, 3, device=device)
         scaffold_log_v_orig = log_ref_v[scaffold_indices] if n_scaffold > 0 else torch.zeros(0, model.num_classes, device=device)
 
-        # 新原子初始坐标：口袋中心 + 高斯噪声（尺度 2Å，与蛋白口袋尺度匹配）
-        extra_pos_init = pocket_center.unsqueeze(0).expand(n_extra, -1) + \
-                         torch.randn(n_extra, 3, device=device) * 2.0
-
-        # 新原子初始类型：均匀分布（全零 → log_softmax）
-        extra_log_v_init = F.log_softmax(
-            torch.zeros(n_extra, model.num_classes, device=device), dim=-1
+        # 新原子初始坐标：Murcko 侧链质心位点（grow/dynamic_locked/prudent 共用）；无位点时回退口袋中心
+        extra_pos_init, _site_place_meta = build_extra_atom_positions(
+            n_extra, _attachment_sites, _place_cfg,
+            pocket_center, device, fallback_noise_scale=2.0, logger=logger,
+            rng=_murcko_sample_rng(grow_cfg, sample_idx),
+        )
+        n_extra = int(extra_pos_init.size(0))
+        (
+            preserved_pos, preserved_log_v, preserved_indices, zero_site_ids,
+            n_preserved, n_locked, n_total,
+        ) = _resolve_init_preserved_atoms(
+            _attachment_sites, _site_place_meta, _place_cfg,
+            ref_ligand_pos, log_ref_v, n_scaffold, n_extra,
+            logger=logger, log_tag='[ScaffoldGrow]', sample_idx=sample_idx,
         )
 
-        # 拼接：[骨架原子 | 新原子]
-        init_ligand_pos = torch.cat([scaffold_pos_orig, extra_pos_init], dim=0)  # [n_total, 3]
-        init_log_ligand_v = torch.cat([scaffold_log_v_orig, extra_log_v_init], dim=0)  # [n_total, C]
+        # 新原子初始类型：偏向 C/N/O/F，屏蔽 H、压低稀有元素权重
+        # H(0) 屏蔽：只能成 1 个键，作为重原子会破坏重建
+        # Cl(12) 压低：单价，容易超价
+        # P(8,9) S(10,11) 压低：稀有，价态复杂
+        extra_v_bias = torch.ones(model.num_classes, device=device)
+        extra_v_bias[0] = -1e9   # H: 屏蔽
+        extra_v_bias[12] = 0.05   # Cl: 极低保底（单价）
+        extra_v_bias[8] = 0.2    # P (非芳香): 低价
+        extra_v_bias[9] = 0.2    # P (芳香): 低价
+        extra_v_bias[10] = 0.3   # S (非芳香): 低价
+        extra_v_bias[11] = 0.3   # S (芳香): 低价
+        extra_v_bias[7] = 0.7    # F: 单价但在药物中常见，中等偏低价
+        extra_log_v_init = F.log_softmax(
+            torch.ones(n_extra, model.num_classes, device=device) * extra_v_bias, dim=-1
+        ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+
+        # 拼接：[骨架 | 零分配保留侧链 | 新原子]
+        init_ligand_pos = torch.cat(
+            [scaffold_pos_orig, preserved_pos, extra_pos_init], dim=0
+        )  # [n_total, 3]
+        init_log_ligand_v = torch.cat(
+            [scaffold_log_v_orig, preserved_log_v, extra_log_v_init], dim=0
+        )  # [n_total, C]
         batch_ligand = torch.zeros(n_total, dtype=torch.long, device=device)
 
         # 中心化：将初始位置对齐到口袋中心
@@ -6414,26 +6852,24 @@ def scaffold_grow_molecule(
         )
 
         # ---- 构建 RePaint 参考态 -------------------------------------------
-        # 骨架参考：已中心化的骨架原子位置 + 骨架原子类型
-        # 新原子参考：口袋中心（掩码为 0，不会被拉回，设置任意值）
-        x0_pos_ref = init_pos_centered.clone()  # 骨架部分将被锚定，新原子随便
+        # 骨架 + 保留侧链锚定；仅 generated_extra 可扩散
+        x0_pos_ref = init_pos_centered.clone()
         x0_log_v_ref = init_log_ligand_v.clone()
 
-        # 掩码：骨架原子在前 n_scaffold 位（pos_mask=type_mask=1），其余为 0
         pos_mask_local = torch.zeros(n_total, device=device)
         type_mask_local = torch.zeros(n_total, device=device)
-        if n_scaffold > 0:
-            pos_mask_local[:n_scaffold] = 1.0
-            type_mask_local[:n_scaffold] = 1.0  # 骨架生长时：元素也固定
+        if n_locked > 0:
+            pos_mask_local[:n_locked] = 1.0
+            type_mask_local[:n_locked] = 1.0
 
         repaint_cfg = {
             'x0_pos': x0_pos_ref,
             'x0_log_v': x0_log_v_ref,
             'pos_mask': pos_mask_local,
-            'type_mask': type_mask_local if n_scaffold > 0 else None,
+            'type_mask': type_mask_local if n_locked > 0 else None,
             'use_mean_for_discrete': True,
             '_use_dual_mask': True,
-        } if n_scaffold > 0 else None
+        } if n_locked > 0 else None
 
         # ---- 前向扩散初始化（从 start_t 开始反扩散）------------------------
         # 新原子直接用纯噪声，骨架原子也加噪（RePaint 会在每步拉回）
@@ -6469,6 +6905,20 @@ def scaffold_grow_molecule(
         pos_np = final_pos.detach().cpu().numpy().astype(np.float64)
         v_np = log_v_out.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
 
+        # 后处理：修复额外原子中价态不兼容的元素 → C
+        # 单价元素 H(0), Cl(12) 作为重原子会超价破坏重建
+        # add_aromatic 模式索引: 0=H, 1=C, 2=C_arom, 3=N, 4=N_arom,
+        #   5=O, 6=O_arom, 7=F, 8=P, 9=P_arom, 10=S, 11=S_arom, 12=Cl
+        if n_extra > 0:
+            extra_v = v_np[n_locked:]
+            to_carbon = (extra_v == 0)   # H: 单价，永远不是重原子
+            # Cl (index 12) 单价，F (index 7) 单价 — 替换为碳
+            to_carbon |= (extra_v == 12)  # Cl
+            to_carbon |= (extra_v == 7)   # F
+            if to_carbon.any():
+                extra_v[to_carbon] = 1  # → 非芳香 C
+                v_np[n_locked:] = extra_v
+
         # 骨架 RMSD（仅对骨架原子，验证锚定效果）
         if n_scaffold > 0:
             scaffold_pos_ref_world = scaffold_pos_orig.detach().cpu().numpy()
@@ -6489,7 +6939,11 @@ def scaffold_grow_molecule(
             'method': 'scaffold_grow',
             'ligand_num_atoms': n_total,
             'n_scaffold': n_scaffold,
+            'n_preserved': n_preserved,
             'n_extra': n_extra,
+            'n_locked': n_locked,
+            'zero_allocation_site_ids': zero_site_ids,
+            'preserved_atom_indices': preserved_indices,
             'scaffold_rmsd': scaffold_rmsd,
             'rmsd_from_ref': float(np.sqrt(np.mean(
                 (pos_np[:n_scaffold_ref] - ref_pos_np) ** 2
@@ -6500,6 +6954,8 @@ def scaffold_grow_molecule(
             'sa': metric_info.get('metrics', {}).get('sa'),
             'status': metric_info.get('status'),
             'is_original': False,
+            'extra_placement': _site_place_meta.get('placement'),
+            'site_allocation': _site_place_meta.get('site_allocation'),
         })
 
     # ---- 主 result_*.pt：首位插入提取后的骨架（坐标/类型子集，便于与生成样本对照分析）----
@@ -6557,7 +7013,1651 @@ def scaffold_grow_molecule(
                 'scaffold_indices': scaffold_indices,
                 'n_extra_mode': grow_cfg.get('n_extra_mode'),
                 'start_t': start_t,
+                'attachment_sites': _attachment_sites,
+                'murcko_sites_cfg': _murcko_sites_cfg,
             },
+            'total_time': total_time,
+        },
+    }
+
+
+def scaffold_dynamic_locked_molecule(
+    model,
+    data,
+    config,
+    ligand_atom_mode: str,
+    device: str = 'cuda:0',
+    logger=None,
+    output_dir: str = None,
+) -> dict:
+    """骨架锁定动态模式：跑完整 dynamic 的 large_step + refine 两阶段，但锁定骨架原子位置、不锁定骨架原子类型。
+
+    与 scaffold_grow 的区别：
+    - grow：单条反扩散循环（start_t≈357→0），同时锁定骨架位置和类型。
+    - dynamic_locked：复用 dynamic 的 large_step（999→~500）+ refine（time_boundary→0）两阶段，
+      仅锁定骨架位置（pos_mask），骨架原子类型自由演化（type_mask=None），由模型重新预测。
+
+    流水线：
+        1. 提取骨架（复用 _extract_scaffold_from_reference）。
+        2. 对每个样本：
+           a. 采样 N_extra（复用 _sample_n_extra_atoms，pocket_prior 等）。
+           b. 初始化：所有原子=纯噪声（中心+高斯）+ 均匀类型（与 dynamic 一致）。
+           c. 构建 repaint_cfg：x0_pos=干净居中骨架，pos_mask=骨架掩码，type_mask=None。
+           d. large_step（带 repaint_cfg）→ refine（带 repaint_cfg，time_upper=time_boundary）。
+        3. 后处理、骨架 RMSD、指标记录。
+    """
+    sc_cfg, _ = _get_scaffold_mode_cfg(config)   # dynamic_locked 无子节时 merged=顶层 scaffold
+    grow_cfg = config.sample.get('scaffold', {}).get('grow', {})
+    center_pos_mode = config.sample.get('center_pos_mode', 'protein')
+    pos_only = config.sample.get('pos_only', False)
+
+    dynamic_cfg = config.sample.get('dynamic', {})
+    large_cfg = dynamic_cfg.get('large_step', {})
+    refine_cfg = dict(dynamic_cfg.get('refine', {}))
+    time_boundary = get_time_boundary(dynamic_cfg, 750)
+    if 'time_upper' not in refine_cfg:
+        refine_cfg['time_upper'] = time_boundary
+    tbr_cfg = config.sample.get('targetdiff_baseline_refine', {})
+    baseline_init_only = bool(
+        tbr_cfg.get('enable', False) and tbr_cfg.get('after_scaffold_init_only', False)
+    )
+    # 仅跑 DiffDynamic refine（跳过 large_step；与 baseline_init_only / prudent 互斥）
+    refine_only = bool(sc_cfg.get('refine_only', False)) and not baseline_init_only
+    # 本模式契约：默认跑完整 large_step + refine；仅 baseline_init_only 时跳过
+    skip_refine = False
+
+    if not hasattr(data, 'ligand_pos') or data.ligand_pos is None or data.ligand_pos.size(0) == 0:
+        raise ValueError(
+            '骨架锁定动态模式需要参考配体（含 3D 坐标 SDF）以提取骨架，请通过 --ligand_path 指定。'
+        )
+
+    ref_ligand_pos = data.ligand_pos.to(device)
+    ref_ligand_v = data.ligand_atom_feature_full.to(device)
+    n_scaffold_ref = ref_ligand_pos.size(0)
+    log_ref_v = index_to_log_onehot(ref_ligand_v, model.num_classes)
+
+    ref_pos_np = ref_ligand_pos.detach().cpu().numpy().astype(np.float64)
+    ref_v_np = np.argmax(log_ref_v.detach().cpu().numpy(), axis=-1).astype(np.int64)
+
+    # ---- 提取骨架（复用共享逻辑）-------------------------------------
+    scaffold_indices, ref_mol, ref_ligand_name, n_scaffold = _extract_scaffold_from_reference(
+        data, sc_cfg, ligand_atom_mode, ref_ligand_pos, ref_ligand_v, log_ref_v,
+        n_scaffold_ref, device, config=config, logger=logger,
+    )
+
+    fix_scaffold_pos = bool(sc_cfg.get('fix_scaffold_pos', True))
+    fix_scaffold_type = bool(sc_cfg.get('fix_scaffold_type', False))   # 本模式默认 False
+
+    if logger:
+        _tbr_steps = int(tbr_cfg.get('start_t', 9)) + 1 if baseline_init_only else None
+        logger.info(
+            f'[ScaffoldDynamicLocked] 骨架原子: {n_scaffold}/{n_scaffold_ref} | '
+            f'锁定位置: {fix_scaffold_pos} | 锁定类型: {fix_scaffold_type} | '
+            f'skip_refine: {skip_refine} | time_boundary: {time_boundary}'
+            + (f' | baseline_init_only: TargetDiff { _tbr_steps }步' if baseline_init_only else '')
+            + (' | refine_only: 跳过 large_step' if refine_only else '')
+        )
+
+    # ---- 保存骨架 SDF 结构（复用 grow 的保存逻辑）----------------------
+    try:
+        if ref_mol is None and hasattr(data, 'ligand_mol') and data.ligand_mol is not None:
+            ref_mol = data.ligand_mol
+            if hasattr(data, 'ligand_filename') and data.ligand_filename:
+                ref_ligand_name = Path(data.ligand_filename).stem
+        if ref_mol is not None and n_scaffold > 0:
+            scaffold_mol = _extract_scaffold_submol(ref_mol, scaffold_indices, logger)
+            if scaffold_mol is not None:
+                if output_dir is not None:
+                    base_output_dir = Path(output_dir)
+                else:
+                    base_output_dir = Path(config.sample.get('output_dir', './outputs'))
+                scaffold_output_dir = base_output_dir / 'scaffold'
+                scaffold_output_dir.mkdir(parents=True, exist_ok=True)
+                if ref_ligand_name:
+                    scaffold_filename = f'{ref_ligand_name}_scaffold_dynamic_locked.sdf'
+                else:
+                    cst = timezone(timedelta(hours=8))
+                    timestamp = datetime.now(cst).strftime('%Y%m%d_%H%M%S')
+                    scaffold_filename = f'scaffold_dl_{n_scaffold}atoms_{timestamp}.sdf'
+                scaffold_sdf_path = scaffold_output_dir / scaffold_filename
+                writer = Chem.SDWriter(str(scaffold_sdf_path))
+                writer.write(scaffold_mol)
+                writer.close()
+                if logger:
+                    logger.info(f'[ScaffoldDynamicLocked] 骨架结构已保存: {scaffold_sdf_path}')
+    except Exception as e:
+        if logger:
+            logger.warning(f'[ScaffoldDynamicLocked] 保存骨架 SDF 失败: {e}')
+
+    if output_dir is not None:
+        _dl_base_output_dir = Path(output_dir)
+    else:
+        _dl_base_output_dir = Path(config.sample.get('output_dir', './outputs'))
+
+    _murcko_sites_cfg = get_murcko_sites_cfg(sc_cfg)
+    _attachment_sites = load_or_extract_attachment_sites(
+        ref_mol, scaffold_indices,
+        sc_cfg.get('scaffold_source', 'auto_murcko'),
+        ref_pos_np, _dl_base_output_dir, ref_ligand_name,
+        _murcko_sites_cfg, logger=logger,
+    )
+
+    # ---- 生成参数 ------------------------------------------------------------
+    num_samples = int(sc_cfg.get('num_samples', grow_cfg.get('num_samples', 200)))
+
+    pos_list, v_list = [], []
+    pos_traj_list, v_traj_list, log_v_traj_list = [], [], []
+    time_list = []
+    meta_records = []
+    total_time = 0.0
+
+    selector_cfg = {
+        'min_qed': grow_cfg.get('min_qed', 0.2),
+        'min_sa': grow_cfg.get('min_sa', 0.2),
+        'filter_incomplete': grow_cfg.get('filter_incomplete', False),
+        'qed_weight': 1.0,
+        'sa_weight': 1.0,
+    }
+
+    log_mode_is_log_prob = (getattr(model, 'ligand_v_input', 'onehot') == 'log_prob')
+
+    # ---- 逐样本循环（batch_size=1，处理可变 n_extra）-----------------------
+    for sample_idx in range(num_samples):
+        n_extra = _sample_n_extra_atoms(
+            grow_cfg, data.protein_pos, n_scaffold, model.num_timesteps, sample_idx=sample_idx,
+        )
+        _place_cfg = _pin_place_cfg_to_n_extra(
+            _murcko_placement_cfg(grow_cfg, _murcko_sites_cfg), n_extra, grow_cfg,
+        )
+        if not uses_site_budget_placement(_place_cfg):
+            n_extra = cap_n_extra_for_sites(n_extra, _attachment_sites, _murcko_sites_cfg)
+        n_total = n_scaffold + n_extra
+
+        if logger and (sample_idx == 0 or sample_idx % 10 == 0):
+            logger.info(
+                f'[ScaffoldDynamicLocked] 样本 {sample_idx + 1}/{num_samples} | '
+                f'骨架原子: {n_scaffold} + 新原子: {n_extra} = 总计: {n_total}'
+            )
+
+        # ---- 构建单样本批次 ---------------------------------------------
+        batch = Batch.from_data_list([data.clone()], follow_batch=FOLLOW_BATCH).to(device)
+        batch_protein = batch.protein_element_batch
+
+        # 蛋白中心（= center_pos('protein') 对 batch_size=1 的 offset）
+        protein_centroid = scatter_mean(batch.protein_pos, batch_protein, dim=0)[0]  # [3]
+
+        # ---- 初始化：Murcko 位点放置 + 骨架/保留侧链参考坐标 ---------------
+        extra_pos_world, _site_place_meta = build_extra_atom_positions(
+            n_extra, _attachment_sites, _place_cfg,
+            protein_centroid, device, fallback_noise_scale=1.0, logger=logger,
+            rng=_murcko_sample_rng(grow_cfg, sample_idx),
+        )
+        n_extra = int(extra_pos_world.size(0))
+        (
+            preserved_pos, preserved_log_v, preserved_indices, zero_site_ids,
+            n_preserved, n_locked, n_total,
+        ) = _resolve_init_preserved_atoms(
+            _attachment_sites, _site_place_meta, _place_cfg,
+            ref_ligand_pos, log_ref_v, n_scaffold, n_extra,
+            logger=logger, log_tag='[ScaffoldDynamicLocked]', sample_idx=sample_idx,
+        )
+
+        # world-frame init: noise everywhere, then overwrite locked + extra
+        init_ligand_pos = protein_centroid.unsqueeze(0).expand(n_total, -1) + \
+                          torch.randn(n_total, 3, device=device)
+        if n_scaffold > 0 and fix_scaffold_pos:
+            init_ligand_pos[:n_scaffold] = ref_ligand_pos[scaffold_indices]
+        if n_preserved > 0 and fix_scaffold_pos:
+            init_ligand_pos[n_scaffold:n_locked] = preserved_pos
+        if n_extra > 0:
+            init_ligand_pos[n_locked:] = extra_pos_world
+        batch_ligand = torch.zeros(n_total, dtype=torch.long, device=device)
+
+        if fix_scaffold_type and n_locked > 0:
+            scaffold_log_part = (
+                log_ref_v[scaffold_indices] if n_scaffold > 0
+                else torch.zeros(0, model.num_classes, device=device)
+            )
+            extra_log_v = F.log_softmax(
+                torch.zeros(n_extra, model.num_classes, device=device), dim=-1
+            ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+            init_ligand_v_input = torch.cat(
+                [scaffold_log_part, preserved_log_v, extra_log_v], dim=0
+            )
+        else:
+            uniform_logits = torch.zeros(n_total, model.num_classes, device=device)
+            if log_mode_is_log_prob:
+                init_ligand_v_input = F.log_softmax(uniform_logits, dim=-1)
+            else:
+                init_ligand_v_input = log_sample_categorical(uniform_logits)
+
+        # ---- 构建 repaint_cfg：锁骨架 + 保留侧链位置 -----------------------
+        repaint_cfg = None
+        if n_locked > 0:
+            scaffold_pos_orig = (
+                ref_ligand_pos[scaffold_indices] if n_scaffold > 0
+                else torch.zeros(0, 3, device=device)
+            )
+            locked_pos_world = torch.cat([scaffold_pos_orig, preserved_pos], dim=0)
+            locked_pos_centered = locked_pos_world - protein_centroid.unsqueeze(0)
+            if n_extra > 0:
+                extra_pos_centered = extra_pos_world - protein_centroid.unsqueeze(0)
+            else:
+                extra_pos_centered = torch.zeros(0, 3, device=device)
+            x0_pos_ref = torch.cat([locked_pos_centered, extra_pos_centered], dim=0)
+
+            scaffold_log_v = (
+                log_ref_v[scaffold_indices] if n_scaffold > 0
+                else torch.zeros(0, model.num_classes, device=device)
+            )
+            extra_log_v_pad = F.log_softmax(
+                torch.zeros(n_extra, model.num_classes, device=device), dim=-1
+            ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+            x0_log_v_ref = torch.cat(
+                [scaffold_log_v, preserved_log_v, extra_log_v_pad], dim=0
+            )
+
+            pos_mask_local = torch.zeros(n_total, device=device)
+            if fix_scaffold_pos:
+                pos_mask_local[:n_locked] = 1.0
+
+            type_mask_local = None
+            if fix_scaffold_type:
+                type_mask_local = torch.zeros(n_total, device=device)
+                type_mask_local[:n_locked] = 1.0
+
+            repaint_cfg = {
+                'x0_pos': x0_pos_ref,
+                'x0_log_v': x0_log_v_ref,
+                'pos_mask': pos_mask_local,
+                'type_mask': type_mask_local,
+                'use_mean_for_discrete': True,
+                '_use_dual_mask': True,
+            }
+
+        t_start_wall = time.time()
+        with torch.no_grad():
+            if baseline_init_only:
+                final_pos_t = init_ligand_pos
+                if log_mode_is_log_prob or (
+                    isinstance(init_ligand_v_input, torch.Tensor) and init_ligand_v_input.dim() == 2
+                ):
+                    log_v_out = init_ligand_v_input
+                else:
+                    log_v_out = index_to_log_onehot(init_ligand_v_input, model.num_classes)
+                if logger and sample_idx == 0:
+                    logger.info(
+                        f'[ScaffoldDynamicLocked] baseline_init_only: 跳过 large_step/refine，'
+                        f'将由 TargetDiff baseline 做 {int(tbr_cfg.get("start_t", 9)) + 1} 步修复'
+                    )
+            elif refine_only:
+                # ---- 仅 refine（位点初始化 → time_boundary→0，跳过 large_step）----
+                if logger and sample_idx == 0:
+                    logger.info(
+                        f'[ScaffoldDynamicLocked] refine_only: 跳过 large_step，'
+                        f'仅 DiffDynamic refine (t={refine_cfg.get("time_upper", time_boundary)}→'
+                        f'{refine_cfg.get("time_lower", 0)})'
+                    )
+                if log_mode_is_log_prob or (
+                    isinstance(init_ligand_v_input, torch.Tensor) and init_ligand_v_input.dim() == 2
+                ):
+                    refine_init_v = init_ligand_v_input
+                else:
+                    refine_init_v = init_ligand_v_input
+                res_refine = model.sample_diffusion_refinement(
+                    protein_pos=batch.protein_pos,
+                    protein_v=batch.protein_atom_feature.float(),
+                    batch_protein=batch_protein,
+                    init_ligand_pos=init_ligand_pos,
+                    init_ligand_v=refine_init_v,
+                    batch_ligand=batch_ligand,
+                    center_pos_mode=center_pos_mode,
+                    pos_only=pos_only,
+                    step_stride=refine_cfg.get('stride'),
+                    step_size=refine_cfg.get('step_size'),
+                    add_noise=refine_cfg.get('noise_scale'),
+                    pos_clip=refine_cfg.get('pos_clip'),
+                    v_clip=refine_cfg.get('v_clip'),
+                    time_upper=refine_cfg.get('time_upper', time_boundary),
+                    time_lower=refine_cfg.get('time_lower', 0),
+                    num_cycles=refine_cfg.get('cycles', 1),
+                    log_ligand_input_mode='log_prob' if log_mode_is_log_prob else 'auto',
+                    repaint_cfg=repaint_cfg,
+                    **_dynamic_subcfg_grad_cap_kwargs(refine_cfg),
+                )
+                final_pos_t = res_refine['pos']
+                log_v_out = res_refine['log_v']
+            else:
+                # ---- large_step 阶段（999→~500，带骨架位置锁定）------------
+                res_large = model.sample_diffusion_large_step(
+                    protein_pos=batch.protein_pos,
+                    protein_v=batch.protein_atom_feature.float(),
+                    batch_protein=batch_protein,
+                    init_ligand_pos=init_ligand_pos,
+                    init_ligand_v=init_ligand_v_input,
+                    batch_ligand=batch_ligand,
+                    num_steps=large_cfg.get('num_steps'),
+                    center_pos_mode=center_pos_mode,
+                    pos_only=pos_only,
+                    step_stride=large_cfg.get('stride'),
+                    step_size=large_cfg.get('step_size'),
+                    add_noise=large_cfg.get('noise_scale'),
+                    pos_clip=large_cfg.get('pos_clip'),
+                    v_clip=large_cfg.get('v_clip'),
+                    log_ligand_input_mode='log_prob' if log_mode_is_log_prob else 'auto',
+                    repaint_cfg=repaint_cfg,
+                    **_dynamic_subcfg_grad_cap_kwargs(large_cfg),
+                )
+
+                # ---- refine 阶段（time_boundary→0，带骨架位置锁定）---------
+                if not skip_refine:
+                    refine_init_pos = res_large['pos']                       # world frame
+                    if log_mode_is_log_prob:
+                        refine_init_v = res_large['log_v']
+                    else:
+                        refine_init_v = res_large['v']
+                    res_refine = model.sample_diffusion_refinement(
+                        protein_pos=batch.protein_pos,
+                        protein_v=batch.protein_atom_feature.float(),
+                        batch_protein=batch_protein,
+                        init_ligand_pos=refine_init_pos,
+                        init_ligand_v=refine_init_v,
+                        batch_ligand=batch_ligand,
+                        center_pos_mode=center_pos_mode,
+                        pos_only=pos_only,
+                        step_stride=refine_cfg.get('stride'),
+                        step_size=refine_cfg.get('step_size'),
+                        add_noise=refine_cfg.get('noise_scale'),
+                        pos_clip=refine_cfg.get('pos_clip'),
+                        v_clip=refine_cfg.get('v_clip'),
+                        time_upper=refine_cfg.get('time_upper', time_boundary),
+                        time_lower=refine_cfg.get('time_lower', 0),
+                        num_cycles=refine_cfg.get('cycles', 1),
+                        log_ligand_input_mode='log_prob' if log_mode_is_log_prob else 'auto',
+                        repaint_cfg=repaint_cfg,
+                        **_dynamic_subcfg_grad_cap_kwargs(refine_cfg),
+                    )
+                    final_pos_t = res_refine['pos']
+                    log_v_out = res_refine['log_v']
+                else:
+                    final_pos_t = res_large['pos']
+                    log_v_out = res_large['log_v']
+        t_end_wall = time.time()
+        total_time += t_end_wall - t_start_wall
+
+        pos_np = final_pos_t.detach().cpu().numpy().astype(np.float64)
+        v_np = log_v_out.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
+
+        # 后处理：修复额外原子中价态不兼容元素 → C（与 grow 一致）
+        if n_extra > 0:
+            extra_v = v_np[n_locked:]
+            to_carbon = (extra_v == 0)    # H
+            to_carbon |= (extra_v == 12)  # Cl
+            to_carbon |= (extra_v == 7)   # F
+            if to_carbon.any():
+                extra_v[to_carbon] = 1    # → 非芳香 C
+                v_np[n_locked:] = extra_v
+
+        # 骨架 RMSD（验证位置锁定效果）
+        if n_scaffold > 0:
+            scaffold_pos_ref_world = ref_ligand_pos[scaffold_indices].detach().cpu().numpy()
+            scaffold_pos_gen = pos_np[:n_scaffold]
+            scaffold_rmsd = float(np.sqrt(np.mean((scaffold_pos_gen - scaffold_pos_ref_world) ** 2)))
+        else:
+            scaffold_rmsd = 0.0
+
+        metric_info = evaluate_candidate(pos_np, v_np, ligand_atom_mode, selector_cfg)
+
+        pos_list.append(pos_np)
+        v_list.append(v_np)
+        pos_traj_list.append([])
+        v_traj_list.append([])
+        log_v_traj_list.append([])
+        time_list.append(t_end_wall - t_start_wall)
+        meta_records.append({
+            'method': 'scaffold_dynamic_locked',
+            'ligand_num_atoms': n_total,
+            'n_scaffold': n_scaffold,
+            'n_preserved': n_preserved,
+            'n_extra': n_extra,
+            'n_locked': n_locked,
+            'zero_allocation_site_ids': zero_site_ids,
+            'preserved_atom_indices': preserved_indices,
+            'scaffold_rmsd': scaffold_rmsd,
+            'rmsd_from_ref': float(np.sqrt(np.mean(
+                (pos_np[:n_scaffold_ref] - ref_pos_np) ** 2
+            ))) if n_scaffold_ref == n_total else float('nan'),
+            'time': t_end_wall - t_start_wall,
+            'smiles': metric_info.get('smiles'),
+            'qed': metric_info.get('metrics', {}).get('qed'),
+            'sa': metric_info.get('metrics', {}).get('sa'),
+            'status': metric_info.get('status'),
+            'is_original': False,
+            'extra_placement': _site_place_meta.get('placement'),
+            'site_allocation': _site_place_meta.get('site_allocation'),
+        })
+
+    # ---- 首位插入提取后的骨架（保持下游提取/评估格式兼容）--------------
+    if n_scaffold > 0:
+        scaffold_pos_np = ref_pos_np[scaffold_indices]
+        scaffold_v_np = ref_v_np[scaffold_indices]
+        scaffold_metric = evaluate_candidate(scaffold_pos_np, scaffold_v_np, ligand_atom_mode, selector_cfg)
+        pos_list.insert(0, scaffold_pos_np)
+        v_list.insert(0, scaffold_v_np)
+        pos_traj_list.insert(0, [])
+        v_traj_list.insert(0, [])
+        log_v_traj_list.insert(0, [])
+        time_list.insert(0, 0.0)
+        meta_records.insert(0, {
+            'method': 'scaffold_dynamic_locked',
+            'ligand_num_atoms': n_scaffold,
+            'n_scaffold': n_scaffold,
+            'n_extra': 0,
+            'scaffold_rmsd': 0.0,
+            'rmsd_from_ref': 0.0,
+            'time': 0.0,
+            'smiles': scaffold_metric.get('smiles'),
+            'qed': scaffold_metric.get('metrics', {}).get('qed'),
+            'sa': scaffold_metric.get('metrics', {}).get('sa'),
+            'status': scaffold_metric.get('status'),
+            'is_original': True,
+            'is_extracted_scaffold': True,
+        })
+
+    if logger:
+        valid = sum(1 for m in meta_records if m.get('status') == 'ok' and not m.get('is_original'))
+        avg_scaffold_rmsd = np.mean([
+            m['scaffold_rmsd'] for m in meta_records
+            if not m.get('is_original') and np.isfinite(m.get('scaffold_rmsd', float('nan')))
+        ]) if valid > 0 else 0.0
+        logger.info(
+            f'[ScaffoldDynamicLocked] 完成: {valid}/{num_samples} 有效分子 | '
+            f'平均骨架 RMSD={avg_scaffold_rmsd:.3f} Å | 总耗时 {total_time:.2f}s'
+        )
+
+    return {
+        'pos_list': pos_list,
+        'v_list': v_list,
+        'pos_traj': pos_traj_list,
+        'v_traj': v_traj_list,
+        'log_v_traj': log_v_traj_list,
+        'time_list': time_list,
+        'meta': {
+            'method': 'scaffold_dynamic_locked',
+            'records': meta_records,
+            'scaffold_cfg': {
+                'scaffold_source': sc_cfg.get('scaffold_source'),
+                'n_scaffold_atoms': n_scaffold,
+                'scaffold_indices': scaffold_indices,
+                'fix_scaffold_pos': fix_scaffold_pos,
+                'fix_scaffold_type': fix_scaffold_type,
+                'time_boundary': time_boundary,
+                'skip_refine': skip_refine,
+                'attachment_sites': _attachment_sites,
+                'murcko_sites_cfg': _murcko_sites_cfg,
+            },
+            'total_time': total_time,
+        },
+    }
+
+
+def _prudent_locked_sample_once(
+    *,
+    model,
+    data,
+    device,
+    grow_cfg,
+    _attachment_sites,
+    _murcko_sites_cfg,
+    protein_centroid,
+    ref_ligand_pos,
+    log_ref_v,
+    scaffold_indices,
+    n_scaffold,
+    scaffold_bond_pairs,
+    fix_scaffold_pos,
+    fix_scaffold_type,
+    log_mode_is_log_prob,
+    large_cfg,
+    refine_cfg,
+    time_boundary,
+    center_pos_mode,
+    pos_only,
+    ligand_atom_mode,
+    selector_cfg,
+    sample_idx,
+    slot_retry,
+    logger=None,
+    log_tag='[ScaffoldPrudent]',
+):
+    """生成一条骨架锁定分子（Gen0 / final_fill 共用）。返回 cand dict 或 None。"""
+    n_extra = _sample_n_extra_atoms(
+        grow_cfg, data.protein_pos, n_scaffold, model.num_timesteps,
+        sample_idx=sample_idx, retry=slot_retry,
+    )
+    _place_cfg = _pin_place_cfg_to_n_extra(
+        _murcko_placement_cfg(grow_cfg, _murcko_sites_cfg), n_extra, grow_cfg,
+    )
+    if not uses_site_budget_placement(_place_cfg):
+        n_extra = cap_n_extra_for_sites(n_extra, _attachment_sites, _murcko_sites_cfg)
+
+    batch = Batch.from_data_list([data.clone()], follow_batch=FOLLOW_BATCH).to(device)
+    batch_protein = batch.protein_element_batch
+    extra_pos_world, _site_place_meta = build_extra_atom_positions(
+        n_extra, _attachment_sites, _place_cfg,
+        protein_centroid, device, fallback_noise_scale=1.0, logger=logger,
+        rng=_murcko_sample_rng(grow_cfg, sample_idx, retry=slot_retry),
+    )
+    n_extra = int(extra_pos_world.size(0))
+    (
+        preserved_pos, preserved_log_v, preserved_indices, zero_site_ids,
+        n_preserved, n_locked, n_total,
+    ) = _resolve_init_preserved_atoms(
+        _attachment_sites, _site_place_meta, _place_cfg,
+        ref_ligand_pos, log_ref_v, n_scaffold, n_extra,
+        logger=logger, log_tag=log_tag, sample_idx=sample_idx,
+    )
+
+    init_ligand_pos = protein_centroid.unsqueeze(0).expand(n_total, -1) + \
+                      torch.randn(n_total, 3, device=device)
+    if n_scaffold > 0 and fix_scaffold_pos:
+        init_ligand_pos[:n_scaffold] = ref_ligand_pos[scaffold_indices]
+    if n_preserved > 0 and fix_scaffold_pos:
+        init_ligand_pos[n_scaffold:n_locked] = preserved_pos
+    if n_extra > 0:
+        init_ligand_pos[n_locked:] = extra_pos_world
+    batch_ligand = torch.zeros(n_total, dtype=torch.long, device=device)
+
+    if fix_scaffold_type and n_locked > 0:
+        scaffold_log_part = (
+            log_ref_v[scaffold_indices] if n_scaffold > 0
+            else torch.zeros(0, model.num_classes, device=device)
+        )
+        extra_log_v = F.log_softmax(
+            torch.zeros(n_extra, model.num_classes, device=device), dim=-1
+        ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+        init_ligand_v_input = torch.cat(
+            [scaffold_log_part, preserved_log_v, extra_log_v], dim=0
+        )
+    else:
+        uniform_logits = torch.zeros(n_total, model.num_classes, device=device)
+        if log_mode_is_log_prob:
+            init_ligand_v_input = F.log_softmax(uniform_logits, dim=-1)
+        else:
+            init_ligand_v_input = log_sample_categorical(uniform_logits)
+
+    repaint_cfg = None
+    if n_locked > 0:
+        scaffold_pos_orig = (
+            ref_ligand_pos[scaffold_indices] if n_scaffold > 0
+            else torch.zeros(0, 3, device=device)
+        )
+        locked_pos_world = torch.cat([scaffold_pos_orig, preserved_pos], dim=0)
+        locked_pos_centered = locked_pos_world - protein_centroid.unsqueeze(0)
+        if n_extra > 0:
+            extra_pos_centered = extra_pos_world - protein_centroid.unsqueeze(0)
+        else:
+            extra_pos_centered = torch.zeros(0, 3, device=device)
+        x0_pos_ref = torch.cat([locked_pos_centered, extra_pos_centered], dim=0)
+        scaffold_log_v = (
+            log_ref_v[scaffold_indices] if n_scaffold > 0
+            else torch.zeros(0, model.num_classes, device=device)
+        )
+        extra_log_v_pad = F.log_softmax(
+            torch.zeros(n_extra, model.num_classes, device=device), dim=-1
+        ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+        x0_log_v_ref = torch.cat([scaffold_log_v, preserved_log_v, extra_log_v_pad], dim=0)
+        pos_mask_local = torch.zeros(n_total, device=device)
+        if fix_scaffold_pos:
+            pos_mask_local[:n_locked] = 1.0
+        type_mask_local = None
+        if fix_scaffold_type:
+            type_mask_local = torch.zeros(n_total, device=device)
+            type_mask_local[:n_locked] = 1.0
+        repaint_cfg = {
+            'x0_pos': x0_pos_ref,
+            'x0_log_v': x0_log_v_ref,
+            'pos_mask': pos_mask_local,
+            'type_mask': type_mask_local,
+            'use_mean_for_discrete': True,
+            '_use_dual_mask': True,
+        }
+
+    with torch.no_grad():
+        res_large = model.sample_diffusion_large_step(
+            protein_pos=batch.protein_pos,
+            protein_v=batch.protein_atom_feature.float(),
+            batch_protein=batch_protein,
+            init_ligand_pos=init_ligand_pos,
+            init_ligand_v=init_ligand_v_input,
+            batch_ligand=batch_ligand,
+            num_steps=large_cfg.get('num_steps'),
+            center_pos_mode=center_pos_mode,
+            pos_only=pos_only,
+            step_stride=large_cfg.get('stride'),
+            step_size=large_cfg.get('step_size'),
+            add_noise=large_cfg.get('noise_scale'),
+            pos_clip=large_cfg.get('pos_clip'),
+            v_clip=large_cfg.get('v_clip'),
+            log_ligand_input_mode='log_prob' if log_mode_is_log_prob else 'auto',
+            repaint_cfg=repaint_cfg,
+            **_dynamic_subcfg_grad_cap_kwargs(large_cfg),
+        )
+        refine_init_pos = res_large['pos']
+        refine_init_v = res_large['log_v'] if log_mode_is_log_prob else res_large['v']
+        res_refine = model.sample_diffusion_refinement(
+            protein_pos=batch.protein_pos,
+            protein_v=batch.protein_atom_feature.float(),
+            batch_protein=batch_protein,
+            init_ligand_pos=refine_init_pos,
+            init_ligand_v=refine_init_v,
+            batch_ligand=batch_ligand,
+            center_pos_mode=center_pos_mode,
+            pos_only=pos_only,
+            step_stride=refine_cfg.get('stride'),
+            step_size=refine_cfg.get('step_size'),
+            add_noise=refine_cfg.get('noise_scale'),
+            pos_clip=refine_cfg.get('pos_clip'),
+            v_clip=refine_cfg.get('v_clip'),
+            time_upper=refine_cfg.get('time_upper', time_boundary),
+            time_lower=refine_cfg.get('time_lower', 0),
+            num_cycles=refine_cfg.get('cycles', 1),
+            log_ligand_input_mode='log_prob' if log_mode_is_log_prob else 'auto',
+            repaint_cfg=repaint_cfg,
+            **_dynamic_subcfg_grad_cap_kwargs(refine_cfg),
+        )
+        final_pos_t = res_refine['pos']
+        log_v_out = res_refine['log_v']
+
+    pos_np = final_pos_t.detach().cpu().numpy().astype(np.float64)
+    v_np = log_v_out.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
+    log_v_np = log_v_out.detach().cpu().numpy().astype(np.float32)
+    if n_extra > 0:
+        extra_v = v_np[n_locked:]
+        to_carbon = (extra_v == 0) | (extra_v == 12) | (extra_v == 7)
+        if to_carbon.any():
+            extra_v[to_carbon] = 1
+            v_np[n_locked:] = extra_v
+
+    metric_info = evaluate_candidate(
+        pos_np, v_np, ligand_atom_mode, selector_cfg,
+        scaffold_bonds=scaffold_bond_pairs, n_scaffold=n_scaffold,
+    )
+    return {
+        'pos': pos_np,
+        'v': v_np,
+        'log_v': log_v_np,
+        'num_atoms': n_total,
+        'n_scaffold': n_scaffold,
+        'n_preserved': n_preserved,
+        'n_extra': n_extra,
+        'n_locked': n_locked,
+        'preserved_atom_indices': list(preserved_indices),
+        'scaffold_bond_pairs': scaffold_bond_pairs,
+        'zero_allocation_site_ids': zero_site_ids,
+        'pos_traj': [],
+        'v_traj': [],
+        'log_v_traj': [],
+        'time_indices': None,
+        'metric_info': metric_info,
+        'site_place_meta': _site_place_meta,
+        'sample_idx': sample_idx,
+        'slot_retry': slot_retry,
+    }
+
+
+def scaffold_prudent_molecule(
+    model,
+    data,
+    config,
+    ligand_atom_mode: str,
+    device: str = 'cuda:0',
+    logger=None,
+    output_dir: str = None,
+) -> dict:
+    """Scaffold-Prudent：骨架锁定 + 迭代重筛选（回原点再跑）。
+
+    核心流程：
+      Gen 0: scaffold_dynamic_locked 生成初始分子池（large_step + refine，锁骨架位置）
+        → QED/SA/Vina 打分 → 选 top-K 幸存者
+      Gen 1..N: forward-diffuse 幸存者到 renoise_t → refine(renoise_t→0, 带骨架 repaint)
+        → 打分 → 选 top-K → 循环
+
+    与 dynamic_locked 的区别：dynamic_locked 一次性生成所有分子后即结束；
+    prudent 在每代末尾选取最佳分子并「回到原点」加噪后重新 refine，实现迭代优化。
+    """
+    sc_cfg, _ = _get_scaffold_mode_cfg(config)
+    prudent_cfg = sc_cfg.get('prudent', {})
+    grow_cfg = dict(config.sample.get('scaffold', {}).get('grow', {}) or {})
+    # 与 sample.seed 对齐（launcher/API 改的是 sample.seed）
+    try:
+        _sample_seed = int(config.sample.get('seed', grow_cfg.get('seed', 42)))
+    except (TypeError, ValueError):
+        _sample_seed = 42
+    grow_cfg['seed'] = _sample_seed
+    try:
+        config.sample.setdefault('scaffold', {})
+        config.sample['scaffold'].setdefault('grow', {})
+        config.sample['scaffold']['grow']['seed'] = _sample_seed
+    except Exception:
+        pass
+
+    n_generations = max(1, int(prudent_cfg.get('n_generations', 5)))
+    n_chains_per_seed = max(1, int(prudent_cfg.get('n_chains_per_seed', 4)))
+    advance_top_k = max(1, int(prudent_cfg.get('advance_top_k', 2)))
+    _re_t = int(prudent_cfg.get('renoise_t', 600))
+    renoise_t = int(np.clip(_re_t, 0, getattr(model, 'num_timesteps', 1000) - 1))
+
+    dynamic_cfg = config.sample.get('dynamic', {})
+    large_cfg = dynamic_cfg.get('large_step', {})
+    refine_cfg = dict(dynamic_cfg.get('refine', {}))
+    time_boundary = get_time_boundary(dynamic_cfg, 750)
+    if 'time_upper' not in refine_cfg:
+        refine_cfg['time_upper'] = time_boundary
+    center_pos_mode = config.sample.get('center_pos_mode', 'protein')
+    pos_only = config.sample.get('pos_only', False)
+    log_mode_is_log_prob = (getattr(model, 'ligand_v_input', 'onehot') == 'log_prob')
+
+    vina_protein_root = prudent_cfg.get('protein_root') or os.environ.get('PROTEIN_ROOT', '').strip() or None
+    if vina_protein_root:
+        try:
+            vina_protein_root = str(Path(vina_protein_root).expanduser().resolve())
+        except Exception:
+            pass
+    vina_advance_thr = prudent_cfg.get('max_vina_affinity_for_advance', 4.0)
+    if vina_advance_thr is not None:
+        try:
+            vina_advance_thr = float(vina_advance_thr)
+        except (TypeError, ValueError):
+            vina_advance_thr = 4.0
+
+    # ---- 参考配体 & 骨架提取（复用共享逻辑）---------------------------
+    if not hasattr(data, 'ligand_pos') or data.ligand_pos is None or data.ligand_pos.size(0) == 0:
+        raise ValueError(
+            '骨架 Prudent 模式需要参考配体（含 3D 坐标 SDF）以提取骨架，请通过 --ligand_path 指定。'
+        )
+
+    ref_ligand_pos = data.ligand_pos.to(device)
+    ref_ligand_v = data.ligand_atom_feature_full.to(device)
+    n_scaffold_ref = ref_ligand_pos.size(0)
+    log_ref_v = index_to_log_onehot(ref_ligand_v, model.num_classes)
+
+    scaffold_indices, ref_mol, ref_ligand_name, n_scaffold = _extract_scaffold_from_reference(
+        data, sc_cfg, ligand_atom_mode, ref_ligand_pos, ref_ligand_v, log_ref_v,
+        n_scaffold_ref, device, config=config, logger=logger,
+    )
+    fix_scaffold_pos = bool(sc_cfg.get('fix_scaffold_pos', True))
+    fix_scaffold_type = bool(sc_cfg.get('fix_scaffold_type', False))
+    scaffold_bond_pairs = _extract_scaffold_bond_pairs(ref_mol, scaffold_indices, logger=logger)
+    if logger:
+        logger.info(
+            f'[ScaffoldPrudent] 骨架原子: {n_scaffold}/{n_scaffold_ref} | '
+            f'锁定位置: {fix_scaffold_pos} | 锁定类型: {fix_scaffold_type} | '
+            f'骨架键: {len(scaffold_bond_pairs)} | '
+            f'代际: {n_generations} | renoise_t: {renoise_t} | advance_top_k: {advance_top_k}'
+        )
+
+    # ---- 蛋白中心（用于 forward-diffuse 和 repaint_cfg 重建）---------------
+    batch_center = Batch.from_data_list([data.clone()], follow_batch=FOLLOW_BATCH).to(device)
+    protein_centroid = scatter_mean(batch_center.protein_pos, batch_center.protein_element_batch, dim=0)[0]
+
+    ref_pos_np_prudent = ref_ligand_pos.detach().cpu().numpy().astype(np.float64)
+    if output_dir is not None:
+        _pr_base_output_dir = Path(output_dir)
+    else:
+        _pr_base_output_dir = Path(config.sample.get('output_dir', './outputs'))
+    _murcko_sites_cfg = get_murcko_sites_cfg(sc_cfg)
+    _attachment_sites = load_or_extract_attachment_sites(
+        ref_mol, scaffold_indices,
+        sc_cfg.get('scaffold_source', 'auto_murcko'),
+        ref_pos_np_prudent, _pr_base_output_dir, ref_ligand_name,
+        _murcko_sites_cfg, logger=logger,
+    )
+
+    # ---- 自适应门控：有参考配体时默认启用（可由 adaptive_gates.enable=false 关闭）----
+    # 门控阈值由「任务原始参考配体」性质给出；actives CSV 仅作可选补充。
+    _ag_cfg = sc_cfg.get('adaptive_gates') or prudent_cfg.get('adaptive_gates') or {}
+    if isinstance(_ag_cfg, bool):
+        _ag_cfg = {'enable': _ag_cfg}
+    _ag_enable = bool(_ag_cfg.get('enable', True))  # 默认开
+    if _ag_enable:
+        try:
+            from utils.adaptive_gates import (
+                apply_gates_to_prudent_cfg,
+                compute_adaptive_gates,
+                write_gates_json,
+            )
+            # 优先：任务传入的原始配体路径（data.ligand_filename）
+            _lig_path = None
+            for cand in (
+                getattr(data, 'ligand_filename', None),
+                _ag_cfg.get('ligand'),
+                sc_cfg.get('ligand_path'),
+                prudent_cfg.get('ligand_path'),
+            ):
+                if cand and str(cand) not in ('N/A', 'None', '') and Path(str(cand)).exists():
+                    _lig_path = str(Path(str(cand)).expanduser().resolve())
+                    break
+            _act_path = _ag_cfg.get('actives') or _ag_cfg.get('actives_csv')
+            if _act_path and not Path(str(_act_path)).exists():
+                _act_path = None
+            if _lig_path:
+                _margins = _ag_cfg.get('margins') if isinstance(_ag_cfg.get('margins'), dict) else None
+                _gates = compute_adaptive_gates(
+                    _lig_path,
+                    actives_csv=_act_path,
+                    margins=_margins,
+                    grow_cfg=grow_cfg,
+                    base_prudent=prudent_cfg,
+                )
+                prudent_cfg = apply_gates_to_prudent_cfg(prudent_cfg, _gates)
+                try:
+                    write_gates_json(_gates, _pr_base_output_dir / 'adaptive_gates.json')
+                except Exception:
+                    pass
+                if logger:
+                    logger.info(
+                        f'[ScaffoldPrudent] adaptive_gates from ligand={_lig_path}: '
+                        f'{_gates.as_prudent_dict()}'
+                    )
+                    for _r in _gates.rationale:
+                        logger.info(f'[ScaffoldPrudent] adaptive_gates: {_r}')
+            elif logger:
+                logger.info(
+                    '[ScaffoldPrudent] adaptive_gates 跳过：无可用参考配体路径'
+                )
+        except Exception as _ag_err:
+            if logger:
+                logger.warning(f'[ScaffoldPrudent] adaptive_gates 失败，沿用原门控: {_ag_err}')
+
+    # ---- Gen 0: scaffold_dynamic_locked 生成初始分子池 -----------------
+    num_samples = max(1, int(sc_cfg.get('num_samples', grow_cfg.get('num_samples', 200))))
+    if logger:
+        logger.info(f'[ScaffoldPrudent] Gen 0: 调用 scaffold_dynamic_locked 生成 {num_samples} 个初始分子')
+
+    selector_cfg = {
+        'min_qed': grow_cfg.get('min_qed', 0.2),
+        'min_sa': grow_cfg.get('min_sa', 0.2),
+        'filter_incomplete': grow_cfg.get('filter_incomplete', False),
+        'qed_weight': 1.0, 'sa_weight': 1.0,
+    }
+
+    # ---- Gen 0 逐样本循环（直接内联，以捕获 log_v 供后续 forward-diffuse）----
+    pool = []
+    meta_records_all = []
+    total_time = 0.0
+    # 累积所有分子的坐标
+    all_pos_accum: list = []
+    all_v_accum: list = []
+    all_meta_accum: list = []
+
+    # ---- Gate params for target-driven Gen0 accumulation ----
+    _size_gates = _prudent_parse_size_gates(prudent_cfg)
+    _hard_gate = bool(_size_gates)
+    _max_gen0_attempts = num_samples * 200 if _hard_gate else num_samples  # 最多尝试 num_samples*200 次
+    _gen0_attempt = 0
+    _slot_retry = 0
+
+    while True:
+        # ---- Exit conditions ----
+        if _gen0_attempt >= _max_gen0_attempts:
+            if logger:
+                logger.warning(
+                    f'[ScaffoldPrudent] Gen0 达到最大尝试次数 {_max_gen0_attempts}, '
+                    f'仅积累 {len(pool)}/{num_samples} gate-passing 分子'
+                )
+            break
+        if len(pool) >= num_samples:
+            break
+
+        _gen0_attempt += 1
+        # 槽位 = 当前已积累数；同槽位门控失败补足用 slot_retry 偏移 RNG
+        sample_idx = len(pool)
+        n_extra = _sample_n_extra_atoms(
+            grow_cfg, data.protein_pos, n_scaffold, model.num_timesteps,
+            sample_idx=sample_idx, retry=_slot_retry,
+        )
+        _place_cfg = _pin_place_cfg_to_n_extra(
+            _murcko_placement_cfg(grow_cfg, _murcko_sites_cfg), n_extra, grow_cfg,
+        )
+        if not uses_site_budget_placement(_place_cfg):
+            n_extra = cap_n_extra_for_sites(n_extra, _attachment_sites, _murcko_sites_cfg)
+        n_total = n_scaffold + n_extra
+
+        if logger and (_gen0_attempt == 1 or _gen0_attempt % 10 == 0 or len(pool) <= 5 or _slot_retry > 0):
+            if _hard_gate:
+                logger.info(
+                    f'[ScaffoldPrudent] Gen0 尝试#{_gen0_attempt} | '
+                    f'sample_idx={sample_idx} slot_retry={_slot_retry} | '
+                    f'已积累 {len(pool)}/{num_samples} gate-passing | '
+                    f'骨架: {n_scaffold} + 新原子: {n_extra} = 总计: {n_total}'
+                )
+            else:
+                logger.info(
+                    f'[ScaffoldPrudent] Gen0 样本 {sample_idx + 1}/{num_samples} | '
+                    f'骨架: {n_scaffold} + 新原子: {n_extra} = 总计: {n_total}'
+                )
+
+        batch = Batch.from_data_list([data.clone()], follow_batch=FOLLOW_BATCH).to(device)
+        batch_protein = batch.protein_element_batch
+
+        # 初始化：骨架 + 零分配保留侧链 + Murcko 位点新原子
+        extra_pos_world, _site_place_meta = build_extra_atom_positions(
+            n_extra, _attachment_sites, _place_cfg,
+            protein_centroid, device, fallback_noise_scale=1.0, logger=logger,
+            rng=_murcko_sample_rng(grow_cfg, sample_idx, retry=_slot_retry),
+        )
+        n_extra = int(extra_pos_world.size(0))
+        (
+            preserved_pos, preserved_log_v, preserved_indices, zero_site_ids,
+            n_preserved, n_locked, n_total,
+        ) = _resolve_init_preserved_atoms(
+            _attachment_sites, _site_place_meta, _place_cfg,
+            ref_ligand_pos, log_ref_v, n_scaffold, n_extra,
+            logger=logger, log_tag='[ScaffoldPrudent]', sample_idx=sample_idx,
+        )
+
+        init_ligand_pos = protein_centroid.unsqueeze(0).expand(n_total, -1) + \
+                          torch.randn(n_total, 3, device=device)
+        if n_scaffold > 0 and fix_scaffold_pos:
+            init_ligand_pos[:n_scaffold] = ref_ligand_pos[scaffold_indices]
+        if n_preserved > 0 and fix_scaffold_pos:
+            init_ligand_pos[n_scaffold:n_locked] = preserved_pos
+        if n_extra > 0:
+            init_ligand_pos[n_locked:] = extra_pos_world
+        batch_ligand = torch.zeros(n_total, dtype=torch.long, device=device)
+
+        if fix_scaffold_type and n_locked > 0:
+            scaffold_log_part = (
+                log_ref_v[scaffold_indices] if n_scaffold > 0
+                else torch.zeros(0, model.num_classes, device=device)
+            )
+            extra_log_v = F.log_softmax(
+                torch.zeros(n_extra, model.num_classes, device=device), dim=-1
+            ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+            init_ligand_v_input = torch.cat(
+                [scaffold_log_part, preserved_log_v, extra_log_v], dim=0
+            )
+        else:
+            uniform_logits = torch.zeros(n_total, model.num_classes, device=device)
+            if log_mode_is_log_prob:
+                init_ligand_v_input = F.log_softmax(uniform_logits, dim=-1)
+            else:
+                init_ligand_v_input = log_sample_categorical(uniform_logits)
+
+        # 构建 repaint_cfg（锁骨架 + 保留侧链位置）
+        repaint_cfg = None
+        if n_locked > 0:
+            scaffold_pos_orig = (
+                ref_ligand_pos[scaffold_indices] if n_scaffold > 0
+                else torch.zeros(0, 3, device=device)
+            )
+            locked_pos_world = torch.cat([scaffold_pos_orig, preserved_pos], dim=0)
+            locked_pos_centered = locked_pos_world - protein_centroid.unsqueeze(0)
+            if n_extra > 0:
+                extra_pos_centered = extra_pos_world - protein_centroid.unsqueeze(0)
+            else:
+                extra_pos_centered = torch.zeros(0, 3, device=device)
+            x0_pos_ref = torch.cat([locked_pos_centered, extra_pos_centered], dim=0)
+
+            scaffold_log_v = (
+                log_ref_v[scaffold_indices] if n_scaffold > 0
+                else torch.zeros(0, model.num_classes, device=device)
+            )
+            extra_log_v_pad = F.log_softmax(
+                torch.zeros(n_extra, model.num_classes, device=device), dim=-1
+            ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+            x0_log_v_ref = torch.cat(
+                [scaffold_log_v, preserved_log_v, extra_log_v_pad], dim=0
+            )
+
+            pos_mask_local = torch.zeros(n_total, device=device)
+            if fix_scaffold_pos:
+                pos_mask_local[:n_locked] = 1.0
+
+            type_mask_local = None
+            if fix_scaffold_type:
+                type_mask_local = torch.zeros(n_total, device=device)
+                type_mask_local[:n_locked] = 1.0
+
+            repaint_cfg = {
+                'x0_pos': x0_pos_ref,
+                'x0_log_v': x0_log_v_ref,
+                'pos_mask': pos_mask_local,
+                'type_mask': type_mask_local,
+                'use_mean_for_discrete': True,
+                '_use_dual_mask': True,
+            }
+
+        t_start_wall = time.time()
+        with torch.no_grad():
+            res_large = model.sample_diffusion_large_step(
+                protein_pos=batch.protein_pos,
+                protein_v=batch.protein_atom_feature.float(),
+                batch_protein=batch_protein,
+                init_ligand_pos=init_ligand_pos,
+                init_ligand_v=init_ligand_v_input,
+                batch_ligand=batch_ligand,
+                num_steps=large_cfg.get('num_steps'),
+                center_pos_mode=center_pos_mode,
+                pos_only=pos_only,
+                step_stride=large_cfg.get('stride'),
+                step_size=large_cfg.get('step_size'),
+                add_noise=large_cfg.get('noise_scale'),
+                pos_clip=large_cfg.get('pos_clip'),
+                v_clip=large_cfg.get('v_clip'),
+                log_ligand_input_mode='log_prob' if log_mode_is_log_prob else 'auto',
+                repaint_cfg=repaint_cfg,
+                **_dynamic_subcfg_grad_cap_kwargs(large_cfg),
+            )
+            # refine（始终跑，scaffold dynamic_locked 契约）
+            refine_init_pos = res_large['pos']
+            if log_mode_is_log_prob:
+                refine_init_v = res_large['log_v']
+            else:
+                refine_init_v = res_large['v']
+            res_refine = model.sample_diffusion_refinement(
+                protein_pos=batch.protein_pos,
+                protein_v=batch.protein_atom_feature.float(),
+                batch_protein=batch_protein,
+                init_ligand_pos=refine_init_pos,
+                init_ligand_v=refine_init_v,
+                batch_ligand=batch_ligand,
+                center_pos_mode=center_pos_mode,
+                pos_only=pos_only,
+                step_stride=refine_cfg.get('stride'),
+                step_size=refine_cfg.get('step_size'),
+                add_noise=refine_cfg.get('noise_scale'),
+                pos_clip=refine_cfg.get('pos_clip'),
+                v_clip=refine_cfg.get('v_clip'),
+                time_upper=refine_cfg.get('time_upper', time_boundary),
+                time_lower=refine_cfg.get('time_lower', 0),
+                num_cycles=refine_cfg.get('cycles', 1),
+                log_ligand_input_mode='log_prob' if log_mode_is_log_prob else 'auto',
+                repaint_cfg=repaint_cfg,
+                **_dynamic_subcfg_grad_cap_kwargs(refine_cfg),
+            )
+            final_pos_t = res_refine['pos']
+            log_v_out = res_refine['log_v']
+        t_end_wall = time.time()
+        total_time += t_end_wall - t_start_wall
+
+        pos_np = final_pos_t.detach().cpu().numpy().astype(np.float64)
+        v_np = log_v_out.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
+        log_v_np = log_v_out.detach().cpu().numpy().astype(np.float32)
+
+        # 后处理：修复额外原子中价态不兼容元素 → C
+        if n_extra > 0:
+            extra_v = v_np[n_locked:]
+            to_carbon = (extra_v == 0) | (extra_v == 12) | (extra_v == 7)
+            if to_carbon.any():
+                extra_v[to_carbon] = 1
+                v_np[n_locked:] = extra_v
+
+        # 骨架 RMSD
+        if n_scaffold > 0:
+            scaffold_pos_ref_np = ref_ligand_pos[scaffold_indices].detach().cpu().numpy()
+            scaffold_pos_gen = pos_np[:n_scaffold]
+            scaffold_rmsd = float(np.sqrt(np.mean((scaffold_pos_gen - scaffold_pos_ref_np) ** 2)))
+        else:
+            scaffold_rmsd = 0.0
+
+        metric_info = evaluate_candidate(
+            pos_np, v_np, ligand_atom_mode, selector_cfg,
+            scaffold_bonds=scaffold_bond_pairs, n_scaffold=n_scaffold,
+        )
+
+        # ---- Gate check: 仅当 _hard_gate 时在 Gen0 就过滤，保证最终输出全是 gate-passing 分子 ----
+        if _hard_gate:
+            mol = _prudent_reconstruct_mol(
+                pos_np, v_np, ligand_atom_mode,
+                logger=logger, context=f'SPg0a{_gen0_attempt}',
+                scaffold_bonds=scaffold_bond_pairs, n_scaffold=n_scaffold,
+            )
+            qed, sa, logp, chem_err = _prudent_chem_scores(mol, logger=logger)
+            gate_ok, reasons = _prudent_size_gate_ok(mol, qed, sa, logp, prudent_cfg, gates=_size_gates)
+
+            if not gate_ok:
+                if logger and (_gen0_attempt <= 5 or _gen0_attempt % 50 == 0):
+                    if not reasons:
+                        reasons = ['unknown_gate_fail']
+                    logger.info(
+                        f'[ScaffoldPrudent] Gen0 gate-reject #{_gen0_attempt} '
+                        f'(sample_idx={sample_idx} slot_retry={_slot_retry}): '
+                        + ', '.join(reasons)
+                        + f' | pool={len(pool)}/{num_samples}'
+                    )
+                # 定期警告：如果长时间没有 gate-passing 分子
+                if _hard_gate and _gen0_attempt % 1000 == 0 and len(pool) == 0:
+                    if logger:
+                        logger.warning(
+                            f'[ScaffoldPrudent] Gen0 已尝试 {_gen0_attempt} 次，尚无 gate-passing 分子。'
+                            f'请考虑放宽尺寸门控 {_size_gates} 或降低 min_qed/min_sa 阈值。'
+                        )
+                _slot_retry += 1
+                continue  # 丢弃此分子，同槽位补足（RNG 已偏移）
+
+        pool.append({
+            'pos': pos_np,
+            'v': v_np,
+            'log_v': log_v_np,
+            'num_atoms': n_total,
+            'n_scaffold': n_scaffold,
+            'n_preserved': n_preserved,
+            'n_extra': n_extra,
+            'n_locked': n_locked,
+            'preserved_atom_indices': list(preserved_indices),
+            'scaffold_bond_pairs': scaffold_bond_pairs,
+            'pos_traj': [],
+            'v_traj': [],
+            'log_v_traj': [],
+            'time_indices': None,
+        })
+        meta_records_all.append({
+            'method': 'scaffold_prudent',
+            'generation': 0,
+            'sample_idx': sample_idx,
+            'slot_retry': _slot_retry,
+            'ligand_num_atoms': n_total,
+            'n_scaffold': n_scaffold,
+            'n_preserved': n_preserved,
+            'n_extra': n_extra,
+            'n_locked': n_locked,
+            'zero_allocation_site_ids': zero_site_ids,
+            'preserved_atom_indices': preserved_indices,
+            'n_scaffold_bonds': len(scaffold_bond_pairs),
+            'scaffold_rmsd': scaffold_rmsd,
+            'time': t_end_wall - t_start_wall,
+            'smiles': metric_info.get('smiles'),
+            'qed': metric_info.get('metrics', {}).get('qed'),
+            'sa': metric_info.get('metrics', {}).get('sa'),
+            'status': metric_info.get('status'),
+            'is_original': False,
+            'extra_placement': _site_place_meta.get('placement'),
+            'site_allocation': _site_place_meta.get('site_allocation'),
+        })
+        _slot_retry = 0
+
+    if logger:
+        valid_gen0 = sum(1 for m in meta_records_all if m.get('status') == 'ok')
+        if _hard_gate:
+            logger.info(
+                f'[ScaffoldPrudent] Gen 0 完成: {len(pool)}/{num_samples} gate-passing 分子 | '
+                f'共 {_gen0_attempt} 次生成尝试 | 有效分子 {valid_gen0} | '
+                f'耗时 {total_time:.2f}s | '
+                f'通过率 {len(pool)/max(1,_gen0_attempt)*100:.1f}%'
+            )
+        else:
+            logger.info(
+                f'[ScaffoldPrudent] Gen 0 完成: {valid_gen0}/{num_samples} 有效分子 | '
+                f'耗时 {total_time:.2f}s'
+            )
+
+    # ---- 多代迭代 ------------------------------------------------------------
+    protein_path = getattr(data, 'protein_filename', None)
+    lig_fn = getattr(data, 'ligand_filename', None)
+    min_q_dock = float(prudent_cfg.get('min_qed_for_docking', 0.15))
+    min_s_dock = float(prudent_cfg.get('min_sa_for_docking', 0.15))
+    max_logp = prudent_cfg.get('max_logp', None)
+    if max_logp is not None:
+        max_logp = float(max_logp)
+
+    generation_stats = []  # 每代统计
+
+    for gen_idx in range(n_generations):
+        if logger:
+            logger.info(
+                f'[ScaffoldPrudent] === Gen {gen_idx}/{n_generations} | pool={len(pool)} chains ==='
+            )
+
+        # ---- 打分：QED/SA/LogP + 条件 Vina → composite ----
+        scored = []
+        for ci, c in enumerate(pool):
+            mol = _prudent_reconstruct_mol(
+                c['pos'], c['v'], ligand_atom_mode,
+                logger=logger, context=f'SPg{gen_idx}c{ci}',
+                scaffold_bonds=c.get('scaffold_bond_pairs', scaffold_bond_pairs),
+                n_scaffold=int(c.get('n_scaffold', n_scaffold)),
+            )
+            qed, sa, logp, chem_err = _prudent_chem_scores(mol, logger=logger)
+
+            gate_ok = (
+                mol is not None
+                and np.isfinite(qed) and np.isfinite(sa)
+                and qed >= min_q_dock and sa >= min_s_dock
+                and (max_logp is None or not np.isfinite(logp) or logp <= max_logp)
+            )
+
+            if not gate_ok:
+                detail = {
+                    'qed': qed, 'sa': sa, 'logp': logp,
+                    'vina_affinity': float('nan'), 'vina_norm': 0.0,
+                    'vina_skipped': True, 'reconstruct_error': chem_err,
+                }
+                comp = float('-inf')
+            else:
+                comp, detail = _prudent_composite_score(
+                    mol, prudent_cfg, protein_path, lig_fn,
+                    logger=logger, protein_root=vina_protein_root,
+                    prefetched_chem=(qed, sa, logp, chem_err), skip_vina=False,
+                )
+
+            if logger and gen_idx == 0 and ci < 5:
+                aff = detail.get('vina_affinity')
+                aff_s = f'{float(aff):.3f}' if aff is not None and np.isfinite(float(aff)) else 'nan'
+                logger.info(
+                    f'[ScaffoldPrudent][score] g{gen_idx} c{ci} | '
+                    f'QED={qed:.4f} SA={sa:.4f} LogP={logp:.2f} Vina={aff_s} composite={comp:.4f}'
+                )
+
+            c['prudent_score_detail'] = detail
+            scored.append((comp, detail, c, ci))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # 记录本代统计
+        comps = [s[0] for s in scored if np.isfinite(s[0])]
+        gen_stat = {
+            'generation': gen_idx,
+            'pool_size': len(pool),
+            'valid_scored': len(comps),
+            'best_composite': float(max(comps)) if comps else float('nan'),
+            'mean_composite': float(np.mean(comps)) if comps else float('nan'),
+        }
+        generation_stats.append(gen_stat)
+        if logger:
+            logger.info(
+                f'[ScaffoldPrudent] Gen {gen_idx} stats: '
+                f'best_comp={gen_stat["best_composite"]:.4f} '
+                f'mean_comp={gen_stat["mean_composite"]:.4f} '
+                f'valid={gen_stat["valid_scored"]}/{gen_stat["pool_size"]}'
+            )
+
+        # 最后一轮不打分不选（输出最终 pool）
+        if gen_idx == n_generations - 1:
+            break
+
+        # ---- 选择 survivors ----
+        filtered = []
+        for comp, detail, c, ci in scored:
+            mol = _prudent_reconstruct_mol(
+                c['pos'], c['v'], ligand_atom_mode,
+                logger=None, context=f'SPg{gen_idx}sel{ci}',
+                scaffold_bonds=c.get('scaffold_bond_pairs', scaffold_bond_pairs),
+                n_scaffold=int(c.get('n_scaffold', n_scaffold)),
+            )
+            qed_v = detail.get('qed', 0.0)
+            sa_v = detail.get('sa', 0.0)
+            if mol is not None and _prudent_eligible_for_advance(
+                mol, qed_v, sa_v, detail, prudent_cfg, vina_advance_thr,
+            ):
+                filtered.append((comp, detail, c, ci))
+
+        _atk_mode = str(prudent_cfg.get('advance_top_k_mode', 'cap')).strip().lower()
+        if _atk_mode == 'cap' and prudent_cfg.get('advance_top_k_strict') is True:
+            _atk_mode = 'strict'
+        continue_when_no_advance = bool(prudent_cfg.get('continue_when_no_advance', True))
+        fallback_keep_top_k = max(1, int(prudent_cfg.get('fallback_keep_top_k', 1)))
+
+        if _atk_mode in ('strict', 'require_full_k', 'full_k'):
+            if len(filtered) < advance_top_k:
+                if continue_when_no_advance and scored:
+                    survivors = [s[2] for s in scored[:min(fallback_keep_top_k, len(scored))]]
+                    if logger:
+                        logger.warning(
+                            f'[ScaffoldPrudent] Gen {gen_idx}: strict 模式下仅 {len(filtered)} 条合格，'
+                            f'回退保留 top-{len(survivors)}'
+                        )
+                else:
+                    survivors = []
+            else:
+                survivors = [f[2] for f in filtered[:advance_top_k]]
+        else:
+            if not filtered:
+                if continue_when_no_advance and scored:
+                    survivors = [s[2] for s in scored[:min(fallback_keep_top_k, len(scored))]]
+                else:
+                    survivors = []
+            else:
+                survivors = [f[2] for f in filtered[:advance_top_k]]
+
+        if not survivors:
+            if logger:
+                logger.warning(f'[ScaffoldPrudent] Gen {gen_idx}: 无幸存者，提前结束迭代')
+            break
+
+        if logger:
+            logger.info(
+                f'[ScaffoldPrudent] Gen {gen_idx}: '
+                f'{len(survivors)} survivors → 扩链 ×{n_chains_per_seed} → {len(survivors) * n_chains_per_seed} chains'
+            )
+
+        # ---- 将当前 pool 中 gate-passing 分子累积到 all_* 列表 ----
+        for pc in pool:
+            # 当 _hard_gate 时，跳过门控失败分子（vina_skipped=True）
+            if _hard_gate:
+                detail = pc.get('prudent_score_detail', {})
+                if detail.get('vina_skipped', False):
+                    continue
+            all_pos_accum.append(np.asarray(pc['pos'], dtype=np.float64))
+            all_v_accum.append(np.asarray(pc['v'], dtype=np.int64))
+            # 记录每个分子来自哪一代
+            pc_meta = dict(pc.get('prudent_score_detail', {}))
+            pc_meta['method'] = 'scaffold_prudent'
+            pc_meta['generation'] = gen_idx
+            pc_meta['num_atoms'] = int(pc.get('num_atoms', 0))
+            pc_meta['n_scaffold'] = int(pc.get('n_scaffold', n_scaffold))
+            pc_meta['n_extra'] = int(pc.get('n_extra', 0))
+            all_meta_accum.append(pc_meta)
+
+        # ---- 扩链 + forward-diffuse + refine ----
+        new_pool = []
+        for surv in survivors:
+            for _ in range(n_chains_per_seed):
+                copied = _prudent_candidate_traj_cleared(_prudent_copy_candidate(surv))
+                # Forward-diffuse 到 renoise_t
+                fwd = _prudent_forward_diffuse_to_t(
+                    model, data, copied, int(renoise_t),
+                    center_pos_mode, pos_only, device, logger=None,
+                )
+                fwd['pos_traj'] = []
+                fwd['v_traj'] = []
+                fwd['log_v_traj'] = []
+                fwd['time_indices'] = None
+                fwd.pop('prudent_score_detail', None)
+                fwd.pop('prudent_round_analysis', None)
+
+                n_total_c = int(fwd['num_atoms'])
+                n_scaffold_c = int(surv.get('n_scaffold', n_scaffold))
+                n_preserved_c = int(surv.get('n_preserved', 0))
+                n_locked_c = int(surv.get('n_locked', n_scaffold_c + n_preserved_c))
+                n_extra_c = max(0, n_total_c - n_locked_c)
+
+                # 重建 repaint_cfg：锁骨架 + Gen0 保留侧链
+                # x0 必须用 survivor 干净态，不可用 fwd 加噪坐标（否则多代骨架漂）
+                repaint_cfg_c = None
+                if n_locked_c > 0:
+                    pos_clean = torch.as_tensor(
+                        np.asarray(surv['pos'], dtype=np.float64),
+                        dtype=torch.float32, device=device,
+                    )
+                    if pos_clean.shape[0] != n_total_c:
+                        # 原子数异常时回退到 fwd（极少见）
+                        pos_clean = torch.as_tensor(
+                            np.asarray(fwd['pos'], dtype=np.float64),
+                            dtype=torch.float32, device=device,
+                        )
+                    x0_pos_ref_c = pos_clean - protein_centroid.unsqueeze(0)
+
+                    if isinstance(surv.get('log_v'), np.ndarray) and np.asarray(surv['log_v']).ndim == 2 \
+                            and np.asarray(surv['log_v']).shape[0] == n_total_c:
+                        x0_log_v_ref_c = torch.as_tensor(
+                            surv['log_v'], dtype=torch.float32, device=device,
+                        )
+                    else:
+                        v_clean = torch.as_tensor(
+                            np.asarray(surv['v'], dtype=np.int64),
+                            dtype=torch.long, device=device,
+                        )
+                        if v_clean.shape[0] != n_total_c:
+                            v_clean = torch.as_tensor(
+                                np.asarray(fwd['v'], dtype=np.int64),
+                                dtype=torch.long, device=device,
+                            )
+                        x0_log_v_ref_c = index_to_log_onehot(v_clean, model.num_classes)
+
+                    pos_mask_c = torch.zeros(n_total_c, device=device)
+                    if fix_scaffold_pos:
+                        pos_mask_c[:n_locked_c] = 1.0
+                    type_mask_c = None
+                    if fix_scaffold_type:
+                        type_mask_c = torch.zeros(n_total_c, device=device)
+                        type_mask_c[:n_locked_c] = 1.0
+
+                    repaint_cfg_c = {
+                        'x0_pos': x0_pos_ref_c,
+                        'x0_log_v': x0_log_v_ref_c,
+                        'pos_mask': pos_mask_c,
+                        'type_mask': type_mask_c,
+                        'use_mean_for_discrete': True,
+                        '_use_dual_mask': True,
+                    }
+
+                # 单链 refine with repaint_cfg
+                refined_list = _batch_refinement_forward_split(
+                    model, data, [fwd],
+                    center_pos_mode=center_pos_mode,
+                    pos_only=pos_only,
+                    device=device,
+                    time_upper=int(renoise_t),
+                    time_lower=int(refine_cfg.get('time_lower', 0)),
+                    refine_cfg=refine_cfg,
+                    refinement_grad_kwargs=_dynamic_subcfg_grad_cap_kwargs(refine_cfg),
+                    error_prefix='[ScaffoldPrudent] refine',
+                    repaint_cfg=repaint_cfg_c,
+                )
+                refined = refined_list[0]
+                refined['n_scaffold'] = n_scaffold_c
+                refined['n_preserved'] = n_preserved_c
+                refined['n_locked'] = n_locked_c
+                refined['n_extra'] = n_extra_c
+                refined['scaffold_bond_pairs'] = surv.get(
+                    'scaffold_bond_pairs', scaffold_bond_pairs,
+                )
+                if surv.get('preserved_atom_indices') is not None:
+                    refined['preserved_atom_indices'] = surv.get('preserved_atom_indices')
+                refined.pop('grad_fusion_steps', None)
+                new_pool.append(refined)
+
+        pool = new_pool
+
+    # ---- 最后一轮凑满 target_n（不足则 final_fill 多轮补足）----------------
+    _tfc = prudent_cfg.get('target_final_count', None)
+    if _tfc is None:
+        target_n = int(num_samples)
+    else:
+        try:
+            target_n = max(1, int(_tfc))
+        except (TypeError, ValueError):
+            target_n = int(num_samples)
+    _mffa = prudent_cfg.get('max_final_fill_attempts', None)
+    if _mffa is None:
+        max_final_fill_attempts = int(target_n) * 200
+    else:
+        try:
+            max_final_fill_attempts = max(1, int(_mffa))
+        except (TypeError, ValueError):
+            max_final_fill_attempts = int(target_n) * 200
+
+    def _pool_gate_ok(c):
+        if not _hard_gate:
+            return True
+        detail = c.get('prudent_score_detail', {})
+        return not detail.get('vina_skipped', False)
+
+    final_pool = [c for c in pool if _pool_gate_ok(c)]
+    if len(final_pool) > target_n:
+        def _comp_key(c):
+            d = c.get('prudent_score_detail') or {}
+            # composite may be stored indirectly; fall back to qed+sa
+            q = d.get('qed', 0.0) or 0.0
+            s = d.get('sa', 0.0) or 0.0
+            v = d.get('vina_norm', 0.0) or 0.0
+            return float(q) + float(s) + float(v)
+        final_pool = sorted(final_pool, key=_comp_key, reverse=True)[:target_n]
+        if logger:
+            logger.info(
+                f'[ScaffoldPrudent] final pool {len(pool)} > target_n={target_n}，按分数截断为 {len(final_pool)}'
+            )
+
+    fill_attempt = 0
+    fill_slot_retry = 0
+    while len(final_pool) < target_n and fill_attempt < max_final_fill_attempts:
+        need = target_n - len(final_pool)
+        sample_idx = len(final_pool)
+        if logger and (fill_attempt == 0 or fill_attempt % 10 == 0 or fill_slot_retry > 0):
+            logger.info(
+                f'[ScaffoldPrudent] final_fill need={need} pool={len(final_pool)}/{target_n} '
+                f'attempt={fill_attempt} sample_idx={sample_idx} slot_retry={fill_slot_retry}'
+            )
+        cand = _prudent_locked_sample_once(
+            model=model, data=data, device=device, grow_cfg=grow_cfg,
+            _attachment_sites=_attachment_sites, _murcko_sites_cfg=_murcko_sites_cfg,
+            protein_centroid=protein_centroid, ref_ligand_pos=ref_ligand_pos,
+            log_ref_v=log_ref_v, scaffold_indices=scaffold_indices, n_scaffold=n_scaffold,
+            scaffold_bond_pairs=scaffold_bond_pairs, fix_scaffold_pos=fix_scaffold_pos,
+            fix_scaffold_type=fix_scaffold_type, log_mode_is_log_prob=log_mode_is_log_prob,
+            large_cfg=large_cfg, refine_cfg=refine_cfg, time_boundary=time_boundary,
+            center_pos_mode=center_pos_mode, pos_only=pos_only,
+            ligand_atom_mode=ligand_atom_mode, selector_cfg=selector_cfg,
+            sample_idx=sample_idx, slot_retry=fill_slot_retry, logger=logger,
+            log_tag='[ScaffoldPrudent][final_fill]',
+        )
+        fill_attempt += 1
+        if cand is None:
+            fill_slot_retry += 1
+            continue
+        if _hard_gate:
+            mol = _prudent_reconstruct_mol(
+                cand['pos'], cand['v'], ligand_atom_mode,
+                logger=logger, context=f'SPfill{fill_attempt}',
+                scaffold_bonds=scaffold_bond_pairs, n_scaffold=n_scaffold,
+            )
+            qed, sa, logp, chem_err = _prudent_chem_scores(mol, logger=logger)
+            gate_ok, reasons = _prudent_size_gate_ok(
+                mol, qed, sa, logp, prudent_cfg, gates=_size_gates,
+            )
+            if not gate_ok:
+                if logger and (fill_attempt <= 5 or fill_attempt % 50 == 0):
+                    logger.info(
+                        f'[ScaffoldPrudent] final_fill gate-reject #{fill_attempt}: '
+                        + ', '.join(reasons or ['unknown'])
+                        + f' | pool={len(final_pool)}/{target_n}'
+                    )
+                fill_slot_retry += 1
+                continue
+        # strip helper-only keys
+        cand.pop('site_place_meta', None)
+        cand.pop('metric_info', None)
+        cand.pop('zero_allocation_site_ids', None)
+        cand['from_final_fill'] = True
+        cand['fill_attempt'] = fill_attempt
+        final_pool.append(cand)
+        fill_slot_retry = 0
+        if logger and len(final_pool) % 10 == 0:
+            logger.info(
+                f'[ScaffoldPrudent] final_fill 已凑 {len(final_pool)}/{target_n}'
+            )
+
+    if len(final_pool) < target_n and logger:
+        logger.warning(
+            f'[ScaffoldPrudent] final_fill 结束仍不足: {len(final_pool)}/{target_n} '
+            f'(attempts={fill_attempt}/{max_final_fill_attempts})'
+        )
+    pool = final_pool
+    n_final_pool = len(pool)
+    if logger:
+        logger.info(
+            f'[ScaffoldPrudent] 最后一轮最终分子数 n_final_pool={n_final_pool} (target_n={target_n})'
+        )
+
+    # ---- 输出最终分子池（含所有累积分子 + 最终 pool）----------------------
+    pos_list, v_list = [], []
+    pos_traj_list, v_traj_list, log_v_traj_list = [], [], []
+    time_list = []
+    out_meta_records = list(meta_records_all)  # Gen 0 records
+
+    # 1) 先添加所有累积的分子（Gen 0 + Gen 1..N-1 的完整 pool）
+    for ai, (apos, av) in enumerate(zip(all_pos_accum, all_v_accum)):
+        pos_list.append(apos)
+        v_list.append(av)
+        pos_traj_list.append([])
+        v_traj_list.append([])
+        log_v_traj_list.append([])
+        time_list.append(0.0)
+        if ai < len(all_meta_accum):
+            am = dict(all_meta_accum[ai])
+            am['is_original'] = False
+            am['time'] = 0.0
+            out_meta_records.append(am)
+
+    final_pool_start = len(pos_list)
+
+    # 2) 再添加最终 pool（最后一代 + final_fill 凑满的分子）
+    for ci, c in enumerate(pool):
+        # 当 _hard_gate 时，跳过门控失败分子
+        if _hard_gate:
+            detail = c.get('prudent_score_detail', {})
+            if detail.get('vina_skipped', False):
+                continue
+        pos_list.append(np.asarray(c['pos'], dtype=np.float64))
+        v_list.append(np.asarray(c['v'], dtype=np.int64))
+        pos_traj_list.append(c.get('pos_traj') or [])
+        v_traj_list.append(c.get('v_traj') or [])
+        log_v_traj_list.append(c.get('log_v_traj') or [])
+        time_list.append(0.0)
+
+        metric_info = evaluate_candidate(
+            np.asarray(c['pos']), np.asarray(c['v']),
+            ligand_atom_mode, selector_cfg,
+            scaffold_bonds=c.get('scaffold_bond_pairs', scaffold_bond_pairs),
+            n_scaffold=int(c.get('n_scaffold', n_scaffold)),
+        )
+        final_gen = n_generations - 1
+        out_meta_records.append({
+            'method': 'scaffold_prudent',
+            'generation': final_gen,
+            'final_pool': True,
+            'from_final_fill': bool(c.get('from_final_fill', False)),
+            'ligand_num_atoms': c.get('num_atoms', 0),
+            'n_scaffold': c.get('n_scaffold', n_scaffold),
+            'n_extra': c.get('n_extra', 0),
+            'time': 0.0,
+            'smiles': metric_info.get('smiles'),
+            'qed': metric_info.get('metrics', {}).get('qed'),
+            'sa': metric_info.get('metrics', {}).get('sa'),
+            'status': metric_info.get('status'),
+            'is_original': False,
+        })
+
+    n_final_pool = len(pos_list) - final_pool_start
+    if logger:
+        final_valid = sum(1 for m in out_meta_records if not m.get('is_original') and m.get('status') == 'ok')
+        gate_note = ' [gate-filtered]' if _hard_gate else ''
+        logger.info(
+            f'[ScaffoldPrudent] 最终输出{gate_note}: {final_valid}/{len(pos_list)} 有效分子 | '
+            f'累积 {len(all_pos_accum)} + 最终 pool {n_final_pool} = {len(pos_list)} 个坐标 | '
+            f'final_pool_start={final_pool_start} | 总 meta 记录 {len(out_meta_records)}'
+        )
+
+    return {
+        'pos_list': pos_list,
+        'v_list': v_list,
+        'pos_traj': pos_traj_list,
+        'v_traj': v_traj_list,
+        'log_v_traj': log_v_traj_list,
+        'time_list': time_list,
+        'meta': {
+            'method': 'scaffold_prudent',
+            'records': out_meta_records,
+            'n_final_pool': n_final_pool,
+            'final_pool_start': final_pool_start,
+            'target_final_count': target_n,
+            'scaffold_cfg': {
+                'scaffold_source': sc_cfg.get('scaffold_source'),
+                'n_scaffold_atoms': n_scaffold,
+                'scaffold_indices': scaffold_indices,
+                'fix_scaffold_pos': fix_scaffold_pos,
+                'fix_scaffold_type': fix_scaffold_type,
+                'time_boundary': time_boundary,
+                'n_generations': n_generations,
+                'renoise_t': renoise_t,
+                'advance_top_k': advance_top_k,
+                'n_chains_per_seed': n_chains_per_seed,
+                'num_samples': num_samples,
+                'target_final_count': target_n,
+            },
+            'generation_stats': generation_stats,
             'total_time': total_time,
         },
     }
@@ -7204,6 +9304,10 @@ if __name__ == '__main__':
         _sc_mode = scaffold_unified_cfg.get('mode', 'evolve')
         if _sc_mode == 'grow':
             sampling_mode = 'scaffold_grow'
+        elif _sc_mode == 'dynamic_locked':
+            sampling_mode = 'scaffold_dynamic_locked'
+        elif _sc_mode == 'prudent':
+            sampling_mode = 'scaffold_prudent'
         elif scaffold_unified_cfg.get('after_dynamic', False):
             sampling_mode = 'dynamic_then_scaffold'
         else:
@@ -7216,7 +9320,8 @@ if __name__ == '__main__':
         sampling_mode = args.mode or config.sample.get('mode', 'baseline')
     if sampling_mode not in [
         'baseline', 'dynamic', 'optimization', 'prudent', 'dynamic_then_optimization',
-        'scaffold_grow', 'scaffold_optimization', 'dynamic_then_scaffold',
+        'scaffold_grow', 'scaffold_optimization', 'dynamic_then_scaffold', 'scaffold_dynamic_locked',
+        'scaffold_prudent',
     ]:
         raise ValueError(f'Unsupported sampling mode: {sampling_mode}')
 
@@ -7633,6 +9738,110 @@ if __name__ == '__main__':
         apply_targetdiff_baseline_refine_to_sampling_result(
             model, data, result, config, device=args.device, logger=logger
         )
+    elif sampling_mode == 'scaffold_dynamic_locked':
+        # 骨架锁定动态模式：跑完整 dynamic large_step+refine，锁定骨架位置、不锁类型
+        config.sample.setdefault('scaffold', {})
+        mol_path = getattr(args, 'molecule_path', None) or opt_cfg.get('molecule_path', None)
+        if mol_path is not None:
+            mol_path = Path(mol_path).resolve()
+            if not mol_path.exists():
+                raise FileNotFoundError(f'参考配体/骨架文件不存在: {mol_path}')
+            logger.info(f'[ScaffoldDynamicLocked] 从独立文件加载参考分子: {mol_path}')
+            mol_dict = parse_sdf_file(str(mol_path))
+            data.ligand_element = torch.tensor(mol_dict['element'], dtype=torch.long)
+            data.ligand_pos = torch.tensor(mol_dict['pos'], dtype=torch.float32)
+            data.ligand_bond_index = torch.tensor(mol_dict['bond_index'], dtype=torch.long)
+            data.ligand_bond_type = torch.tensor(mol_dict['bond_type'], dtype=torch.long)
+            mol_transform = Compose([ligand_featurizer, trans.FeaturizeLigandBond()])
+            data = mol_transform(data)
+        else:
+            use_test_set = getattr(args, 'use_test_set', False)
+            data_id = getattr(args, 'data_id', None)
+            if use_test_set and data_id is not None:
+                logger.info(f'[ScaffoldDynamicLocked] 使用测试集配体作为骨架参考: data_id={data_id}')
+            elif hasattr(data, 'ligand_filename') and data.ligand_filename:
+                logger.info(f'[ScaffoldDynamicLocked] 使用已加载配体作为骨架参考: {data.ligand_filename}')
+            else:
+                logger.info('[ScaffoldDynamicLocked] 使用已加载配体作为骨架参考')
+
+        dl_out = scaffold_dynamic_locked_molecule(
+            model=model,
+            data=data,
+            config=config,
+            ligand_atom_mode=ligand_atom_mode,
+            device=args.device,
+            logger=logger,
+            output_dir=args.result_path,
+        )
+        result = {
+            'data': data,
+            'pred_ligand_pos': dl_out['pos_list'],
+            'pred_ligand_v': dl_out['v_list'],
+            'pred_ligand_pos_traj': dl_out['pos_traj'],
+            'pred_ligand_v_traj': dl_out['v_traj'],
+            'pred_ligand_log_v_traj': dl_out['log_v_traj'],
+            'time': dl_out['time_list'],
+            'meta': dl_out['meta'],
+            'mode': 'scaffold_dynamic_locked',
+        }
+        apply_targetdiff_baseline_refine_to_sampling_result(
+            model, data, result, config, device=args.device, logger=logger
+        )
+    elif sampling_mode == 'scaffold_prudent':
+        # 骨架锁定 + Prudent 迭代重筛选：锁骨架位置，每代打分选优后回到原点 refine
+        config.sample.setdefault('scaffold', {})
+        mol_path = getattr(args, 'molecule_path', None) or opt_cfg.get('molecule_path', None)
+        if mol_path is not None:
+            mol_path = Path(mol_path).resolve()
+            if not mol_path.exists():
+                raise FileNotFoundError(f'参考配体/骨架文件不存在: {mol_path}')
+            logger.info(f'[ScaffoldPrudent] 从独立文件加载参考分子: {mol_path}')
+            mol_dict = parse_sdf_file(str(mol_path))
+            data.ligand_element = torch.tensor(mol_dict['element'], dtype=torch.long)
+            data.ligand_pos = torch.tensor(mol_dict['pos'], dtype=torch.float32)
+            data.ligand_bond_index = torch.tensor(mol_dict['bond_index'], dtype=torch.long)
+            data.ligand_bond_type = torch.tensor(mol_dict['bond_type'], dtype=torch.long)
+            mol_transform = Compose([ligand_featurizer, trans.FeaturizeLigandBond()])
+            data = mol_transform(data)
+        else:
+            use_test_set = getattr(args, 'use_test_set', False)
+            data_id = getattr(args, 'data_id', None)
+            if use_test_set and data_id is not None:
+                logger.info(f'[ScaffoldPrudent] 使用测试集配体作为骨架参考: data_id={data_id}')
+            elif hasattr(data, 'ligand_filename') and data.ligand_filename:
+                logger.info(f'[ScaffoldPrudent] 使用已加载配体作为骨架参考: {data.ligand_filename}')
+            else:
+                logger.info('[ScaffoldPrudent] 使用已加载配体作为骨架参考')
+
+        sp_out = scaffold_prudent_molecule(
+            model=model,
+            data=data,
+            config=config,
+            ligand_atom_mode=ligand_atom_mode,
+            device=args.device,
+            logger=logger,
+            output_dir=args.result_path,
+        )
+        result = {
+            'data': data,
+            'pred_ligand_pos': sp_out['pos_list'],
+            'pred_ligand_v': sp_out['v_list'],
+            'pred_ligand_pos_traj': sp_out['pos_traj'],
+            'pred_ligand_v_traj': sp_out['v_traj'],
+            'pred_ligand_log_v_traj': sp_out['log_v_traj'],
+            'time': sp_out['time_list'],
+            'meta': sp_out['meta'],
+            'mode': 'scaffold_prudent',
+        }
+        _sp_meta = sp_out.get('meta') or {}
+        result['_prudent_final_pool_meta'] = {
+            'n_final_pool': _sp_meta.get('n_final_pool'),
+            'final_pool_start': _sp_meta.get('final_pool_start'),
+            'target_final_count': _sp_meta.get('target_final_count'),
+        }
+        apply_targetdiff_baseline_refine_to_sampling_result(
+            model, data, result, config, device=args.device, logger=logger
+        )
     elif sampling_mode in ('dynamic', 'prudent'):  # 动态采样 / Prudent 多轮筛选。
         # 确保动态采样配置存在，并设置默认值。
         config.sample.setdefault('dynamic', {})  # 如果不存在则创建空字典。
@@ -7781,6 +9990,13 @@ if __name__ == '__main__':
         'config_backup': config_backup,
         'result_file': os.path.abspath(result_file),  # 保存result_file路径，用于评估时匹配
     }
+    _pfm = result.pop('_prudent_final_pool_meta', None) or {}
+    if _pfm.get('n_final_pool') is not None:
+        extra_info['n_final_pool'] = int(_pfm['n_final_pool'])
+    if _pfm.get('final_pool_start') is not None:
+        extra_info['final_pool_start'] = int(_pfm['final_pool_start'])
+    if _pfm.get('target_final_count') is not None:
+        extra_info['target_final_count'] = int(_pfm['target_final_count'])
     
     # 将extra_info添加到result字典中
     result['extra_info'] = extra_info
