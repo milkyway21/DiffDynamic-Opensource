@@ -1,0 +1,41 @@
+# Prudent Cumulative 模式专用配置
+# 只保留跨代累积分段演化核心参数
+
+sample:
+  mode: prudent
+  num_steps: 1000
+  
+  dynamic:
+    # time_boundary 是 large_step 终点 = refine 起点
+    time_boundary: 650
+    
+    large_step:
+      batch_size: 20
+      # large_step 生成初始候选，不做 refine
+      
+    # Prudent Cumulative 分段演化（唯一模式）
+    prudent:
+      enable: true
+      segment_evolution_mode: true
+      
+      # 跨代累加参数（核心）
+      n_sampling: 4               # 每 seed 并行链数
+      checkpoint_frame: 2        # 每代第几帧保存断点（固定2帧）
+      total_frames: 24           # 每代终点（固定24帧）
+      max_generations: 5         # 总共跑5代
+      
+      # 晋级参数
+      advance_top_k: 1           # 每代取1个 winner
+      advance_top_k_mode: cap
+      
+      # 打分权重
+      vina_weight: 0.86
+      qed_weight: 0.07
+      sa_weight: 0.07
+      
+      # 其他
+      vina_exhaustiveness: 1
+      log_per_chain_scores: true
+
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt

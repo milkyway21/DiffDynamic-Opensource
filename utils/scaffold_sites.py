@@ -1,0 +1,1323 @@
+"""
+Murcko 侧链位点：提取被去掉侧链的质心，并在骨架生长/动态锁骨架/Prudent 中
+引导额外原子的初始放置（grow / dynamic_locked / prudent 共用）。
+
+默认在去除位点质心附近用各向同性高斯云初始化（与从头生成 center+randn 同构），
+单样本浓缩到少数去除位点，避免跨多位点/沿射线离散珠串。
+"""
+
+from __future__ import annotations
+
+import json
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from rdkit import Chem
+
+CST = timezone(timedelta(hours=8))
+
+# 常见/复杂自由基重原子数先验（抬高单苯/稠环/联苯等）
+DEFAULT_FRAGMENT_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 20]
+# 抬高 ≥6 原子片段概率（名义 P(≥6)≈0.89），降低 1–5 小侧链
+DEFAULT_FRAGMENT_WEIGHTS = [
+    0.02, 0.02, 0.02, 0.02, 0.03, 0.16, 0.10, 0.09, 0.08,
+    0.12, 0.12, 0.10, 0.05, 0.04, 0.015, 0.01, 0.005,
+]
+
+DEFAULT_MURCKO_SITES_CFG = {
+    'p_active': 0.5,
+    'max_per_site': 20,
+    'min_per_site': 0,
+    'per_site_count_mode': 'split',
+    # fragment_prior：按常见自由基规模一次写入；uniform：旧 Uniform[min,max]
+    'per_site_add_mode': 'fragment_prior',
+    'fragment_sizes': list(DEFAULT_FRAGMENT_SIZES),
+    'fragment_weights': list(DEFAULT_FRAGMENT_WEIGHTS),
+    # 与从头生成一致：质心 + N(0, σ)，σ≈1（sample_diffusion 里 center+randn）
+    'jitter_std': 1.0,
+    'jitter_mode': 'gaussian',  # gaussian|isotropic|clustered | directional（旧：沿位点射线离散外推）
+    # 多原子时沿 anchor→centroid 径向外推（Å）：r = radial_step*atom_idx + radial_bulk*max(0, count-start)
+    'radial_step': 0.25,
+    'radial_bulk': 0.35,
+    'radial_bulk_start': 4,
+    # directional 模式：沿射线第 k 个原子再外推 directional_step Å
+    'directional_step': 1.0,
+    'directional_min_base_dist': 1.5,
+    # 每个样本最多在几个去除位点上释放；默认 = 去掉的侧链数（n_removed_sidechains）
+    'max_active_sites': 'n_removed_sidechains',
+    'prefer_murcko_sites': True,  # 浓缩时优先真实侧链去除位点，而非 exit-vector
+    'save_json': True,
+    'overflow_mode': 'pocket_fallback',
+    'dedup_dist': 0.5,
+    # 虚拟 exit-vector：在环上可取代原子处补充释放点（缓解单侧链位点问题）
+    'include_exit_vectors': False,
+    'exit_vector_mode': 'aromatic_h',  # aromatic_h | ring_h | all_h
+    'exit_vector_offset': 1.5,
+    'exit_vector_dedup_dist': 1.2,
+    # 位点分配为 0 时保留该位点原配体侧链（removed_atom_indices）；false=旧行为全剥侧链
+    'preserve_zero_allocation_sidechains': True,
+}
+
+
+def uses_site_budget_placement(sites_cfg: dict) -> bool:
+    """grow/dynamic_locked 是否由位点分配逻辑决定 n_extra（非先验固定值）。"""
+    return str(sites_cfg.get('per_site_count_mode', 'split')) in (
+        'random_per_site', 'sequential_random',
+    )
+
+
+def count_removed_sidechain_sites(attachment_sites: Optional[List[Dict[str, Any]]]) -> int:
+    """统计带有 removed_atom_indices 的真实侧链去除位点数（不含 exit_vector）。"""
+    n = 0
+    for site in attachment_sites or []:
+        if str(site.get('site_kind', 'murcko_sidechain')) == 'exit_vector':
+            continue
+        if site.get('removed_atom_indices'):
+            n += 1
+    return n
+
+
+def resolve_max_active_sites(
+    sites_cfg: dict,
+    attachment_sites: Optional[List[Dict[str, Any]]],
+) -> int:
+    """解析 max_active_sites：默认 / n_removed_sidechains = 去掉的侧链数量。"""
+    raw = (sites_cfg or {}).get('max_active_sites', 'n_removed_sidechains')
+    n_removed = count_removed_sidechain_sites(attachment_sites)
+    if raw is None or raw is True:
+        return max(int(n_removed), 0)
+    if isinstance(raw, str):
+        key = raw.strip().lower()
+        if key in (
+            '', 'auto', 'all', 'n_removed_sidechains', 'removed_sidechains',
+            'n_sidechains', 'sidechains',
+        ):
+            return max(int(n_removed), 0)
+        try:
+            return max(int(raw), 0)
+        except ValueError:
+            return max(int(n_removed), 0)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return max(int(n_removed), 0)
+    # 0 / 负数：视为「不限制浓缩」→ 用去掉的侧链数
+    if val <= 0:
+        return max(int(n_removed), 0)
+    return val
+
+
+def get_murcko_sites_cfg(scaffold_cfg: dict) -> dict:
+    """合并 scaffold / grow 下的 murcko_sites 子配置。"""
+    raw = {}
+    if isinstance(scaffold_cfg.get('murcko_sites'), dict):
+        raw.update(scaffold_cfg['murcko_sites'])
+    grow = scaffold_cfg.get('grow')
+    if isinstance(grow, dict) and isinstance(grow.get('murcko_sites'), dict):
+        raw.update(grow['murcko_sites'])
+    return {**DEFAULT_MURCKO_SITES_CFG, **raw}
+
+
+def _atom_positions(mol, ref_pos_np: Optional[np.ndarray] = None) -> np.ndarray:
+    """返回 [N, 3] 坐标；优先 conformer，否则用 ref_pos_np。"""
+    n = mol.GetNumAtoms()
+    if mol.GetNumConformers() > 0:
+        conf = mol.GetConformer()
+        return np.array([conf.GetAtomPosition(i) for i in range(n)], dtype=np.float64)
+    if ref_pos_np is not None and len(ref_pos_np) >= n:
+        return np.asarray(ref_pos_np[:n], dtype=np.float64)
+    return np.zeros((n, 3), dtype=np.float64)
+
+
+def _is_heavy(atom: Chem.Atom) -> bool:
+    return atom.GetAtomicNum() > 1
+
+
+def _connected_components(mol, atom_indices: List[int]) -> List[List[int]]:
+    """对 atom_indices 子图做连通分量划分。"""
+    idx_set = set(atom_indices)
+    adj: Dict[int, List[int]] = {i: [] for i in atom_indices}
+    for bond in mol.GetBonds():
+        a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if a in idx_set and b in idx_set:
+            adj[a].append(b)
+            adj[b].append(a)
+
+    seen = set()
+    components = []
+    for start in atom_indices:
+        if start in seen:
+            continue
+        comp = []
+        queue = deque([start])
+        seen.add(start)
+        while queue:
+            u = queue.popleft()
+            comp.append(u)
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    queue.append(v)
+        components.append(comp)
+    return components
+
+
+def extract_murcko_attachment_sites(
+    mol,
+    scaffold_indices: List[int],
+    ref_pos_np: Optional[np.ndarray] = None,
+    dedup_dist: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """
+    从完整分子 + Murcko 骨架索引提取侧链位点（被去掉片段的质心）。
+
+    Returns:
+        list of AttachmentSite dicts
+    """
+    if mol is None or not scaffold_indices:
+        return []
+
+    scaffold_set = set(int(i) for i in scaffold_indices)
+    n_atoms = mol.GetNumAtoms()
+    non_scaffold = [i for i in range(n_atoms) if i not in scaffold_set]
+    if not non_scaffold:
+        return []
+
+    positions = _atom_positions(mol, ref_pos_np)
+    components = _connected_components(mol, non_scaffold)
+    sites: List[Dict[str, Any]] = []
+
+    for comp in components:
+        heavy = [i for i in comp if _is_heavy(mol.GetAtomWithIdx(i))]
+        if not heavy:
+            continue
+
+        anchor_candidates = []
+        for i in comp:
+            atom = mol.GetAtomWithIdx(i)
+            for nb in atom.GetNeighbors():
+                j = nb.GetIdx()
+                if j in scaffold_set:
+                    anchor_candidates.append(j)
+
+        if not anchor_candidates:
+            continue
+
+        anchor_idx = int(anchor_candidates[0])
+        frag_pos = positions[comp]
+        centroid = frag_pos.mean(axis=0)
+        anchor_pos = positions[anchor_idx]
+
+        sites.append({
+            'site_id': len(sites),
+            'anchor_scaffold_idx': anchor_idx,
+            'anchor_pos': anchor_pos.tolist(),
+            'centroid_pos': centroid.tolist(),
+            'removed_atom_indices': [int(x) for x in comp],
+            'removed_atom_count': len(comp),
+        })
+
+    # 按质心距离去重
+    if dedup_dist > 0 and len(sites) > 1:
+        merged: List[Dict[str, Any]] = []
+        for site in sites:
+            c = np.array(site['centroid_pos'], dtype=np.float64)
+            dup = False
+            for kept in merged:
+                kc = np.array(kept['centroid_pos'], dtype=np.float64)
+                if np.linalg.norm(c - kc) < dedup_dist:
+                    dup = True
+                    kept['removed_atom_indices'] = list(
+                        set(kept['removed_atom_indices']) | set(site['removed_atom_indices'])
+                    )
+                    kept['removed_atom_count'] = len(kept['removed_atom_indices'])
+                    break
+            if not dup:
+                site['site_id'] = len(merged)
+                merged.append(site)
+        sites = merged
+
+    return sites
+
+
+def extract_exit_vector_sites(
+    mol,
+    scaffold_indices: List[int],
+    ref_pos_np: Optional[np.ndarray] = None,
+    mode: str = 'aromatic_h',
+    offset: float = 1.5,
+    existing_sites: Optional[List[Dict[str, Any]]] = None,
+    dedup_dist: float = 1.2,
+) -> List[Dict[str, Any]]:
+    """
+    在骨架环原子上构造虚拟释放点（exit vector）。
+
+    用于 Murcko 只剥掉极少侧链、真实位点过少的情况（如 X77 仅 1 个 tBu 位点）。
+    质心沿「锚点 → 远离邻居质心」方向外推 offset Å。
+
+    mode:
+      - aromatic_h: 芳香 C/N 且有显式/隐式 H
+      - ring_h: 任意环上 C/N 且有 H
+      - all_h: 骨架上任意 C/N 且有 H
+    """
+    if mol is None or not scaffold_indices:
+        return []
+
+    scaffold_set = set(int(i) for i in scaffold_indices)
+    positions = _atom_positions(mol, ref_pos_np)
+    ri = mol.GetRingInfo()
+    ring_atoms = set()
+    for ring in ri.AtomRings():
+        ring_atoms.update(ring)
+
+    mode = str(mode or 'aromatic_h').lower()
+    virtual: List[Dict[str, Any]] = []
+
+    for idx in scaffold_indices:
+        atom = mol.GetAtomWithIdx(int(idx))
+        z = atom.GetAtomicNum()
+        if z not in (6, 7):
+            continue
+        if atom.GetTotalNumHs() < 1:
+            continue
+        if mode == 'aromatic_h':
+            if not atom.GetIsAromatic():
+                continue
+        elif mode == 'ring_h':
+            if int(idx) not in ring_atoms:
+                continue
+        elif mode == 'all_h':
+            pass
+        else:
+            if not atom.GetIsAromatic():
+                continue
+
+        anchor = positions[int(idx)]
+        nbs = [n.GetIdx() for n in atom.GetNeighbors()]
+        if nbs:
+            nb_cent = positions[nbs].mean(axis=0)
+            direction = anchor - nb_cent
+        else:
+            direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        nrm = float(np.linalg.norm(direction))
+        if nrm < 1e-6:
+            direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            nrm = 1.0
+        direction = direction / nrm
+        centroid = anchor + float(offset) * direction
+
+        virtual.append({
+            'site_id': -1,
+            'anchor_scaffold_idx': int(idx),
+            'anchor_pos': anchor.tolist(),
+            'centroid_pos': centroid.tolist(),
+            'removed_atom_indices': [],
+            'removed_atom_count': 0,
+            'site_kind': 'exit_vector',
+            'exit_vector_mode': mode,
+        })
+
+    # 与已有真实侧链位点去重
+    kept_existing = list(existing_sites or [])
+    existing_cent = [
+        np.asarray(s['centroid_pos'], dtype=np.float64) for s in kept_existing
+    ]
+    merged_virtual: List[Dict[str, Any]] = []
+    for site in virtual:
+        c = np.asarray(site['centroid_pos'], dtype=np.float64)
+        if any(np.linalg.norm(c - ec) < dedup_dist for ec in existing_cent):
+            continue
+        if any(
+            np.linalg.norm(c - np.asarray(k['centroid_pos'], dtype=np.float64)) < dedup_dist
+            for k in merged_virtual
+        ):
+            continue
+        merged_virtual.append(site)
+
+    return merged_virtual
+
+
+def merge_attachment_and_exit_vector_sites(
+    murcko_sites: List[Dict[str, Any]],
+    exit_sites: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """合并真实侧链位点与虚拟 exit-vector，重编号 site_id。"""
+    merged: List[Dict[str, Any]] = []
+    for s in murcko_sites:
+        sc = dict(s)
+        sc.setdefault('site_kind', 'murcko_sidechain')
+        sc['site_id'] = len(merged)
+        merged.append(sc)
+    for s in exit_sites:
+        sc = dict(s)
+        sc.setdefault('site_kind', 'exit_vector')
+        sc['site_id'] = len(merged)
+        merged.append(sc)
+    return merged
+
+
+def load_or_extract_attachment_sites(
+    mol,
+    scaffold_indices: List[int],
+    scaffold_source: str,
+    ref_pos_np: Optional[np.ndarray],
+    output_dir: Optional[Path],
+    ref_ligand_name: Optional[str],
+    sites_cfg: dict,
+    logger=None,
+) -> List[Dict[str, Any]]:
+    """Murcko 来源时提取/加载位点；其它 source 返回空列表。"""
+    if scaffold_source not in ('auto_murcko', 'auto_murcko_generic'):
+        if logger:
+            logger.info(
+                f'[MurckoSites] scaffold_source={scaffold_source}，跳过侧链位点提取，使用口袋随机放置'
+            )
+        return []
+
+    if mol is None or not scaffold_indices:
+        return []
+
+    include_ev = bool(sites_cfg.get('include_exit_vectors', False))
+    ev_mode = str(sites_cfg.get('exit_vector_mode', 'aromatic_h'))
+    cache_suffix = f'_ev_{ev_mode}' if include_ev else ''
+
+    json_path = None
+    if sites_cfg.get('save_json', True) and output_dir and ref_ligand_name:
+        scaffold_dir = Path(output_dir) / 'scaffold'
+        scaffold_dir.mkdir(parents=True, exist_ok=True)
+        json_path = scaffold_dir / f'{ref_ligand_name}_murcko_sites{cache_suffix}.json'
+        if json_path.exists():
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                sites = data.get('attachment_sites', [])
+                cache_ok = bool(sites)
+                if include_ev:
+                    cache_ok = cache_ok and any(
+                        s.get('site_kind') == 'exit_vector' for s in sites
+                    )
+                if cache_ok:
+                    if logger:
+                        logger.info(f'[MurckoSites] 从缓存加载 {len(sites)} 个位点: {json_path}')
+                    return sites
+            except Exception as e:
+                if logger:
+                    logger.warning(f'[MurckoSites] 读取缓存失败: {e}')
+
+    sites = extract_murcko_attachment_sites(
+        mol, scaffold_indices, ref_pos_np,
+        dedup_dist=float(sites_cfg.get('dedup_dist', 0.5)),
+    )
+    for s in sites:
+        s.setdefault('site_kind', 'murcko_sidechain')
+
+    if logger:
+        logger.info(f'[MurckoSites] 提取 {len(sites)} 个侧链质心位点')
+
+    if include_ev:
+        exit_sites = extract_exit_vector_sites(
+            mol,
+            scaffold_indices,
+            ref_pos_np,
+            mode=ev_mode,
+            offset=float(sites_cfg.get('exit_vector_offset', 1.5)),
+            existing_sites=sites,
+            dedup_dist=float(sites_cfg.get('exit_vector_dedup_dist', 1.2)),
+        )
+        sites = merge_attachment_and_exit_vector_sites(sites, exit_sites)
+        n_ev = sum(1 for s in sites if s.get('site_kind') == 'exit_vector')
+        if logger:
+            logger.info(
+                f'[MurckoSites] exit_vector({ev_mode}): +{n_ev} 虚拟位点 → 合计 {len(sites)}'
+            )
+
+    if json_path and sites:
+        payload = {
+            'ligand_name': ref_ligand_name,
+            'n_scaffold': len(scaffold_indices),
+            'scaffold_indices': [int(i) for i in scaffold_indices],
+            'scaffold_source': scaffold_source,
+            'include_exit_vectors': include_ev,
+            'exit_vector_mode': ev_mode if include_ev else None,
+            'attachment_sites': sites,
+            'extracted_at': datetime.now(CST).isoformat(),
+        }
+        try:
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            if logger:
+                logger.info(f'[MurckoSites] 位点已保存: {json_path}')
+        except Exception as e:
+            if logger:
+                logger.warning(f'[MurckoSites] 保存位点 JSON 失败: {e}')
+
+    return sites
+
+
+def sample_fragment_atom_count(
+    rng: np.random.Generator,
+    sites_cfg: dict,
+    room: int,
+) -> int:
+    """
+    从常见/复杂自由基重原子数离散先验采样，并 clamp 到可用 room。
+
+    默认目录含单苯(6)、共边双苯量级(11)、联苯(12) 等；不可达的 k 会被过滤。
+    """
+    if room <= 0:
+        return 0
+    max_per_site = int(sites_cfg.get('max_per_site', 20))
+    min_per_site = int(sites_cfg.get('min_per_site', 0))
+    lo = max(1, min_per_site) if min_per_site > 0 else 1
+    hi = min(int(room), max_per_site)
+    if hi < lo:
+        return 0
+
+    sizes = list(sites_cfg.get('fragment_sizes') or DEFAULT_FRAGMENT_SIZES)
+    weights = list(sites_cfg.get('fragment_weights') or DEFAULT_FRAGMENT_WEIGHTS)
+    if len(weights) != len(sizes):
+        weights = list(DEFAULT_FRAGMENT_WEIGHTS[: len(sizes)])
+        if len(weights) < len(sizes):
+            weights.extend([1e-6] * (len(sizes) - len(weights)))
+
+    kept_sizes: List[int] = []
+    kept_w: List[float] = []
+    for k, w in zip(sizes, weights):
+        ki = int(k)
+        if lo <= ki <= hi and float(w) > 0:
+            kept_sizes.append(ki)
+            kept_w.append(float(w))
+    if not kept_sizes:
+        return int(rng.integers(lo, hi + 1))
+    w_arr = np.asarray(kept_w, dtype=np.float64)
+    w_arr = w_arr / w_arr.sum()
+    return int(rng.choice(kept_sizes, p=w_arr))
+
+
+def sample_per_site_add(
+    rng: np.random.Generator,
+    sites_cfg: dict,
+    room: int,
+    *,
+    allow_zero_uniform: bool = True,
+) -> int:
+    """按 per_site_add_mode 决定本轮向位点写入的原子数。"""
+    if room <= 0:
+        return 0
+    mode = str(sites_cfg.get('per_site_add_mode', 'fragment_prior')).lower()
+    max_per_site = int(sites_cfg.get('max_per_site', 20))
+    min_per_site = int(sites_cfg.get('min_per_site', 0))
+    min_per_site = max(0, min(min_per_site, max_per_site))
+    hi_add = min(max_per_site, int(room))
+    if mode in ('uniform', 'uniform_random'):
+        lo_add = min(min_per_site, hi_add)
+        if allow_zero_uniform:
+            return int(rng.integers(lo_add, hi_add + 1))
+        lo_add = max(1, lo_add) if hi_add >= 1 else 0
+        if lo_add > hi_add:
+            return 0
+        return int(rng.integers(lo_add, hi_add + 1))
+    return sample_fragment_atom_count(rng, sites_cfg, room)
+
+
+def allocate_atoms_to_sites(
+    n_extra: int,
+    sites: List[Dict[str, Any]],
+    p_active: float = 0.5,
+    max_per_site: int = 20,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[List[Dict[str, Any]], List[int], int]:
+    """
+    将 n_extra 个原子分配到激活位点。
+
+    Returns:
+        (active_sites, counts_per_site, overflow_count)
+        sum(counts) + overflow_count == n_extra
+    """
+    if n_extra <= 0 or not sites:
+        return [], [], n_extra
+
+    rng = rng or np.random.default_rng()
+    active = [s for s in sites if rng.random() < p_active]
+    if not active:
+        active = [sites[int(rng.integers(0, len(sites)))]]
+
+    n_active = len(active)
+    capacity = n_active * max_per_site
+    allocatable = min(n_extra, capacity)
+    overflow = n_extra - allocatable
+
+    counts = [0] * n_active
+    if allocatable == 0:
+        return active, counts, overflow
+
+    if allocatable <= n_active:
+        chosen = rng.choice(n_active, size=allocatable, replace=False)
+        for idx in chosen:
+            counts[int(idx)] += 1
+        return active, counts, overflow
+
+    # 随机切分 + clamp + 迭代调整
+    cuts = sorted(rng.integers(0, allocatable + 1, size=max(n_active - 1, 0)).tolist())
+    boundaries = [0] + cuts + [allocatable]
+    for i in range(n_active):
+        counts[i] = min(max_per_site, boundaries[i + 1] - boundaries[i])
+
+    deficit = allocatable - sum(counts)
+    for _ in range(100):
+        if deficit == 0:
+            break
+        adjustable = [i for i, c in enumerate(counts) if c < max_per_site]
+        if not adjustable:
+            break
+        idx = int(rng.choice(adjustable))
+        counts[idx] += 1
+        deficit -= 1
+
+    if deficit > 0:
+        overflow += deficit
+        for i in range(n_active):
+            counts[i] = min(counts[i], max_per_site)
+
+    return active, counts, overflow
+
+
+def allocate_atoms_random_per_site(
+    sites: List[Dict[str, Any]],
+    sites_cfg: dict,
+    n_extra_bounds: Optional[Tuple[int, int]] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[List[Dict[str, Any]], List[int], int]:
+    """
+    每位点独立随机原子数（增强样本间多样性）。
+
+    默认 per_site_add_mode=fragment_prior：每激活位点采样一个自由基规模；
+    uniform 时退回 Uniform[min_per_site, max_per_site]。
+    总 n_extra = sum(counts)，再 clamp 到 n_extra_bounds（若提供）。
+
+    Returns:
+        (active_sites, counts_per_site, effective_n_extra)
+    """
+    if not sites:
+        return [], [], 0
+
+    rng = rng or np.random.default_rng()
+    p_active = float(sites_cfg.get('p_active', 0.5))
+    max_per_site = int(sites_cfg.get('max_per_site', 20))
+    min_per_site = int(sites_cfg.get('min_per_site', 0))
+    min_per_site = max(0, min(min_per_site, max_per_site))
+
+    active = [s for s in sites if rng.random() < p_active]
+    if not active:
+        active = [sites[int(rng.integers(0, len(sites)))]]
+
+    counts = [
+        sample_per_site_add(rng, sites_cfg, max_per_site, allow_zero_uniform=True)
+        for _ in active
+    ]
+    # fragment_prior 不会返回 0（除非 room=0）；若全 0 则强制至少 1
+    if sum(counts) == 0 and active:
+        counts[0] = sample_per_site_add(
+            rng, sites_cfg, max_per_site, allow_zero_uniform=False,
+        ) or 1
+    n_extra = sum(counts)
+
+    if n_extra_bounds is not None:
+        lo, hi = n_extra_bounds
+        lo, hi = int(lo), int(hi)
+        if n_extra < lo:
+            deficit = lo - n_extra
+            for _ in range(deficit):
+                idx = int(rng.integers(0, len(counts)))
+                if counts[idx] < max_per_site:
+                    counts[idx] += 1
+                    n_extra += 1
+                elif n_extra >= lo:
+                    break
+            # 若仍不足，强制加到第一个位点（受 max_per_site 限制）
+            while n_extra < lo and counts:
+                for i in range(len(counts)):
+                    if counts[i] < max_per_site:
+                        counts[i] += 1
+                        n_extra += 1
+                        if n_extra >= lo:
+                            break
+                else:
+                    break
+        if n_extra > hi:
+            surplus = n_extra - hi
+            for _ in range(surplus):
+                candidates = [i for i, c in enumerate(counts) if c > min_per_site]
+                if not candidates:
+                    candidates = [i for i, c in enumerate(counts) if c > 0]
+                if not candidates:
+                    break
+                idx = int(rng.choice(candidates))
+                counts[idx] -= 1
+                n_extra -= 1
+
+    return active, counts, n_extra
+
+
+def allocate_atoms_sequential_random(
+    sites: List[Dict[str, Any]],
+    sites_cfg: dict,
+    n_extra_bounds: Optional[Tuple[int, int]] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[List[Dict[str, Any]], List[int], int]:
+    """
+    按位点顺序遍历：每位点以 p_active（默认 1/2）概率尝试加入，
+    加入量默认按自由基规模先验（fragment_prior），上限 max_per_site（默认 20），
+    多轮扫描直至达到本样本目标原子数（在 [lo, hi] 内随机，hi 为总数上限）。
+
+    Returns:
+        (active_sites, counts_per_site, effective_n_extra)
+    """
+    if not sites:
+        return [], [], 0
+
+    rng = rng or np.random.default_rng()
+    p_active = float(sites_cfg.get('p_active', 0.5))
+    max_per_site = int(sites_cfg.get('max_per_site', 20))
+    min_per_site = int(sites_cfg.get('min_per_site', 0))
+    min_per_site = max(0, min(min_per_site, max_per_site))
+
+    lo, hi = 0, compute_site_capacity(sites, sites_cfg)
+    if n_extra_bounds is not None:
+        lo, hi = int(n_extra_bounds[0]), int(n_extra_bounds[1])
+    lo = max(0, lo)
+    hi = max(lo, hi)
+    cap_hi = compute_site_capacity(sites, sites_cfg)
+    hi = min(hi, cap_hi) if cap_hi > 0 else hi
+    lo = min(lo, hi)
+
+    if hi <= 0:
+        return [], [], 0
+
+    # 本样本目标总数：在 [lo, hi] 均匀随机，再按序分配至该目标
+    budget = int(rng.integers(lo, hi + 1)) if hi > lo else hi
+    if budget <= 0:
+        return [], [], 0
+
+    ordered = sorted(sites, key=lambda s: int(s.get('site_id', 0)))
+    n_sites = len(ordered)
+    counts_arr = [0] * n_sites
+    remaining = budget
+
+    stall = 0
+    max_stall = max(n_sites * 4, 8)
+    while remaining > 0 and stall < max_stall:
+        added_round = False
+        for idx in range(n_sites):
+            if remaining <= 0:
+                break
+            room = min(max_per_site - counts_arr[idx], remaining)
+            if room <= 0:
+                continue
+            if rng.random() >= p_active:
+                continue
+            add = sample_per_site_add(rng, sites_cfg, room, allow_zero_uniform=True)
+            if add <= 0:
+                continue
+            counts_arr[idx] += add
+            remaining -= add
+            added_round = True
+        if added_round:
+            stall = 0
+            continue
+        stall += 1
+        eligible = [i for i in range(n_sites) if counts_arr[i] < max_per_site]
+        if not eligible or remaining <= 0:
+            break
+        idx = int(rng.choice(eligible))
+        room = min(max_per_site - counts_arr[idx], remaining)
+        # 打破停滞时仍走片段先验（至少 1），避免退回任意 Uniform
+        add = sample_per_site_add(rng, sites_cfg, room, allow_zero_uniform=False)
+        if add <= 0:
+            add = int(rng.integers(1, room + 1)) if room >= 1 else 0
+        if add <= 0:
+            break
+        counts_arr[idx] += add
+        remaining -= add
+        stall = 0
+
+    active: List[Dict[str, Any]] = []
+    counts: List[int] = []
+    for idx, site in enumerate(ordered):
+        if counts_arr[idx] > 0:
+            active.append(site)
+            counts.append(counts_arr[idx])
+
+    return active, counts, budget - remaining
+
+
+def compute_site_capacity(
+    sites: List[Dict[str, Any]],
+    sites_cfg: dict,
+) -> int:
+    """位点可放置原子的最大容量（全部位点激活时）。"""
+    if not sites:
+        return 0
+    max_per_site = int(sites_cfg.get('max_per_site', 20))
+    return len(sites) * max_per_site
+
+
+def cap_n_extra_for_sites(
+    n_extra: int,
+    attachment_sites: List[Dict[str, Any]],
+    sites_cfg: dict,
+) -> int:
+    """overflow_mode=cap/drop 时，将 n_extra 限制在位点总容量内。"""
+    overflow_mode = str(sites_cfg.get('overflow_mode', 'pocket_fallback'))
+    if overflow_mode not in ('cap', 'drop') or not attachment_sites:
+        return n_extra
+    return min(n_extra, compute_site_capacity(attachment_sites, sites_cfg))
+
+
+def _attachment_direction(site: Dict[str, Any]) -> Optional[np.ndarray]:
+    """返回 normalize(centroid - anchor)；缺锚点或退化时返回 None。"""
+    anchor = site.get('anchor_pos')
+    centroid = site.get('centroid_pos')
+    if anchor is None or centroid is None:
+        return None
+    anchor = np.asarray(anchor, dtype=np.float64).reshape(3)
+    centroid = np.asarray(centroid, dtype=np.float64).reshape(3)
+    direction = centroid - anchor
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-6:
+        return None
+    return direction / norm
+
+
+def _directional_site_position(
+    site: Dict[str, Any],
+    atom_idx: int,
+    jitter_std: float,
+    rng: np.random.Generator,
+    directional_step: float = 1.0,
+    min_base_dist: float = 1.5,
+) -> np.ndarray:
+    """沿 anchor→centroid 方向外推放置（旧方案，易呈离散珠串）。"""
+    anchor = site.get('anchor_pos')
+    centroid = site.get('centroid_pos')
+    if anchor is None or centroid is None:
+        centroid = np.array(site['centroid_pos'], dtype=np.float64)
+        return centroid + rng.normal(0.0, jitter_std, size=3)
+
+    anchor = np.array(anchor, dtype=np.float64)
+    centroid = np.array(centroid, dtype=np.float64)
+    direction = centroid - anchor
+    norm = float(np.linalg.norm(direction))
+    if norm > 1e-6:
+        direction = direction / norm
+    else:
+        direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    base_dist = max(norm, float(min_base_dist))
+    dist = base_dist + float(atom_idx) * float(directional_step)
+    pos = anchor + direction * dist
+    noise = rng.normal(0.0, jitter_std * 0.3, size=3)
+    return pos + noise
+
+
+def _gaussian_site_position(
+    site: Dict[str, Any],
+    jitter_std: float,
+    rng: np.random.Generator,
+    atom_idx: int = 0,
+    site_count: int = 1,
+    radial_step: float = 0.25,
+    radial_bulk: float = 0.35,
+    radial_bulk_start: int = 4,
+) -> np.ndarray:
+    """质心附近高斯云；多原子时沿 attachment 径向外推，避免贴骨架堆叠。
+
+    r = radial_step * atom_idx + radial_bulk * max(0, site_count - radial_bulk_start)
+    pos = centroid + direction * r + N(0, jitter_std)
+    """
+    centroid = np.array(site['centroid_pos'], dtype=np.float64)
+    r = float(radial_step) * float(atom_idx) + float(radial_bulk) * max(
+        0.0, float(site_count) - float(radial_bulk_start),
+    )
+    direction = _attachment_direction(site)
+    if direction is not None and r > 0.0:
+        centroid = centroid + direction * r
+    return centroid + rng.normal(0.0, float(jitter_std), size=3)
+
+
+def _is_gaussian_jitter(jitter_mode: str) -> bool:
+    mode = str(jitter_mode or 'gaussian').lower()
+    return mode in ('gaussian', 'isotropic', 'clustered', 'denovo', 'random')
+
+
+def concentrate_site_allocation(
+    active_sites: List[Dict[str, Any]],
+    counts: List[int],
+    max_active_sites: int,
+    rng: Optional[np.random.Generator] = None,
+    prefer_murcko: bool = True,
+) -> Tuple[List[Dict[str, Any]], List[int]]:
+    """
+    将已分配的位点浓缩到 ≤ max_active_sites 个，原子数合并。
+
+    默认优先真实侧链去除位点（murcko_sidechain），再按当前 count 加权抽样，
+    使多样本间仍可换位点，但单样本内原子聚成一团（仿从头单中心）。
+    """
+    if not active_sites or not counts:
+        return active_sites, counts
+    max_k = int(max_active_sites)
+    if max_k <= 0 or len(active_sites) <= max_k:
+        return active_sites, counts
+
+    rng = rng or np.random.default_rng()
+    indices = list(range(len(active_sites)))
+    if prefer_murcko:
+        murcko_idx = [
+            i for i in indices
+            if str(active_sites[i].get('site_kind', 'murcko_sidechain')) != 'exit_vector'
+        ]
+        pool = murcko_idx if murcko_idx else indices
+    else:
+        pool = indices
+
+    weights = np.array([max(int(counts[i]), 1) for i in pool], dtype=np.float64)
+    weights = weights / weights.sum()
+
+    k = min(max_k, len(pool))
+    if k == 1:
+        chosen = [int(rng.choice(pool, p=weights))]
+    else:
+        # 无放回加权：逐次选，去掉已选再归一化
+        chosen = []
+        rem = list(pool)
+        rem_w = weights.copy()
+        for _ in range(k):
+            rem_w = rem_w / rem_w.sum()
+            pick = int(rng.choice(len(rem), p=rem_w))
+            chosen.append(rem[pick])
+            rem.pop(pick)
+            rem_w = np.delete(rem_w, pick)
+
+    total = int(sum(counts))
+    if k == 1:
+        return [active_sites[chosen[0]]], [total]
+
+    # 多焦点：把 total 随机切到 k 个选中位点
+    cuts = sorted(rng.integers(0, total + 1, size=k - 1).tolist()) if total > 0 else []
+    bounds = [0] + cuts + [total]
+    new_counts = [bounds[i + 1] - bounds[i] for i in range(k)]
+    # 去掉 0 计数
+    out_sites, out_counts = [], []
+    for i, c in zip(chosen, new_counts):
+        if c > 0:
+            out_sites.append(active_sites[i])
+            out_counts.append(int(c))
+    if not out_sites and total > 0:
+        return [active_sites[chosen[0]]], [total]
+    return out_sites, out_counts
+
+
+def collect_zero_allocation_sites(
+    attachment_sites: List[Dict[str, Any]],
+    site_allocation: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """返回 concentrate 后仍无新原子分配、且带有原侧链索引的位点。
+
+    exit_vector 等无 removed_atom_indices 的位点不会进入结果。
+    """
+    allocated_ids = set()
+    if site_allocation:
+        for a in site_allocation:
+            if int(a.get('count', 0) or 0) <= 0:
+                continue
+            sid = a.get('site_id')
+            if sid is not None:
+                allocated_ids.add(int(sid))
+
+    zero: List[Dict[str, Any]] = []
+    for site in attachment_sites or []:
+        sid = site.get('site_id')
+        if sid is None:
+            continue
+        if int(sid) in allocated_ids:
+            continue
+        removed = site.get('removed_atom_indices') or []
+        if not removed:
+            continue
+        zero.append(site)
+    return zero
+
+
+def gather_preserved_sidechain_atoms(
+    zero_sites: List[Dict[str, Any]],
+    ref_pos: torch.Tensor,
+    ref_log_v: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    """从参考配体取出零分配位点的原侧链坐标与类型 log-onehot。
+
+    Returns:
+        (pos [n_preserved, 3], log_v [n_preserved, C], indices 参考配体 0-based 索引)
+    """
+    device = ref_pos.device
+    n_classes = int(ref_log_v.shape[-1]) if ref_log_v is not None and ref_log_v.ndim >= 2 else 0
+    indices: List[int] = []
+    seen = set()
+    for site in zero_sites or []:
+        for idx in site.get('removed_atom_indices') or []:
+            i = int(idx)
+            if i in seen:
+                continue
+            if i < 0 or i >= int(ref_pos.shape[0]):
+                continue
+            seen.add(i)
+            indices.append(i)
+
+    if not indices:
+        return (
+            torch.zeros(0, 3, device=device),
+            torch.zeros(0, n_classes, device=device),
+            [],
+        )
+
+    idx_t = torch.tensor(indices, dtype=torch.long, device=device)
+    return ref_pos.index_select(0, idx_t), ref_log_v.index_select(0, idx_t), indices
+
+
+def resolve_preserved_sidechains(
+    attachment_sites: List[Dict[str, Any]],
+    place_meta: Optional[Dict[str, Any]],
+    sites_cfg: dict,
+    ref_pos: torch.Tensor,
+    ref_log_v: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[int]]:
+    """按配置决定是否保留零分配位点原侧链。
+
+    Returns:
+        (preserved_pos, preserved_log_v, preserved_indices, zero_allocation_site_ids)
+    """
+    meta = place_meta or {}
+    cfg = sites_cfg or {}
+    enabled = bool(cfg.get('preserve_zero_allocation_sidechains', True))
+    zero_ids = [int(x) for x in (meta.get('zero_allocation_site_ids') or [])]
+    if not enabled:
+        device = ref_pos.device
+        n_classes = int(ref_log_v.shape[-1]) if ref_log_v is not None and ref_log_v.ndim >= 2 else 0
+        return (
+            torch.zeros(0, 3, device=device),
+            torch.zeros(0, n_classes, device=device),
+            [],
+            zero_ids,
+        )
+
+    # 优先用 meta 已写好的索引（build_extra_atom_positions 填充）
+    preserved_from_meta = meta.get('preserved_atom_indices')
+    if preserved_from_meta is not None:
+        indices = [int(i) for i in preserved_from_meta]
+        if not indices:
+            device = ref_pos.device
+            n_classes = int(ref_log_v.shape[-1]) if ref_log_v is not None and ref_log_v.ndim >= 2 else 0
+            return (
+                torch.zeros(0, 3, device=device),
+                torch.zeros(0, n_classes, device=device),
+                [],
+                zero_ids,
+            )
+        idx_t = torch.tensor(indices, dtype=torch.long, device=ref_pos.device)
+        return (
+            ref_pos.index_select(0, idx_t),
+            ref_log_v.index_select(0, idx_t),
+            indices,
+            zero_ids,
+        )
+
+    zero_sites = collect_zero_allocation_sites(
+        attachment_sites, meta.get('site_allocation'),
+    )
+    zero_ids = [int(s.get('site_id')) for s in zero_sites if s.get('site_id') is not None]
+    pos, log_v, indices = gather_preserved_sidechain_atoms(zero_sites, ref_pos, ref_log_v)
+    return pos, log_v, indices, zero_ids
+
+
+def _fill_zero_allocation_preserve_meta(
+    meta: Dict[str, Any],
+    attachment_sites: List[Dict[str, Any]],
+    site_allocation: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """根据最终 site_allocation 填写零分配位点与可保留原子索引。"""
+    alloc = site_allocation if site_allocation is not None else meta.get('site_allocation')
+    zero_sites = collect_zero_allocation_sites(attachment_sites, alloc)
+    zero_ids: List[int] = []
+    preserved: List[int] = []
+    seen = set()
+    for site in zero_sites:
+        sid = site.get('site_id')
+        if sid is not None:
+            zero_ids.append(int(sid))
+        for idx in site.get('removed_atom_indices') or []:
+            i = int(idx)
+            if i in seen:
+                continue
+            seen.add(i)
+            preserved.append(i)
+    meta['zero_allocation_site_ids'] = zero_ids
+    meta['preserved_atom_indices'] = preserved
+    meta['n_preserved_atoms'] = len(preserved)
+    return meta
+
+
+def init_extra_positions_at_sites(
+    active_sites: List[Dict[str, Any]],
+    counts: List[int],
+    device,
+    jitter_std: float = 1.0,
+    jitter_mode: str = 'gaussian',
+    rng: Optional[np.random.Generator] = None,
+    sites_cfg: Optional[dict] = None,
+) -> torch.Tensor:
+    """按位点分配生成世界坐标系 extra 位置 [n_extra, 3]。
+
+    gaussian（默认）：质心 + 径向偏移 + N(0, jitter_std)；多原子时略远离骨架。
+    directional：沿 anchor→centroid 射线外推（旧离散方案）。
+    """
+    cfg = sites_cfg or {}
+    radial_step = float(cfg.get('radial_step', DEFAULT_MURCKO_SITES_CFG['radial_step']))
+    radial_bulk = float(cfg.get('radial_bulk', DEFAULT_MURCKO_SITES_CFG['radial_bulk']))
+    radial_bulk_start = int(cfg.get('radial_bulk_start', DEFAULT_MURCKO_SITES_CFG['radial_bulk_start']))
+    directional_step = float(cfg.get('directional_step', DEFAULT_MURCKO_SITES_CFG['directional_step']))
+    min_base_dist = float(cfg.get(
+        'directional_min_base_dist', DEFAULT_MURCKO_SITES_CFG['directional_min_base_dist'],
+    ))
+    rng = rng or np.random.default_rng()
+    positions = []
+    use_gauss = _is_gaussian_jitter(jitter_mode)
+    for site, cnt in zip(active_sites, counts):
+        if cnt <= 0:
+            continue
+        for atom_i in range(cnt):
+            if use_gauss:
+                positions.append(_gaussian_site_position(
+                    site, jitter_std, rng,
+                    atom_idx=atom_i, site_count=cnt,
+                    radial_step=radial_step, radial_bulk=radial_bulk,
+                    radial_bulk_start=radial_bulk_start,
+                ))
+            elif str(jitter_mode).lower() == 'directional':
+                positions.append(_directional_site_position(
+                    site, atom_i, jitter_std, rng,
+                    directional_step=directional_step,
+                    min_base_dist=min_base_dist,
+                ))
+            else:
+                positions.append(_gaussian_site_position(
+                    site, jitter_std, rng,
+                    atom_idx=atom_i, site_count=cnt,
+                    radial_step=radial_step, radial_bulk=radial_bulk,
+                    radial_bulk_start=radial_bulk_start,
+                ))
+
+    if not positions:
+        return torch.zeros(0, 3, device=device)
+
+    arr = np.array(positions, dtype=np.float32)
+    return torch.tensor(arr, dtype=torch.float32, device=device)
+
+
+def build_extra_atom_positions(
+    n_extra: int,
+    attachment_sites: List[Dict[str, Any]],
+    sites_cfg: dict,
+    fallback_center: torch.Tensor,
+    device,
+    fallback_noise_scale: float = 2.0,
+    logger=None,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    为 grow / dynamic_locked / prudent 生成额外原子初始坐标。
+
+    有位点时按 Murcko 侧链质心分配；不足或失败时回退口袋/蛋白中心随机放置。
+    """
+    n_extra_requested = n_extra
+    overflow_mode = str(sites_cfg.get('overflow_mode', 'pocket_fallback'))
+    meta: Dict[str, Any] = {
+        'placement': 'pocket_fallback',
+        'site_allocation': None,
+        'overflow_count': 0,
+        'n_extra_requested': n_extra_requested,
+        'n_extra_effective': n_extra_requested,
+        'overflow_mode': overflow_mode,
+    }
+
+    count_mode_early = str(sites_cfg.get('per_site_count_mode', 'split'))
+    if n_extra <= 0 and not uses_site_budget_placement(sites_cfg):
+        meta['n_extra_effective'] = 0
+        meta['site_allocation'] = []
+        return torch.zeros(0, 3, device=device), _fill_zero_allocation_preserve_meta(
+            meta, attachment_sites or [], [],
+        )
+
+    if not attachment_sites:
+        pos = fallback_center.unsqueeze(0).expand(n_extra, -1) + \
+              torch.randn(n_extra, 3, device=device) * fallback_noise_scale
+        return pos, _fill_zero_allocation_preserve_meta(meta, [], [])
+
+    p_active = float(sites_cfg.get('p_active', 0.5))
+    max_per_site = int(sites_cfg.get('max_per_site', 20))
+    jitter_std = float(sites_cfg.get('jitter_std', 1.0))
+    jitter_mode = str(sites_cfg.get('jitter_mode', 'gaussian'))
+    count_mode = str(sites_cfg.get('per_site_count_mode', 'split'))
+    max_active_sites = resolve_max_active_sites(sites_cfg, attachment_sites)
+    prefer_murcko = bool(sites_cfg.get('prefer_murcko_sites', True))
+    meta['n_removed_sidechain_sites'] = count_removed_sidechain_sites(attachment_sites)
+
+    if overflow_mode in ('cap', 'drop'):
+        p_active = float(sites_cfg.get('p_active', 0.5))
+
+    if count_mode in ('random_per_site', 'sequential_random'):
+        min_c = int(sites_cfg.get('n_extra_min_clamp', 0))
+        max_c = int(sites_cfg.get('n_extra_max_clamp', max(n_extra, 1)))
+        cap_hi = cap_n_extra_for_sites(max_c, attachment_sites, sites_cfg)
+        max_c = min(max_c, cap_hi) if cap_hi > 0 else max_c
+        min_c = min(min_c, max_c)
+        alloc_fn = (
+            allocate_atoms_sequential_random
+            if count_mode == 'sequential_random'
+            else allocate_atoms_random_per_site
+        )
+        active, counts, n_extra_eff = alloc_fn(
+            attachment_sites, sites_cfg,
+            n_extra_bounds=(min_c, max_c),
+            rng=rng,
+        )
+        overflow = 0
+        meta['n_extra_effective'] = n_extra_eff
+        meta['per_site_count_mode'] = count_mode
+        if n_extra_eff <= 0:
+            meta['site_allocation'] = []
+            return torch.zeros(0, 3, device=device), _fill_zero_allocation_preserve_meta(
+                meta, attachment_sites, [],
+            )
+        if logger:
+            logger.info(
+                f'[MurckoSites] {count_mode}: 各位点分配 {counts} → n_extra={n_extra_eff} '
+                f'(budget∈[{min_c},{max_c}])'
+            )
+    else:
+        if overflow_mode in ('cap', 'drop'):
+            n_extra = cap_n_extra_for_sites(n_extra, attachment_sites, sites_cfg)
+            meta['n_extra_effective'] = n_extra
+            if n_extra < n_extra_requested and logger:
+                logger.info(
+                    f'[MurckoSites] overflow_mode={overflow_mode}: '
+                    f'n_extra {n_extra_requested} → {n_extra}（位点容量上限）'
+                )
+            if n_extra <= 0:
+                meta['site_allocation'] = []
+                return torch.zeros(0, 3, device=device), _fill_zero_allocation_preserve_meta(
+                    meta, attachment_sites, [],
+                )
+
+        active, counts, overflow = allocate_atoms_to_sites(
+            n_extra, attachment_sites, p_active=p_active, max_per_site=max_per_site,
+            rng=rng,
+        )
+
+        drop_overflow = overflow_mode in ('cap', 'drop')
+        if overflow > 0:
+            if drop_overflow:
+                if logger:
+                    logger.info(
+                        f'[MurckoSites] overflow_mode={overflow_mode}: '
+                        f'丢弃 {overflow} 个溢出原子（不口袋随机放置）'
+                    )
+                meta['overflow_dropped'] = overflow
+                overflow = 0
+            elif logger:
+                logger.warning(
+                    f'[MurckoSites] n_extra={n_extra} 超出位点容量，'
+                    f'{overflow} 个原子回退口袋随机放置'
+                )
+        n_extra_eff = n_extra
+
+    # 浓缩到少数去除位点，避免跨多位点离散撒点
+    n_before = len([c for c in counts if c > 0])
+    active, counts = concentrate_site_allocation(
+        active, counts, max_active_sites, rng=rng, prefer_murcko=prefer_murcko,
+    )
+    meta['max_active_sites'] = max_active_sites
+    meta['n_sites_before_concentrate'] = n_before
+    meta['n_sites_after_concentrate'] = len(active)
+    if logger and n_before != len(active):
+        logger.info(
+            f'[MurckoSites] concentrate: {n_before} → {len(active)} 位点 '
+            f'(max_active_sites={max_active_sites}, counts={counts})'
+        )
+
+    site_pos = init_extra_positions_at_sites(
+        active, counts, device,
+        jitter_std=jitter_std, jitter_mode=jitter_mode,
+        rng=rng, sites_cfg=sites_cfg,
+    )
+    n_site = site_pos.size(0)
+
+    parts = []
+    if n_site > 0:
+        parts.append(site_pos)
+
+    if overflow > 0:
+        overflow_pos = fallback_center.unsqueeze(0).expand(overflow, -1) + \
+                         torch.randn(overflow, 3, device=device) * fallback_noise_scale
+        parts.append(overflow_pos)
+
+    if not parts:
+        pos = fallback_center.unsqueeze(0).expand(max(n_extra_eff, 1), -1) + \
+              torch.randn(max(n_extra_eff, 1), 3, device=device) * fallback_noise_scale
+        meta['site_allocation'] = [
+            {
+                'site_id': active[i].get('site_id'),
+                'count': counts[i],
+                'centroid_pos': active[i].get('centroid_pos'),
+            }
+            for i in range(len(active)) if counts[i] > 0
+        ]
+        return pos, _fill_zero_allocation_preserve_meta(meta, attachment_sites)
+
+    extra_pos = torch.cat(parts, dim=0)
+    n_placed = extra_pos.size(0)
+    meta['n_extra_effective'] = n_placed
+    meta['n_extra_placed'] = n_placed
+
+    drop_overflow = overflow_mode in ('cap', 'drop')
+    if n_placed != n_extra_eff and not uses_site_budget_placement(sites_cfg) and not drop_overflow:
+        if logger:
+            logger.warning(
+                f'[MurckoSites] 分配异常 ({n_placed} != {n_extra_eff})，整批回退口袋放置'
+            )
+        pos = fallback_center.unsqueeze(0).expand(n_extra, -1) + \
+              torch.randn(n_extra, 3, device=device) * fallback_noise_scale
+        meta['n_extra_effective'] = n_extra
+        meta['site_allocation'] = [
+            {
+                'site_id': active[i].get('site_id'),
+                'count': counts[i],
+                'centroid_pos': active[i].get('centroid_pos'),
+            }
+            for i in range(len(active)) if counts[i] > 0
+        ]
+        return pos, _fill_zero_allocation_preserve_meta(meta, attachment_sites)
+
+    meta['placement'] = 'murcko_sites'
+    meta['overflow_count'] = overflow
+    meta['site_allocation'] = [
+        {
+            'site_id': active[i].get('site_id'),
+            'count': counts[i],
+            'centroid_pos': active[i].get('centroid_pos'),
+        }
+        for i in range(len(active)) if counts[i] > 0
+    ]
+    return extra_pos, _fill_zero_allocation_preserve_meta(meta, attachment_sites)

@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+.venv*/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.cursorignore
+.claude/
+CLAUDE.md
+
+# Runtime config (machine-local paths — never commit)
+server/server_config.json
+.env
+.env.*
+
+# Database (runtime)
+diffdynamic.db
+diffdynamic.db-shm
+diffdynamic.db-wal
+
+# Large data / weights / outputs (download or generate separately)
+data/
+outputs/
+pretrained_models/
+docktmp/
+experiments/
+third_party/
+tmp/
+backups/
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Molecule / table artifacts
+*.sdf
+*.mol2
+*.pdbqt
+*.xlsx
+*.xls
+*.csv
+*.pkl
+*.pkl.gz
+
+# LMDB / scientific binaries
+*.lmdb
+*.lmdb-lock
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Logs
+*.log
+server_run.log

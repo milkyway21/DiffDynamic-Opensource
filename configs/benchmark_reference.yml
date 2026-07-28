@@ -1,0 +1,35 @@
+# 横向比较参考配置（POKMOL-3D / SiteMap）
+# 文献中的具体数值区间请从原文或补充材料填入；未填时脚本仍可做维度映射与相关性分析。
+
+pokmol_3d:
+  description: >
+    POKMOL-3D 类工作通常报告：Vina 亲和力分布、几何互补、与已知配体的属性一致性（QED/SA）、构象/对接保真度。
+  mapping_to_this_repo:
+    binding_affinity: [score_a, score_c]
+    geometric_complementarity: [score_b, score_h]
+    property_consistency: [score_d]
+    pose_fidelity: [score_e, score_f]
+  # 以下区间为占位：请用 POKMOL-3D 或同类论文中的统计量替换（单位与论文一致）
+  literature_ranges:
+    vina_median_kcal_mol: null
+    qed_mean: null
+    sa_mean: null
+
+sitemap:
+  # Schrödinger SiteMap 综合分；Dscore > 该阈值常被视为高可成药性（文献常用约 0.83，以官方说明为准）
+  dscore_high_druggability_threshold: 0.83
+
+experimental_plan:
+  notes: >
+    计划：POKMOL 32 个典型口袋 + shoc2、hsv pol、HDAC8、CDK6、CD38、4AZF、5AEH、5LIU 等，
+    每口袋约 400 个分子；跑完 evaluate_pocket_quality 后合并 evaluation_records.csv 与本脚本。
+  molecules_per_pocket: 400
+  extra_pocket_tags:
+    - shoc2
+    - hsv_pol
+    - HDAC8
+    - CDK6
+    - CD38
+    - 4AZF
+    - 5AEH
+    - 5LIU
