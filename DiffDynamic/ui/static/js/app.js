@@ -1094,14 +1094,14 @@ function renderPeScores(scores) {
     return;
   }
   const dims = [
-    { key: 'score_a', label: 'A · Vina' },
-    { key: 'score_b', label: 'B · Clustering' },
-    { key: 'score_c', label: 'C · LE' },
-    { key: 'score_d', label: 'D · Druglike' },
+    { key: 'score_a', label: 'A · Aff+LE' },
+    { key: 'score_b', label: 'B · Mode' },
+    { key: 'score_c', label: 'C · Drug' },
+    { key: 'score_d', label: 'D · Unique' },
     { key: 'score_e', label: 'E · Complete' },
-    { key: 'score_f', label: 'F · Unique' },
-    { key: 'score_g', label: 'G · Size' },
-    { key: 'score_h', label: 'H · Volume' },
+    { key: 'score_f', label: 'F · Chem' },
+    { key: 'score_g', label: 'G · Anchor' },
+    { key: 'score_h', label: 'H · Geom' },
   ];
   let html = '';
   for (const d of dims) {

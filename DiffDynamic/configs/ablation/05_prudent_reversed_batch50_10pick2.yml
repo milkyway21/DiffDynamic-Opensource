@@ -1,0 +1,118 @@
+# =============================================================================
+# 消融：反向梯度 DiffDynamic-Prudent（denovo）
+# batch_size=50 × n_sampling=10 → advance_top_k=2 × 1 轮
+# 期望终分子 ≈ 50 × 2 = 100 / 口袋（选出的最后两个 × 50 seeds 的集合）
+# grad_fusion: start=0,end=1 → 先弱后强（相对默认先强后弱）
+# scaffold.enable=false
+# =============================================================================
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  use_grad_fusion: true
+  grad_fusion_lambda:
+    mode: quadratic
+    start: 0.0
+    end: 1.0
+    power: 2.0
+
+sample:
+  seed: 2021
+  mode: prudent
+  num_steps: 1000
+  sample_num_atoms: prior
+  center_pos_mode: protein
+  pos_only: false
+
+  dynamic:
+    method: legacy
+    time_boundary: 650
+    skip_refine: true
+    large_step:
+      batch_size: 50
+      n_repeat: 1
+      schedule: lambda
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      linear_step_lower: 15
+      linear_step_upper: 15
+      step_size: 0.33
+      stride: 15
+      noise_scale: 0.1
+      use_adaptive_step: true
+      use_time_scale: false
+    selector:
+      enable_selection: false
+      selection_time: 250
+      top_percent: 0.3
+      top_n: 20
+      min_sa: 0.1
+      min_qed: 0.1
+      qed_weight: 1
+      sa_weight: 1
+    prudent:
+      enable: true
+      n_sampling: 10
+      segment_evolution_mode: true
+      checkpoint_frame: 24
+      total_frames: 24
+      max_checkpoint_rounds: 1
+      advance_top_k: 2
+      advance_top_k_mode: cap
+      continue_when_no_advance: true
+      fallback_keep_top_k: 1
+      winner_select_by_composite: true
+      vina_weight: 0.5
+      qed_weight: 0.15
+      sa_weight: 0.15
+      lipinski_weight: 0.1
+      lilly_demerit_weight: 0.1
+      vina_exhaustiveness: 1
+      log_per_chain_scores: true
+      min_qed_for_docking: 0
+      min_sa_for_docking: 0
+      max_vina_affinity_for_advance: null
+      async_vina_max_workers: 4
+      protein_root: ./data/crossdocked_pocket10_test_only
+      save_checkpoint_every_segment: true
+      segment_checkpoint_subdirectory: null
+      save_segment_breakpoint_pt: false
+      save_segment_generation_pool_pt: true
+      segment_generation_pt_seeds: first
+    refine:
+      n_sampling: 1
+      cycles: 1
+      schedule: lambda
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      linear_step_lower: 3
+      linear_step_upper: 8
+      step_size: 0.47
+      stride: 5
+      time_lower: 0
+      noise_scale: 0.05
+      use_adaptive_step: true
+      use_time_scale: false
+      max_grad_fusion_iterations: 15
+
+  scaffold:
+    enable: false
+
+  optimization:
+    enable: false
+
+  targetdiff_baseline_refine:
+    enable: true
+    start_t: 9
+    lock_prefix: types_and_pos
+    after_scaffold_init_only: false
+    run_every_prudent_round: true
+    refine_batch_size: 10
+
+  pre_docking:
+    etkdg_reembed: false
+    mmff_minimize: false
+    mmff_max_iters: 2000
+    use_uff_fallback: false
+
+  step_trajectory_save:
+    enable: false

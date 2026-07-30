@@ -206,6 +206,13 @@ sample:
     after_scaffold_init_only: false
     run_every_prudent_round: true
     refine_batch_size: null
+  # Deterministic RDKit topology repair AFTER reconstruct (orthogonal to
+  # targetdiff_baseline_refine which fixes coordinates before .pt write).
+  # Default false so paper evaluation baselines stay unchanged.
+  rdkit_structure_repair:
+    enable: false
+    config: rdkit-structure-repair/configs/conservative.yaml
+    on_reject: keep_original  # keep_original | raise
   pre_docking:
     etkdg_reembed: false
     mmff_minimize: false

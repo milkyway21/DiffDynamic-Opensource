@@ -1,26 +1,144 @@
-# /data/ye 工作区
+# DiffDynamic-Opensource
 
-本目录包含多个独立项目，每个子目录对应一个项目：
+**DiffDynamic** 是面向 3D 结构化药物设计（SBDD）的扩散模型推理框架：在 [TargetDiff](https://github.com/DeepGraphLearning/TargetDiff) 骨干上，提供两阶段动态跳步采样、梯度融合、Prudent 多轮过滤与骨架约束生成，并附带 Web 演示界面。
 
-| 目录 | 说明 |
-|------|------|
-| **DiffDynamic/** | 扩散模型 SBDD 框架 + Web 演示平台（前后端） |
-| DiffSBDD/ | DiffSBDD 基线 |
-| diffgui/ | DiffGUI 相关 |
-| e-drug-lab/ | 药物发现实验室 |
-| omicos/ | 组学分析 |
-| pocket_quality_vis/ | 口袋质量可视化 |
-| protein-ligand/ | 蛋白-配体数据 |
-| pt/ | 生成结果 (.pt) 存储 |
+技术原理与创新点详见英文长文：[DiffDynamic/README.md](DiffDynamic/README.md)  
+中文补充：[DiffDynamic/README.zh-CN.md](DiffDynamic/README.zh-CN.md)
 
-## DiffDynamic 快速启动
+## 仓库结构
+
+```
+DiffDynamic-Opensource/
+├── README.md                 # 本使用引导（仓库主页）
+├── DiffDynamic/              # 核心代码与权重
+│   ├── pretrained_models/    # 预训练权重（已入库）
+│   ├── configs/sampling.yml  # 采样主配置
+│   ├── scripts/sample_diffusion.py
+│   ├── evaluate_pt_with_correct_reconstruct.py
+│   ├── evaluate_pocket_quality.py
+│   ├── extract_pt_to_sdf_excel.py
+│   ├── server/ + ui/         # FastAPI + Web 前端
+│   └── start_server.sh
+└── auto_upload.py            # 本地同步辅助脚本（可选）
+```
+
+## 环境准备
+
+- Python 3.8+
+- Conda 环境建议命名为 `diffdynamic`（PyTorch 1.12+、CUDA、RDKit、AutoDock Vina）
+- NVIDIA GPU（生成与对接评估）
 
 ```bash
-cd DiffDynamic
+git clone https://github.com/milkyway21/DiffDynamic-Opensource.git
+cd DiffDynamic-Opensource/DiffDynamic
+
+conda activate diffdynamic
+# Web 服务额外依赖（可选）
+pip install -r requirements-web.txt
+# 或安装基础依赖
+pip install -r requirements.txt
+```
+
+将项目根加入 `PYTHONPATH`（在 `DiffDynamic/` 下运行脚本时通常已足够）：
+
+```bash
+export PYTHONPATH="$(pwd):${PYTHONPATH}"
+```
+
+## 预训练权重
+
+Clone 后权重已在：
+
+| 文件 | 用途 |
+|------|------|
+| `DiffDynamic/pretrained_models/pretrained_diffusion.pt` | 默认采样检查点（必需） |
+| `DiffDynamic/pretrained_models/pretrained_GlintDM.pt` | 相关对照权重 |
+
+`configs/sampling.yml` 中默认指向：
+
+```yaml
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+```
+
+无需再单独下载权重即可开始采样。
+
+## 快速开始
+
+以下命令均在 `DiffDynamic/` 目录执行。
+
+### 1. 单口袋采样（测试集 data_id）
+
+```bash
+python scripts/sample_diffusion.py configs/sampling.yml \
+    --data_id 0 --device cuda:0
+```
+
+自定义蛋白 / 参考配体：
+
+```bash
+python scripts/sample_diffusion.py configs/sampling.yml \
+    --protein_path /path/to/protein.pdb \
+    --ligand_path /path/to/reference.sdf \
+    --device cuda:0
+```
+
+结果默认写入 `outputs/`（运行时生成，不在仓库中）。
+
+### 2. 评估与提取
+
+```bash
+# 重建 + Vina / QED / SA 等评估
+python evaluate_pt_with_correct_reconstruct.py \
+    outputs/result_0_*.pt \
+    --protein_root ./data/crossdocked_v1.1_rmsd1.0_pocket10
+
+# .pt → SDF / Excel
+python extract_pt_to_sdf_excel.py outputs/result_0_*.pt
+```
+
+口袋质量 8 维评估：
+
+```bash
+python evaluate_pocket_quality.py --help
+```
+
+> 说明：CrossDocked 测试口袋数据（`data/`）需自行准备；仓库不包含该数据集。
+
+### 3. Web 演示界面
+
+```bash
 bash start_server.sh
 ```
 
-Web UI: http://localhost:7860/  
-API 文档: http://localhost:7860/docs
+- 界面：http://localhost:7860/
+- API 文档：http://localhost:7860/docs
 
-详细说明见 [DiffDynamic/README.zh-CN.md](DiffDynamic/README.zh-CN.md)
+可在浏览器中触发生成、评估、分子浏览与历史记录。
+
+## 配置入口
+
+所有生成行为以 [`DiffDynamic/configs/sampling.yml`](DiffDynamic/configs/sampling.yml) 为准，常用字段：
+
+| 字段 | 说明 |
+|------|------|
+| `sample.mode` | `baseline` / `dynamic` / `prudent` / `optimization` |
+| `sample.dynamic.time_boundary` | 大步跳跃与精修分界（默认约 650） |
+| `model.use_grad_fusion` | 是否启用梯度融合 |
+| `sample.scaffold` | 骨架约束（grow / evolve） |
+
+更多模式说明见 [DiffDynamic/README.md](DiffDynamic/README.md) 与 [SEEDFORGE.md](DiffDynamic/SEEDFORGE.md)。
+
+## 数据说明：仓库内 vs 自备
+
+| 内容 | 是否入库 | 说明 |
+|------|----------|------|
+| 源码、配置、脚本、Web | 是 | `DiffDynamic/` 下代码与文档 |
+| `pretrained_models/*.pt` | 是 | 预训练权重 ~64MB |
+| `data/`（CrossDocked 等） | 否 | 需自行准备测试口袋 |
+| `outputs/`、`experiments/` | 否 | 运行时生成 |
+| 评估导出的 xlsx/csv/图片 | 否 | 不上传 |
+
+## 致谢
+
+本项目基于 [TargetDiff](https://github.com/DeepGraphLearning/TargetDiff)（Guan et al., ICLR 2023）构建。感谢其在扩散模型结构化药物设计方面的奠基性工作。

@@ -552,12 +552,17 @@ def postprocess_rd_mol_2(rdmol, n_scaffold=None):  # 对 RDKit 分子进行第�
 def reconstruct_from_generated(
     xyz, atomic_nums, aromatic=None, basic_mode=True,
     scaffold_bonds=None, n_scaffold=None,
+    rdkit_structure_repair=None,
 ):  # 从生成的坐标和元素重建 RDKit 分子。
     """
     will utilize data.ligand_pos, data.ligand_element, data.ligand_atom_feature_full to reconstruct mol
 
     scaffold_bonds: optional list of (i, j[, order[, aromatic]]) for atoms 0..n_scaffold-1
     to force-keep Murcko scaffold topology during OpenBabel distance bonding.
+
+    rdkit_structure_repair: optional dict matching sample.rdkit_structure_repair in sampling.yml
+        enable / config / on_reject. Applied AFTER postprocess (orthogonal to
+        targetdiff_baseline_refine which runs before .pt write).
     """
     # xyz = data.ligand_pos.clone().cpu().tolist()
     # atomic_nums = data.ligand_element.clone().cpu().tolist()
@@ -627,7 +632,68 @@ def reconstruct_from_generated(
     except:
         raise MolReconsError()
 
+    rd_mol = _maybe_apply_rdkit_structure_repair(rd_mol, rdkit_structure_repair)
     return rd_mol
+
+
+def _maybe_apply_rdkit_structure_repair(rd_mol, repair_cfg):
+    """Optional deterministic topology repair (rdkit-structure-repair package).
+
+    Runs after OB→RDKit postprocess. Default off. Config shape::
+        {enable: bool, config: path, on_reject: keep_original|raise}
+    """
+    if not repair_cfg:
+        return rd_mol
+    # Support OmegaConf / dict / plain object
+    try:
+        enable = bool(repair_cfg.get("enable", False))
+    except Exception:
+        enable = bool(getattr(repair_cfg, "enable", False))
+    if not enable:
+        return rd_mol
+
+    import os
+    import sys
+
+    try:
+        cfg_path = repair_cfg.get("config", None)
+        on_reject = repair_cfg.get("on_reject", "keep_original")
+    except Exception:
+        cfg_path = getattr(repair_cfg, "config", None)
+        on_reject = getattr(repair_cfg, "on_reject", "keep_original")
+
+    # Ensure package importable when running from DiffDynamic root
+    dd_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pkg_src = os.path.join(dd_root, "rdkit-structure-repair", "src")
+    if os.path.isdir(pkg_src) and pkg_src not in sys.path:
+        sys.path.insert(0, pkg_src)
+
+    if cfg_path and not os.path.isabs(str(cfg_path)):
+        cfg_path = os.path.join(dd_root, str(cfg_path))
+
+    try:
+        from structure_repair import repair_molecule  # type: ignore
+        from structure_repair.config import load_config  # type: ignore
+
+        config = load_config(cfg_path) if cfg_path else load_config()
+        result = repair_molecule(rd_mol, config=config, molecule_id="reconstruct")
+        if result.status == "REPAIRED" and result.repaired_mol is not None:
+            return result.repaired_mol
+        if result.status == "UNCHANGED" and result.repaired_mol is not None:
+            # May still have cleared maps / standardize applied
+            return result.repaired_mol
+        if result.status in ("AMBIGUOUS", "REJECTED"):
+            if on_reject == "raise":
+                raise MolReconsError(
+                    f"rdkit_structure_repair {result.status}: {result.reject_reason}"
+                )
+            return rd_mol
+        return result.repaired_mol if result.repaired_mol is not None else rd_mol
+    except MolReconsError:
+        raise
+    except Exception:
+        # Never break reconstruction if the optional repair package fails
+        return rd_mol
 
 
 def save_positions_only_to_sdf(xyz, atomic_nums, output_path):

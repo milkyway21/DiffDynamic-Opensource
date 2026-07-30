@@ -1,0 +1,71 @@
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  use_grad_fusion: true
+  grad_fusion_lambda:
+    mode: quadratic
+    start: 1.0
+    end: 0.0
+    power: 2.0
+sample:
+  seed: 2021
+  mode: dynamic
+  num_steps: 1000
+  sample_num_atoms: prior
+  center_pos_mode: protein
+  pos_only: false
+  dynamic:
+    method: legacy
+    time_boundary: 650
+    skip_refine: false
+    large_step:
+      batch_size: 10
+      n_repeat: 1
+      schedule: uniform
+      stride: 20
+      step_size: 0.33
+      noise_scale: 0.1
+      use_adaptive_step: false
+      use_time_scale: false
+    selector:
+      enable_selection: false
+      selection_time: 250
+      top_percent: 0.3
+      top_n: 20
+      min_sa: 0.1
+      min_qed: 0.1
+      qed_weight: 1
+      sa_weight: 1
+    refine:
+      n_sampling: 1
+      cycles: 1
+      schedule: uniform
+      stride: 20
+      step_size: 0.47
+      time_lower: 0
+      noise_scale: 0.05
+      use_adaptive_step: false
+      use_time_scale: false
+      max_grad_fusion_iterations: 15
+  optimization:
+    enable: false
+  scaffold:
+    enable: false
+  targetdiff_baseline_refine:
+    enable: true
+    start_t: 10
+    lock_prefix: types_and_pos
+    after_scaffold_init_only: false
+    run_every_prudent_round: true
+    refine_batch_size: null
+  pre_docking:
+    etkdg_reembed: false
+    mmff_minimize: false
+    mmff_max_iters: 2000
+    use_uff_fallback: false
+  step_trajectory_save:
+    enable: false
+    output_dir: ./diffway
+    bond_threshold: 500
+    merge_pymol_sdf: true
+    merge_sdf_filename: trajectory_pymol.sdf

@@ -1,0 +1,89 @@
+# Aggressive structure optimization for DiffDynamic reconstruct.
+# Still deterministic / rule-based — no ML.
+# Looser acceptance than conservative; post-standardize; prefer best on ties.
+
+mode: aggressive_optimize
+
+repair:
+  max_iterations: 15
+  maximum_edit_cost: 40
+  minimum_improvement: 20
+  minimum_winner_margin: 10
+  reject_repeated_state: true
+  # If multiple candidates are close, still take the best (do not AMBIGUOUS abort)
+  prefer_best_on_ambiguous: true
+  # If no candidate fully clears issues but some improve, take best improving one
+  accept_best_effort: true
+  # Clear atom maps before returning mol (avoid map pollution in SDF/SMILES)
+  clear_atom_maps_on_output: true
+
+aromaticity:
+  repair_c6_carbon_rings: true
+  repair_c5_heteroaromatic_rings: true
+  require_unique_kekule_candidate: false
+  use_3d_planarity_as_optional_evidence: true
+  # Attempt C6 aromatic recovery up to higher H counts (more aggressive)
+  c6_max_ring_h_count: 10
+
+cumulene:
+  allow_known_legal_patterns: true
+  repair_ring_cumulenes: true
+  reject_ambiguous_linear_cumulenes: false
+
+connectivity_repair:
+  allow_bond_deletion: true
+  allow_bond_addition: false
+  maximum_deleted_bonds: 3
+  maximum_added_bonds: 0
+
+charge:
+  allowed_total_charges: [-3, -2, -1, 0, 1, 2, 3]
+  preserve_permanent_ions: true
+  preserve_zwitterions: true
+  allow_local_charge_repair: true
+  force_neutral: false
+
+stereo:
+  preserve_tetrahedral_centers: true
+  preserve_double_bond_stereo: true
+  reject_if_changed: true
+
+radicals:
+  allow: false
+
+identity:
+  preserve_elements: true
+  preserve_heavy_atom_count: true
+  allow_local_bond_order_changes: true
+  allow_documented_bond_deletion: true
+
+standardize:
+  enable: true
+  cleanup: true
+  normalize: true
+  largest_fragment: true
+  # Do NOT uncharge by default (preserve zwitterions / permanent ions)
+  uncharge: false
+  reionize: false
+
+scoring:
+  parse_failure: 10000
+  sanitize_failure: 8000
+  invalid_valence_count: 3000
+  kekulization_failure_count: 2000
+  unexpected_radical_count: 1500
+  aromaticity_conflict_count: 1000
+  impossible_bond_order_count: 800
+  implausible_charge_count: 500
+  ring_conflict_count: 300
+  disconnected_fragment_penalty: 100
+  edit_costs:
+    bond_order_change: 1
+    formal_charge_change: 1
+    implicit_h_change: 1
+    aromatic_flag_change: 0.5
+    bond_deletion: 5
+    bond_addition: 10
+    stereo_change: 1000
+    heavy_atom_deletion: 10000
+    element_change: 10000

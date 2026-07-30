@@ -373,14 +373,16 @@ def get_pocket_eval_results(job_id: str):
         metric_to_score = {
             "vina_docking": "score_a",
             "clustering": "score_b",
-            "ligand_efficiency": "score_c",
-            "drug_likeness": "score_d",
+            "drug_likeness": "score_c",
+            "ligand_efficiency": "score_a",  # legacy: LE merged into A
+            "diversity": "score_d",
             "completeness": "score_e",
-            "diversity": "score_f",
-            "size_consistency": "score_g",
+            "pocket_chemistry": "score_f",
+            "anchor_richness": "score_g",
+            "size_consistency": "score_g",  # legacy size → ignore semantics, map g
             "pocket_volume": "score_h",
-            "interaction": "score_g",  # legacy misnomer
-            "stability": "score_h",    # legacy misnomer
+            "interaction": "score_g",
+            "stability": "score_h",
             "overall_pocket_score": "overall_score",
             "score_a": "score_a",
             "score_b": "score_b",

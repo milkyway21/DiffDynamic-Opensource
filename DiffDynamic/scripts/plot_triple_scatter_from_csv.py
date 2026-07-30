@@ -83,15 +83,22 @@ def _scale_theoretical_01(arr: np.ndarray, cap: float) -> np.ndarray:
     return out
 
 
+def _order_indices_by_key_ascending(key: np.ndarray) -> np.ndarray:
+    """按 key 升序（NaN 排在最后）。"""
+    key = np.asarray(key, dtype=np.float64)
+    return np.argsort(np.nan_to_num(key, nan=np.inf), kind="stable")
+
+
 def order_rows_by_ddeval_ascending(
     ddeval: np.ndarray,
     p2: np.ndarray,
     sm: np.ndarray,
     pocket_ids: list[str],
+    sort_key: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    """按 ddeval 原始分从低到高重排（NaN 排在最后）。"""
-    key = np.asarray(ddeval, dtype=np.float64)
-    order = np.argsort(np.nan_to_num(key, nan=np.inf), kind="stable")
+    """按 sort_key（默认 ddeval）从低到高重排（NaN 排在最后）。"""
+    key = ddeval if sort_key is None else sort_key
+    order = _order_indices_by_key_ascending(key)
     ddeval = np.asarray(ddeval, dtype=np.float64)[order]
     p2 = np.asarray(p2, dtype=np.float64)[order]
     sm = np.asarray(sm, dtype=np.float64)[order]
@@ -105,10 +112,11 @@ def order_rows_by_ddeval_ascending_quad(
     fp: np.ndarray,
     sm: np.ndarray,
     pocket_ids: list[str],
+    sort_key: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    """按 ddeval 升序重排四列：ddeval → p2rank → fpocket → sitemap + 横轴标签。"""
-    key = np.asarray(ddeval, dtype=np.float64)
-    order = np.argsort(np.nan_to_num(key, nan=np.inf), kind="stable")
+    """按 sort_key（默认 ddeval）升序重排四列：ddeval → p2rank → fpocket → sitemap。"""
+    key = ddeval if sort_key is None else sort_key
+    order = _order_indices_by_key_ascending(key)
     ddeval = np.asarray(ddeval, dtype=np.float64)[order]
     p2 = np.asarray(p2, dtype=np.float64)[order]
     fp = np.asarray(fp, dtype=np.float64)[order]
@@ -566,7 +574,13 @@ def main() -> int:
     parser.add_argument(
         "--four-metrics",
         action="store_true",
-        help="绘制四列：ddeval（含 this_work）/ P2Rank / FPocket / SiteMap；横轴仍按 ddeval 升序",
+        help="绘制四列：ddeval（含 this_work）/ P2Rank / FPocket / SiteMap",
+    )
+    parser.add_argument(
+        "--sort-by",
+        choices=("ddeval", "sitemap"),
+        default="ddeval",
+        help="横轴排序键：ddeval（默认，即 this_work）或 sitemap（SiteMap 升序）",
     )
     parser.add_argument(
         "--cap-fpocket",
@@ -640,15 +654,19 @@ def main() -> int:
             return 2
     n = len(pocket_ids)
 
+    sort_key = sm if args.sort_by == "sitemap" else ddeval
+    sort_label = "SiteMap ↑" if args.sort_by == "sitemap" else "ddeval ↑"
     if args.four_metrics:
         if not np.any(np.isfinite(fp)):
             print("❌ --four-metrics 需要表中存在 FPocket 数值列（如 fpocket）", file=sys.stderr)
             return 2
         ddeval, p2, fp, sm, pocket_ids = order_rows_by_ddeval_ascending_quad(
-            ddeval, p2, fp, sm, pocket_ids
+            ddeval, p2, fp, sm, pocket_ids, sort_key=sort_key
         )
     else:
-        ddeval, p2, sm, pocket_ids = order_rows_by_ddeval_ascending(ddeval, p2, sm, pocket_ids)
+        ddeval, p2, sm, pocket_ids = order_rows_by_ddeval_ascending(
+            ddeval, p2, sm, pocket_ids, sort_key=sort_key
+        )
 
     if args.four_metrics:
         if args.scale_theoretical_max:
@@ -728,9 +746,9 @@ def main() -> int:
         ax.scatter(x, sm_n, c=colors["sm"], label=sm_lbl, **pt_kw)
 
     ax.set_xlabel(
-        "Pocket id (row order or data_id; sorted by ddeval ↑)"
+        f"Pocket id (row order or data_id; sorted by {sort_label})"
         if args.four_metrics
-        else "Pocket data_id (from table, sorted by ddeval ↑)"
+        else f"Pocket data_id (from table, sorted by {sort_label})"
     )
     if args.four_metrics:
         if y_mode == "raw":

@@ -1588,6 +1588,50 @@ def _prudent_reconstruct_mol(
         return None
 
 
+def _prudent_canonical_smiles(
+    cand_or_mol=None,
+    *,
+    pos=None,
+    v=None,
+    ligand_atom_mode=None,
+    scaffold_bonds=None,
+    n_scaffold=None,
+    logger=None,
+    context='',
+):
+    """Return canonical SMILES for a candidate dict / Mol / (pos,v), or None."""
+    mol = None
+    if cand_or_mol is not None and hasattr(cand_or_mol, 'GetNumAtoms'):
+        mol = cand_or_mol
+    elif isinstance(cand_or_mol, dict):
+        cached = cand_or_mol.get('smiles') or cand_or_mol.get('canonical_smiles')
+        if cached and isinstance(cached, str) and cached not in ('', 'None', 'nan'):
+            try:
+                m2 = Chem.MolFromSmiles(cached)
+                if m2 is not None:
+                    return Chem.MolToSmiles(m2)
+            except Exception:
+                pass
+        pos = cand_or_mol.get('pos', pos)
+        v = cand_or_mol.get('v', v)
+        scaffold_bonds = cand_or_mol.get('scaffold_bond_pairs', scaffold_bonds)
+        n_scaffold = cand_or_mol.get('n_scaffold', n_scaffold)
+    if mol is None:
+        if pos is None or v is None or ligand_atom_mode is None:
+            return None
+        mol = _prudent_reconstruct_mol(
+            np.asarray(pos), np.asarray(v), ligand_atom_mode,
+            logger=logger, context=context or 'canonical_smiles',
+            scaffold_bonds=scaffold_bonds, n_scaffold=n_scaffold,
+        )
+    if mol is None:
+        return None
+    try:
+        return Chem.MolToSmiles(mol)
+    except Exception:
+        return None
+
+
 def _prudent_score_one_round(
     pool,
     *,
@@ -1744,7 +1788,8 @@ def _prudent_score_one_round(
         row = chem_by_ci.get(ci)
         if row is None:
             continue
-        _ci, _c, mol, qed, sa, _chem_err = row
+        # chem_round 行格式: (ci, c, mol, qed, sa, logp, chem_err)
+        _ci, _c, mol, qed, sa = row[0], row[1], row[2], row[3], row[4]
         if _prudent_eligible_for_advance(
             mol, qed, sa, detail, prudent_cfg, vina_advance_thr,
         ):
@@ -3938,7 +3983,8 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
 
     total_candidates = []  # 存储所有候选。
     range_offset = 0  # 范围模式的原子偏移。
-    time_records = {'large_step': [], 'refine': []}  # 记录各阶段耗时。
+    time_records = {'large_step': [], 'refine': [], 'baseline_refine': []}  # 记录各阶段耗时。
+    largestep_smiles_list = []  # 实验3：largestep 完成时强制重建的 SMILES（不中断采样）
     
     profiler.checkpoint('before_large_step')
 
@@ -4373,6 +4419,30 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
     if logger:
         logger.info(f'[Dynamic] Large-step completed | Total candidates: {len(total_candidates)}')
 
+    # 实验3：largestep 完成后强制重建分子并记录 SMILES，不中断后续 refine/baseline_refine
+    if dynamic_cfg.get('capture_largestep_smiles', False):
+        for cand in total_candidates:
+            pos_final = cand['pos']
+            v_final = cand['v']
+            smi = None
+            try:
+                v_tensor = torch.tensor(v_final, dtype=torch.long)
+                atom_numbers = trans.get_atomic_number_from_index(v_tensor, mode=ligand_atom_mode)
+                aromatic_flags = trans.is_aromatic_from_index(v_tensor, mode=ligand_atom_mode)
+                mol = reconstruct.reconstruct_from_generated(
+                    pos_final, atom_numbers, aromatic_flags,
+                    basic_mode=(str(ligand_atom_mode) == 'basic'),
+                )
+                if mol is not None:
+                    smi = Chem.MolToSmiles(mol)
+            except Exception as exc:
+                if logger:
+                    logger.warning(f'[Ablation] largestep SMILES capture failed: {exc}')
+            largestep_smiles_list.append(smi)
+        if logger:
+            n_ok = sum(1 for s in largestep_smiles_list if s)
+            logger.info(f'[Ablation] Captured largestep SMILES: {n_ok}/{len(largestep_smiles_list)}')
+
     # 读取时间节点配置
     time_boundary = get_time_boundary(dynamic_cfg, 750)  # time_boundary用于划分large_step和refine
     enable_selection = selector_cfg.get('enable_selection', False)
@@ -4630,9 +4700,11 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
     # TargetDiff 基准扩散修复（可选）；optimization.enable 且将随后优化时延后在优化后执行
     meta_baseline_refine_ti = None
     if not skip_targetdiff_baseline_refine:
+        _br_t0 = time.time()
         refine_out = apply_targetdiff_baseline_refinement(
             model, data, refined_pos_list, refined_v_list, config, device=device, logger=logger
         )
+        time_records['baseline_refine'].append(time.time() - _br_t0)  # 记录 10 步修复 GPU 耗时
         if len(refine_out) == 5:
             refined_pos_list, refined_v_list, refine_pos_traj_add, refine_v_traj_add, refine_time_indices = refine_out
             refined_pos_traj = [list(pt) + list(rpt) for pt, rpt in zip(refined_pos_traj, refine_pos_traj_add)]
@@ -4651,10 +4723,14 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
             'max_grad_fusion_iterations', large_cfg.get('max_gradient_steps')
         ),
     }
+    if dynamic_cfg.get('capture_largestep_smiles', False) and largestep_smiles_list:
+        meta_dict['largestep_smiles'] = largestep_smiles_list  # 实验3 专表用
     if meta_baseline_refine_ti is not None:
         meta_dict['baseline_refine_time_indices'] = meta_baseline_refine_ti
     # Flatten time records to match baseline expectation
-    time_list = time_records['large_step'] + time_records['refine']  # 合并耗时记录。
+    time_list = (
+        time_records['large_step'] + time_records['refine'] + time_records['baseline_refine']
+    )  # 合并耗时记录（含 10 步修复）。
 
     return {
         'pos_list': refined_pos_list,
@@ -7894,8 +7970,11 @@ def scaffold_prudent_molecule(
     # ---- Gate params for target-driven Gen0 accumulation ----
     _size_gates = _prudent_parse_size_gates(prudent_cfg)
     _hard_gate = bool(_size_gates)
-    _max_gen0_attempts = num_samples * 200 if _hard_gate else num_samples  # 最多尝试 num_samples*200 次
+    # 允许 gate 失败 / SMILES 去重后同槽位补采（含无 hard_gate 时的唯一 SMILES 重试）
+    _max_gen0_attempts = num_samples * 200
     _gen0_attempt = 0
+    _gen0_seen_smiles = set()
+    _gen0_dedup_reject = 0
     _slot_retry = 0
 
     while True:
@@ -8108,14 +8187,15 @@ def scaffold_prudent_molecule(
         )
 
         # ---- Gate check: 仅当 _hard_gate 时在 Gen0 就过滤，保证最终输出全是 gate-passing 分子 ----
+        gen0_mol = None
         if _hard_gate:
-            mol = _prudent_reconstruct_mol(
+            gen0_mol = _prudent_reconstruct_mol(
                 pos_np, v_np, ligand_atom_mode,
                 logger=logger, context=f'SPg0a{_gen0_attempt}',
                 scaffold_bonds=scaffold_bond_pairs, n_scaffold=n_scaffold,
             )
-            qed, sa, logp, chem_err = _prudent_chem_scores(mol, logger=logger)
-            gate_ok, reasons = _prudent_size_gate_ok(mol, qed, sa, logp, prudent_cfg, gates=_size_gates)
+            qed, sa, logp, chem_err = _prudent_chem_scores(gen0_mol, logger=logger)
+            gate_ok, reasons = _prudent_size_gate_ok(gen0_mol, qed, sa, logp, prudent_cfg, gates=_size_gates)
 
             if not gate_ok:
                 if logger and (_gen0_attempt <= 5 or _gen0_attempt % 50 == 0):
@@ -8137,6 +8217,34 @@ def scaffold_prudent_molecule(
                 _slot_retry += 1
                 continue  # 丢弃此分子，同槽位补足（RNG 已偏移）
 
+        # Canonical SMILES 去重：池中已有相同结构则同槽位重采
+        gen0_smi = _prudent_canonical_smiles(
+            gen0_mol if gen0_mol is not None else None,
+            pos=pos_np, v=v_np, ligand_atom_mode=ligand_atom_mode,
+            scaffold_bonds=scaffold_bond_pairs, n_scaffold=n_scaffold,
+            logger=None, context=f'SPg0dedup{_gen0_attempt}',
+        )
+        if gen0_smi is None:
+            gen0_smi = metric_info.get('smiles')
+            if gen0_smi:
+                try:
+                    m_tmp = Chem.MolFromSmiles(str(gen0_smi))
+                    gen0_smi = Chem.MolToSmiles(m_tmp) if m_tmp is not None else None
+                except Exception:
+                    gen0_smi = None
+        if gen0_smi and gen0_smi in _gen0_seen_smiles:
+            _gen0_dedup_reject += 1
+            if logger and (_gen0_dedup_reject <= 5 or _gen0_dedup_reject % 50 == 0):
+                logger.info(
+                    f'[ScaffoldPrudent] Gen0 SMILES-dedup-reject #{_gen0_dedup_reject} '
+                    f'(sample_idx={sample_idx} slot_retry={_slot_retry}) smi={gen0_smi[:80]} '
+                    f'| pool={len(pool)}/{num_samples}'
+                )
+            _slot_retry += 1
+            continue
+        if gen0_smi:
+            _gen0_seen_smiles.add(gen0_smi)
+
         pool.append({
             'pos': pos_np,
             'v': v_np,
@@ -8148,6 +8256,7 @@ def scaffold_prudent_molecule(
             'n_locked': n_locked,
             'preserved_atom_indices': list(preserved_indices),
             'scaffold_bond_pairs': scaffold_bond_pairs,
+            'smiles': gen0_smi,
             'pos_traj': [],
             'v_traj': [],
             'log_v_traj': [],
@@ -8168,7 +8277,7 @@ def scaffold_prudent_molecule(
             'n_scaffold_bonds': len(scaffold_bond_pairs),
             'scaffold_rmsd': scaffold_rmsd,
             'time': t_end_wall - t_start_wall,
-            'smiles': metric_info.get('smiles'),
+            'smiles': gen0_smi or metric_info.get('smiles'),
             'qed': metric_info.get('metrics', {}).get('qed'),
             'sa': metric_info.get('metrics', {}).get('sa'),
             'status': metric_info.get('status'),
@@ -8184,12 +8293,14 @@ def scaffold_prudent_molecule(
             logger.info(
                 f'[ScaffoldPrudent] Gen 0 完成: {len(pool)}/{num_samples} gate-passing 分子 | '
                 f'共 {_gen0_attempt} 次生成尝试 | 有效分子 {valid_gen0} | '
+                f'SMILES-dedup-reject={_gen0_dedup_reject} n_unique_smiles={len(_gen0_seen_smiles)} | '
                 f'耗时 {total_time:.2f}s | '
                 f'通过率 {len(pool)/max(1,_gen0_attempt)*100:.1f}%'
             )
         else:
             logger.info(
                 f'[ScaffoldPrudent] Gen 0 完成: {valid_gen0}/{num_samples} 有效分子 | '
+                f'SMILES-dedup-reject={_gen0_dedup_reject} n_unique_smiles={len(_gen0_seen_smiles)} | '
                 f'耗时 {total_time:.2f}s'
             )
 
@@ -8220,6 +8331,11 @@ def scaffold_prudent_molecule(
                 n_scaffold=int(c.get('n_scaffold', n_scaffold)),
             )
             qed, sa, logp, chem_err = _prudent_chem_scores(mol, logger=logger)
+            if mol is not None and not c.get('smiles'):
+                try:
+                    c['smiles'] = Chem.MolToSmiles(mol)
+                except Exception:
+                    pass
 
             gate_ok = (
                 mol is not None
@@ -8475,23 +8591,57 @@ def scaffold_prudent_molecule(
         detail = c.get('prudent_score_detail', {})
         return not detail.get('vina_skipped', False)
 
-    final_pool = [c for c in pool if _pool_gate_ok(c)]
+    def _comp_key(c):
+        d = c.get('prudent_score_detail') or {}
+        q = d.get('qed', 0.0) or 0.0
+        s = d.get('sa', 0.0) or 0.0
+        v = d.get('vina_norm', 0.0) or 0.0
+        return float(q) + float(s) + float(v)
+
+    gated = [c for c in pool if _pool_gate_ok(c)]
+    # 按 canonical SMILES 去重：同结构保留 composite 更高者
+    _final_dedup_reject = 0
+    _best_by_smi = {}
+    _no_smi = []
+    for c in gated:
+        smi = _prudent_canonical_smiles(
+            c, ligand_atom_mode=ligand_atom_mode,
+            scaffold_bonds=c.get('scaffold_bond_pairs', scaffold_bond_pairs),
+            n_scaffold=int(c.get('n_scaffold', n_scaffold)),
+            logger=None, context='final_pool_dedup',
+        )
+        if smi:
+            c['smiles'] = smi
+            prev = _best_by_smi.get(smi)
+            if prev is None:
+                _best_by_smi[smi] = c
+            else:
+                _final_dedup_reject += 1
+                if _comp_key(c) > _comp_key(prev):
+                    _best_by_smi[smi] = c
+        else:
+            _no_smi.append(c)
+    final_pool = list(_best_by_smi.values()) + _no_smi
+    if logger and _final_dedup_reject:
+        logger.info(
+            f'[ScaffoldPrudent] final_pool SMILES 去重: gated={len(gated)} → '
+            f'unique={len(_best_by_smi)} (+{len(_no_smi)} no-smiles) '
+            f'dedup_reject={_final_dedup_reject}'
+        )
     if len(final_pool) > target_n:
-        def _comp_key(c):
-            d = c.get('prudent_score_detail') or {}
-            # composite may be stored indirectly; fall back to qed+sa
-            q = d.get('qed', 0.0) or 0.0
-            s = d.get('sa', 0.0) or 0.0
-            v = d.get('vina_norm', 0.0) or 0.0
-            return float(q) + float(s) + float(v)
         final_pool = sorted(final_pool, key=_comp_key, reverse=True)[:target_n]
         if logger:
             logger.info(
-                f'[ScaffoldPrudent] final pool {len(pool)} > target_n={target_n}，按分数截断为 {len(final_pool)}'
+                f'[ScaffoldPrudent] final pool 去重后仍 > target_n={target_n}，按分数截断为 {len(final_pool)}'
             )
 
     fill_attempt = 0
     fill_slot_retry = 0
+    _fill_dedup_reject = 0
+    _final_seen_smiles = {
+        c.get('smiles') for c in final_pool
+        if c.get('smiles')
+    }
     while len(final_pool) < target_n and fill_attempt < max_final_fill_attempts:
         need = target_n - len(final_pool)
         sample_idx = len(final_pool)
@@ -8536,12 +8686,32 @@ def scaffold_prudent_molecule(
                     )
                 fill_slot_retry += 1
                 continue
+        else:
+            mol = None
+        fill_smi = _prudent_canonical_smiles(
+            mol if mol is not None else cand,
+            ligand_atom_mode=ligand_atom_mode,
+            scaffold_bonds=scaffold_bond_pairs, n_scaffold=n_scaffold,
+            logger=None, context=f'SPfill_dedup{fill_attempt}',
+        )
+        if fill_smi and fill_smi in _final_seen_smiles:
+            _fill_dedup_reject += 1
+            if logger and (_fill_dedup_reject <= 5 or _fill_dedup_reject % 50 == 0):
+                logger.info(
+                    f'[ScaffoldPrudent] final_fill SMILES-dedup-reject #{_fill_dedup_reject} '
+                    f'smi={fill_smi[:80]} | pool={len(final_pool)}/{target_n}'
+                )
+            fill_slot_retry += 1
+            continue
         # strip helper-only keys
         cand.pop('site_place_meta', None)
         cand.pop('metric_info', None)
         cand.pop('zero_allocation_site_ids', None)
         cand['from_final_fill'] = True
         cand['fill_attempt'] = fill_attempt
+        if fill_smi:
+            cand['smiles'] = fill_smi
+            _final_seen_smiles.add(fill_smi)
         final_pool.append(cand)
         fill_slot_retry = 0
         if logger and len(final_pool) % 10 == 0:
@@ -8552,13 +8722,17 @@ def scaffold_prudent_molecule(
     if len(final_pool) < target_n and logger:
         logger.warning(
             f'[ScaffoldPrudent] final_fill 结束仍不足: {len(final_pool)}/{target_n} '
-            f'(attempts={fill_attempt}/{max_final_fill_attempts})'
+            f'(attempts={fill_attempt}/{max_final_fill_attempts} '
+            f'fill_dedup_reject={_fill_dedup_reject})'
         )
     pool = final_pool
     n_final_pool = len(pool)
+    _n_unique_final = len({c.get('smiles') for c in pool if c.get('smiles')})
     if logger:
         logger.info(
-            f'[ScaffoldPrudent] 最后一轮最终分子数 n_final_pool={n_final_pool} (target_n={target_n})'
+            f'[ScaffoldPrudent] 最后一轮最终分子数 n_final_pool={n_final_pool} '
+            f'(target_n={target_n}, n_unique_smiles={_n_unique_final}, '
+            f'final_dedup_reject={_final_dedup_reject}, fill_dedup_reject={_fill_dedup_reject})'
         )
 
     # ---- 输出最终分子池（含所有累积分子 + 最终 pool）----------------------

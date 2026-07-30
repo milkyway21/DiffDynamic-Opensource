@@ -1,0 +1,112 @@
+# 6W63 scaffold dynamic_locked gen1000
+# num_samples=1000
+
+
+
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  use_grad_fusion: true
+  grad_fusion_lambda:
+    mode: quadratic
+    start: 1
+    end: 0
+    power: 2
+
+sample:
+  seed: 42
+  mode: dynamic
+  num_steps: 1000
+  sample_num_atoms: prior
+  center_pos_mode: protein
+  pos_only: false
+
+  dynamic:
+    method: legacy
+    time_boundary: 650
+    skip_refine: true
+    large_step:
+      batch_size: 5
+      n_repeat: 1
+      schedule: lambda
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      linear_step_lower: 15
+      linear_step_upper: 15
+      step_size: 0.33
+      stride: 15
+      noise_scale: 0.1
+      use_adaptive_step: true
+      use_time_scale: false
+    refine:
+      n_sampling: 1
+      cycles: 1
+      schedule: lambda
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      linear_step_lower: 3
+      linear_step_upper: 8
+      step_size: 0.47
+      stride: 5
+      time_lower: 0
+      noise_scale: 0.05
+      use_adaptive_step: true
+      use_time_scale: false
+      max_grad_fusion_iterations: 15
+
+  targetdiff_baseline_refine:
+    enable: true
+    start_t: 9
+    # 骨架+零分配保留侧链：类型与坐标都锁死（refine 后硬还原）
+    lock_prefix: types_and_pos
+    after_scaffold_init_only: false
+    # 1000 分子时必须分批，否则 baseline refine OOM
+    refine_batch_size: 10
+
+  scaffold:
+    enable: true
+    mode: dynamic_locked
+    scaffold_source: auto_murcko
+    fix_scaffold_pos: true
+    fix_scaffold_type: true
+    num_samples: 1000
+
+    murcko_sites:
+      p_active: 0.5
+      max_per_site: 20
+      min_per_site: 0
+      per_site_count_mode: sequential_random
+      per_site_add_mode: fragment_prior
+      fragment_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 20]
+      fragment_weights: [0.08, 0.06, 0.05, 0.05, 0.05, 0.14, 0.07, 0.06, 0.05, 0.10, 0.10, 0.10, 0.04, 0.03, 0.01, 0.005, 0.005]
+      jitter_std: 1.0
+      jitter_mode: gaussian
+      radial_step: 0.25
+      radial_bulk: 0.35
+      radial_bulk_start: 4
+      max_active_sites: n_removed_sidechains
+      prefer_murcko_sites: true
+      save_json: true
+      overflow_mode: cap
+      dedup_dist: 0.5
+      include_exit_vectors: false
+      preserve_zero_allocation_sidechains: true
+
+    # 按任务原始参考配体自适应门控（默认开；配体路径由 --ligand_path 注入）
+    adaptive_gates:
+      enable: true
+      actives: /data/ye/protein-ligand/6W63/active_dock_qed_sa.csv
+
+
+    grow:
+      seed: 42
+      n_extra_mode: ligand_size_normal_minus_scaffold
+      ligand_size_mean: 40
+      ligand_size_std: 5.0
+      ligand_size_min: 34
+      ligand_size_max: 60
+      n_extra_min_clamp: 6
+      n_extra_max_clamp: 45
+      min_qed: 0.0
+      min_sa: 0.0
+      filter_incomplete: false

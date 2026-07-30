@@ -17,7 +17,6 @@ server/server_config.json
 data/
 outputs/
 experiments/
-pretrained_models/
 docktmp/
 configs/prop/
 configs/backups/
@@ -26,10 +25,13 @@ configs/backups/
 *.lmdb
 *.lmdb-lock
 
-# Model weights
+# Model weights (allow-list pretrained only)
 *.pt
 *.pth
 *.ckpt
+!pretrained_models/
+!pretrained_models/pretrained_diffusion.pt
+!pretrained_models/pretrained_GlintDM.pt
 
 # Logs
 *.log

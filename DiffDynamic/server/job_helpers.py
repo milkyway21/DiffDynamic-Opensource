@@ -183,13 +183,13 @@ def parse_pocket_scores_from_csv(
 def store_pocket_evaluations(run_id: int, scores: dict):
     """Persist 8-dimension pocket scores to evaluations table."""
     dim_map = {
-        "score_a": "vina_docking",
+        "score_a": "vina_docking",       # Aff+LE
         "score_b": "clustering",
-        "score_c": "ligand_efficiency",
-        "score_d": "drug_likeness",
+        "score_c": "drug_likeness",
+        "score_d": "diversity",          # uniqueness
         "score_e": "completeness",
-        "score_f": "diversity",
-        "score_g": "size_consistency",
+        "score_f": "pocket_chemistry",
+        "score_g": "anchor_richness",
         "score_h": "pocket_volume",
     }
     for key, label in dim_map.items():

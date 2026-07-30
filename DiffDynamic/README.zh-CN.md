@@ -231,13 +231,11 @@ sample:
 
 ## 数据说明
 
-以下数据不包含在 Git 仓库中：
-
 | 目录 | 大小 | 说明 |
 |------|------|------|
-| `data/` | ~68MB | 测试集蛋白口袋数据（CrossDocked 子集） |
-| `outputs/` | 运行时生成 | 分子生成结果和评估输出 |
-| `pretrained_models/` | ~64MB | 预训练模型权重 |
+| `pretrained_models/` | ~64MB | **已包含在仓库中**：`pretrained_diffusion.pt`（默认采样）与 `pretrained_GlintDM.pt` |
+| `data/` | ~68MB | **不在仓库中**：测试集蛋白口袋数据（CrossDocked 子集），需自行准备 |
+| `outputs/` | 运行时生成 | **不在仓库中**：分子生成结果和评估输出 |
 
 ## 致谢
 

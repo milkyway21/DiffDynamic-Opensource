@@ -35,7 +35,6 @@ DiffDynamic/server/server_config.json
 # Large data files (download separately)
 DiffDynamic/data/
 DiffDynamic/outputs/
-DiffDynamic/pretrained_models/
 DiffDynamic/docktmp/
 DiffDynamic/configs/prop/
 DiffDynamic/configs/backups/
@@ -44,10 +43,13 @@ DiffDynamic/configs/backups/
 *.lmdb
 *.lmdb-lock
 
-# Model weights and checkpoints
+# Model weights and checkpoints (allow-list pretrained only)
 *.pt
 *.pth
 *.ckpt
+!DiffDynamic/pretrained_models/
+!DiffDynamic/pretrained_models/pretrained_diffusion.pt
+!DiffDynamic/pretrained_models/pretrained_GlintDM.pt
 
 # SDF molecule files
 *.sdf
@@ -78,6 +80,7 @@ DiffDynamic/pics/
 DiffDynamic/fig7/
 DiffDynamic/pocket_quality_vis/
 DiffDynamic/jsdpt3010/
+DiffDynamic/jsdpt3010_*/
 DiffDynamic/molecules_score_*/
 DiffDynamic/tmp/
 DiffDynamic/third_party/

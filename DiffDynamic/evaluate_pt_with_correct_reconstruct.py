@@ -67,6 +67,10 @@ REPO_ROOT = Path(__file__).parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Optional RDKit topology repair after reconstruct (see sample.rdkit_structure_repair).
+# Set via --rdkit-structure-repair CLI; default None keeps paper baselines unchanged.
+_RDKIT_STRUCTURE_REPAIR_CFG = None
+
 # 定义对接临时目录
 DOCK_TMP_DIR = Path(REPO_ROOT) / 'docktmp'
 # 确保目录存在
@@ -772,7 +776,7 @@ def remove_small_fragments(mol, debug=False):
     return largest
 
 
-def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False):
+def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_structure_repair=None):
     """
     使用正确的reconstruct方法重建单个分子
     
@@ -781,12 +785,16 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False):
         v: 原子类型索引 (N,) 或 (N, num_classes)
         atom_mode: 原子编码模式 ('basic' 或 'add_aromatic')
         debug: 是否打印调试信息
+        rdkit_structure_repair: optional dict for sample.rdkit_structure_repair;
+            if None, uses module-level ``_RDKIT_STRUCTURE_REPAIR_CFG`` (set by CLI).
         
     Returns:
         tuple: (mol, error_info)
         - mol: RDKit分子对象或None
         - error_info: dict包含错误类型和错误信息，成功时为None
     """
+    if rdkit_structure_repair is None:
+        rdkit_structure_repair = _RDKIT_STRUCTURE_REPAIR_CFG
     error_info = None
     try:
         # 转换为numpy
@@ -828,7 +836,8 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False):
             pos_array.tolist(),  # 转换为列表格式，确保与 reconstruct.py 一致
             atom_numbers,        # 原子序数列表（从 get_atomic_number_from_index 返回）
             aromatic_flags,      # 芳香性标记列表或 None（从 is_aromatic_from_index 返回）
-            basic_mode=(atom_mode == 'basic')  # basic 模式时设为 True，add_aromatic 模式时设为 False
+            basic_mode=(atom_mode == 'basic'),  # basic 模式时设为 True，add_aromatic 模式时设为 False
+            rdkit_structure_repair=rdkit_structure_repair,
         )
         
         if mol is None:
@@ -1392,7 +1401,14 @@ def _evaluate_single_molecule_worker(args_tuple):
         pre_docking_use_uff_fallback = args_tuple[13] if len(args_tuple) > 13 else True
         pre_docking_etkdg_reembed = args_tuple[14] if len(args_tuple) > 14 else False
         vina_modes_tuple = args_tuple[15] if len(args_tuple) > 15 else None
-        vina_modes_eff = frozenset(vina_modes_tuple) if vina_modes_tuple else _DEFAULT_VINA_MODES
+        # ``None`` means the legacy default, while an empty tuple is the explicit
+        # ``--vina-modes none`` sentinel.  Do not collapse both values by truthiness:
+        # the isolated worker must preserve the caller's no-Vina request.
+        vina_modes_eff = (
+            _DEFAULT_VINA_MODES
+            if vina_modes_tuple is None
+            else frozenset(vina_modes_tuple)
+        )
         (mol_pickle_path, ligand_filename, protein_root, exhaustiveness, n_poses,
          size_factor, buffer, tmp_dir, mol_idx, debug) = args_tuple[:10]
         
@@ -3423,7 +3439,8 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                 n_reconstruct_fail=n_reconstruct_fail,
                 n_eval_success=n_eval_success,
                 failure_stats=failure_stats,
-                ref_vina_score=ref_vina_score
+                ref_vina_score=ref_vina_score,
+                vina_modes=_vina_modes
             )
             # 8.1 记录完整分子到专用Excel（分初次生成、优化后两个表）
             record_complete_molecules_to_excel(
@@ -3556,7 +3573,8 @@ def record_evaluation_results_to_excel(results, output_dir, pt_file, ligand_file
                                       num_samples=None, n_reconstruct_success=None,
                                       n_reconstruct_fail=None, n_eval_success=None,
                                       failure_stats=None, meta_records=None, pt_mode=None,
-                                      sampling_meta=None, ref_vina_score=None):
+                                      sampling_meta=None, ref_vina_score=None,
+                                      vina_modes=None):
     """
     将评估结果记录到Excel表格中（与原来的dock_generated_molecules.py格式一致）
     
@@ -3575,6 +3593,8 @@ def record_evaluation_results_to_excel(results, output_dir, pt_file, ligand_file
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
     excel_file = os.path.join(output_dir, f'evaluation_results_{timestamp}.xlsx')
+    # vina_modes 为空集（none）时，不要求 Vina 结果，仅凭重建成功即可记录
+    _vina_optional = (vina_modes is not None and len(frozenset(vina_modes)) == 0)
     only_dynamic = (pt_mode == 'dynamic_then_optimization' and meta_records)
     # dynamic_then_scaffold + save_dynamic_before_scaffold：只写「dynamic 原始」行（is_dynamic_raw）
     sm = sampling_meta if isinstance(sampling_meta, dict) else {}
@@ -3619,6 +3639,14 @@ def record_evaluation_results_to_excel(results, output_dir, pt_file, ligand_file
             continue
         # 跳过重建失败的分子（mol为None）
         if result.get('mol') is None:
+            continue
+        # vina_modes=none 时跳过 Vina 校验，仅记录重建成功的分子
+        if _vina_optional:
+            record = _build_evaluation_record(result, pt_file, ligand_filename, atom_mode, exhaustiveness)
+            if idx < 3:
+                lilly_raw = result.get('lilly_medchem_passed', None)
+                print(f"    [Excel记录调试] 分子{idx+1}: lilly_medchem_passed={lilly_raw} -> {record.get('Lilly_Medchem_通过')}")
+            records.append(record)
             continue
         # 只记录对接成功的分子（至少有一种vina模式成功）
         if not result.get('success'):
@@ -5091,8 +5119,30 @@ def main():
         action='store_true',
         help='不生成键长/原子对距离等聚合分布图（bond_length_hist.png、pair_dist_hist.png）',
     )
+    parser.add_argument(
+        '--rdkit-structure-repair',
+        action='store_true',
+        help='重建后启用确定性 RDKit 结构修复（rdkit-structure-repair；默认关闭）',
+    )
+    parser.add_argument(
+        '--rdkit-structure-repair-config',
+        type=str,
+        default='rdkit-structure-repair/configs/conservative.yaml',
+        help='rdkit-structure-repair YAML 配置路径（相对 DiffDynamic 根目录）',
+    )
     
     args = parser.parse_args()
+
+    global _RDKIT_STRUCTURE_REPAIR_CFG
+    if args.rdkit_structure_repair:
+        _RDKIT_STRUCTURE_REPAIR_CFG = {
+            'enable': True,
+            'config': args.rdkit_structure_repair_config,
+            'on_reject': 'keep_original',
+        }
+        print(f"RDKit structure repair: ON ({args.rdkit_structure_repair_config})")
+    else:
+        _RDKIT_STRUCTURE_REPAIR_CFG = None
 
     try:
         vina_modes_cli = parse_vina_modes_arg(args.vina_modes)
