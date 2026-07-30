@@ -32,20 +32,22 @@ diffdynamic.db
 diffdynamic.db-shm
 diffdynamic.db-wal
 
-# Large data / weights / outputs (download or generate separately)
+# Large data / outputs (download or generate separately)
 data/
 outputs/
-pretrained_models/
 docktmp/
 experiments/
 third_party/
 tmp/
 backups/
 
-# Model weights and checkpoints
+# Model weights and checkpoints (allow-list pretrained only)
 *.pt
 *.pth
 *.ckpt
+!pretrained_models/
+!pretrained_models/pretrained_diffusion.pt
+!pretrained_models/pretrained_GlintDM.pt
 
 # Molecule / table artifacts
 *.sdf
