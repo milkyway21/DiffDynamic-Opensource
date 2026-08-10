@@ -363,7 +363,12 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 profile,
             )
             _write_yaml(config, variant_config)
-            jobs.append((gpu, variant, variant_root, variant_config, next_job_id))
+            jobs.append(
+                (
+                    gpu, variant, variant_root, variant_config,
+                    next_job_id, use_profile,
+                )
+            )
             next_job_id += 1
             run_counts[name] = run_counts.get(name, 0) + 1
 
@@ -373,7 +378,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "run_counts": run_counts,
             "last_schedule": [
                 {"gpu": gpu, "variant": variant[0], "job_id": job_id}
-                for gpu, variant, _, _, job_id in jobs
+                for gpu, variant, _, _, job_id, _ in jobs
             ],
         }
         root.mkdir(parents=True, exist_ok=True)
@@ -391,7 +396,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                     variant_root=variant_root,
                     config_path=variant_config,
                     profile_path=profile_path,
-                    use_profile=use_profile,
+                    use_profile=job_use_profile,
                     gpu=gpu,
                     job_id=job_id,
                     base_seed=args.start_seed,
@@ -400,7 +405,10 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                     native_ligand=native_ligand,
                     deadline=deadline,
                 )
-                for gpu, _, variant_root, variant_config, job_id in jobs
+                for (
+                    gpu, _, variant_root, variant_config, job_id,
+                    job_use_profile,
+                ) in jobs
             ]
             for future in as_completed(futures):
                 results.append(future.result())
