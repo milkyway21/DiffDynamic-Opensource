@@ -70,6 +70,10 @@ VARIANTS = (
     # template, one real Murcko exit, old size prior, and baseline refine.
     ("native_tbr_legacy_020", "native_template", 0.20, 0.25, False, True,
      "prior_minus_scaffold", "legacy"),
+    # Independent replicate of the best control; it uses a distinct job
+    # namespace and seed while keeping the same scaffold-only configuration.
+    ("native_tbr_legacy_020_replica", "native_template", 0.20, 0.25,
+     False, True, "prior_minus_scaffold", "legacy"),
 )
 
 
@@ -297,6 +301,29 @@ def _choose_variants(
         key=lambda item: _variant_score(variant_summaries.get(item[0], {})),
         reverse=True,
     )
+    legacy_family = tuple(
+        item for item in VARIANTS
+        if item[0] in {
+            "native_tbr_legacy_020",
+            "native_tbr_legacy_020_replica",
+        }
+    )
+    if ranked[0][0] in {item[0] for item in legacy_family} and len(legacy_family) > 1:
+        chosen = [ranked[0]]
+        legacy_by_run = sorted(
+            legacy_family,
+            key=lambda item: run_counts.get(item[0], 0),
+        )
+        for item in legacy_by_run:
+            if item not in chosen:
+                chosen.append(item)
+                break
+        for item in ranked:
+            if item not in chosen:
+                chosen.append(item)
+            if len(chosen) == 3:
+                break
+        return chosen
     unseen = [item for item in VARIANTS if item[0] not in variant_summaries]
     if unseen:
         chosen = [ranked[0], unseen[0]]
