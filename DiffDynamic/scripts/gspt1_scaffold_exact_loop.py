@@ -44,12 +44,24 @@ SCAFFOLD_SMARTS = "O=C1CCC(N2Cc3ccccc3C2=O)C(=O)N1"
 VARIANTS = (
     # Keep the native target-side spatial template fixed while leaving atom
     # classes and bonds to the diffusion model.
-    ("native_fixed_100", "native_template", 1.00, 0.10),
-    ("native_anchor_075", "native_template", 0.75, 0.15),
-    ("native_anchor_050", "native_template", 0.50, 0.20),
-    ("native_anchor_020", "native_template", 0.20, 0.25),
-    ("hybrid_anchor_035", "hybrid", 0.35, 0.25),
-    ("directional_anchor_020", "directional", 0.20, 0.25),
+    # name, jitter_mode, anchor_strength, jitter_std, profile, baseline,
+    # n_extra_mode, site_selection_mode
+    ("native_fixed_100", "native_template", 1.00, 0.10, True, False,
+     "reference_size_prior", "weighted_single"),
+    ("native_anchor_075", "native_template", 0.75, 0.15, True, False,
+     "reference_size_prior", "weighted_single"),
+    ("native_anchor_050", "native_template", 0.50, 0.20, True, False,
+     "reference_size_prior", "weighted_single"),
+    ("native_anchor_020", "native_template", 0.20, 0.25, True, False,
+     "reference_size_prior", "weighted_single"),
+    ("hybrid_anchor_035", "hybrid", 0.35, 0.25, True, False,
+     "reference_size_prior", "weighted_single"),
+    ("directional_anchor_020", "directional", 0.20, 0.25, True, False,
+     "reference_size_prior", "weighted_single"),
+    # Reproduces the useful pre-profile pilot geometry: native target-side
+    # template, one real Murcko exit, old size prior, and baseline refine.
+    ("native_tbr_legacy_020", "native_template", 0.20, 0.25, False, True,
+     "prior_minus_scaffold", "legacy"),
 )
 
 
@@ -78,33 +90,46 @@ def _variant_config(
     jitter_mode: str,
     anchor_strength: float,
     jitter_std: float,
+    use_profile: bool,
+    enable_baseline: bool,
+    n_extra_mode: str,
+    site_selection_mode: str,
     profile: dict[str, Any],
 ) -> dict[str, Any]:
     config = copy.deepcopy(base)
     scaffold = config.setdefault("sample", {}).setdefault("scaffold", {})
     sites = scaffold.setdefault("murcko_sites", {})
-    sites["reference_exit_profile"] = str(profile_path)
-    sites["site_selection_mode"] = "weighted_single"
+    sites["reference_exit_profile"] = str(profile_path) if use_profile else None
+    if site_selection_mode == "legacy":
+        sites.pop("site_selection_mode", None)
+    else:
+        sites["site_selection_mode"] = site_selection_mode
     sites["site_budget_mode"] = "requested"
     sites["jitter_mode"] = jitter_mode
     sites["jitter_std"] = jitter_std
     scaffold.setdefault("grow", {})["extra_anchor_strength"] = anchor_strength
-    # The baseline TargetDiff pass is unconstrained for extra atoms and would
-    # undo the target-side spatial prior after scaffold sampling.  It is
-    # disabled only in these scaffold campaign configs; denovo configs are
-    # untouched.
+    # The profile variants disable TargetDiff baseline because it is
+    # unconstrained for extra atoms and can undo the target-side spatial
+    # prior.  The legacy control explicitly keeps it enabled for comparison.
     baseline_refine = config.setdefault("sample", {}).setdefault(
         "targetdiff_baseline_refine", {}
     )
-    baseline_refine["enable"] = False
+    baseline_refine["enable"] = enable_baseline
     grow = scaffold["grow"]
-    grow["n_extra_mode"] = "reference_size_prior"
-    grow["reference_size_values"] = list(profile["n_extra_values"])
-    grow["reference_size_weights"] = list(profile["n_extra_weights"])
-    grow["n_extra_min_clamp"] = min(profile["n_extra_values"])
-    grow["n_extra_max_clamp"] = max(profile["n_extra_values"])
-    grow["n_extra_min"] = min(profile["n_extra_values"])
-    grow["n_extra_max"] = max(profile["n_extra_values"])
+    grow["n_extra_mode"] = n_extra_mode
+    if n_extra_mode in ("reference_size_prior", "reference_n_extra_prior"):
+        grow["reference_size_values"] = list(profile["n_extra_values"])
+        grow["reference_size_weights"] = list(profile["n_extra_weights"])
+        grow["n_extra_min_clamp"] = min(profile["n_extra_values"])
+        grow["n_extra_max_clamp"] = max(profile["n_extra_values"])
+        grow["n_extra_min"] = min(profile["n_extra_values"])
+        grow["n_extra_max"] = max(profile["n_extra_values"])
+    else:
+        grow["n_extra_fixed"] = 8
+        grow["n_extra_min"] = 10
+        grow["n_extra_max"] = 22
+        grow["n_extra_min_clamp"] = 10
+        grow["n_extra_max_clamp"] = 22
     return config
 
 
@@ -299,7 +324,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
         if args.max_rounds and round_index >= args.max_rounds:
             break
         variant_summaries = {}
-        for name, _, _, _ in VARIANTS:
+        for name, _, _, _, _, _, _, _ in VARIANTS:
             variant_root = root / "rounds" / name
             summary_path = variant_root / "audit" / "summary.json"
             if summary_path.exists():
@@ -313,7 +338,11 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
         selected = _choose_variants(variant_summaries, run_counts, round_index)
         jobs = []
         for gpu, variant in zip(args.gpus, selected):
-            name, jitter_mode, anchor_strength, jitter_std = variant
+            (
+                name, jitter_mode, anchor_strength, jitter_std,
+                use_profile, enable_baseline, n_extra_mode,
+                site_selection_mode,
+            ) = variant
             variant_root = root / "rounds" / name / f"run_{round_index:04d}"
             variant_config = variant_root / "config.yml"
             config = _variant_config(
@@ -322,6 +351,10 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 jitter_mode,
                 anchor_strength,
                 jitter_std,
+                use_profile,
+                enable_baseline,
+                n_extra_mode,
+                site_selection_mode,
                 profile,
             )
             _write_yaml(config, variant_config)
@@ -378,7 +411,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
         campaign_summary = audit(
             [root], reference_sdf, audit_dir, scaffold_atoms=18, top_n=500
         )
-        for name, _, _, _ in VARIANTS:
+        for name, _, _, _, _, _, _, _ in VARIANTS:
             variant_root = root / "rounds" / name
             if variant_root.exists():
                 audit(
