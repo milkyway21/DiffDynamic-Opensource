@@ -439,6 +439,13 @@ def _transfer_template_geometry(
     if source_positions.ndim != 2 or source_positions.shape[1] != 3:
         return None
 
+    # Connected-component traversal is not guaranteed to start at the atom
+    # bonded to the scaffold.  Use the closest target-side atom as the
+    # attachment end and emit it first, so the transferred cloud preserves a
+    # chemically sensible exit direction for native_template placement.
+    source_distances = np.linalg.norm(source_positions - source_anchor, axis=1)
+    attachment_order = np.argsort(source_distances, kind='stable')
+    source_positions = source_positions[attachment_order]
     source_direction = source_positions[0] - source_anchor
     target_direction = (
         np.asarray(target_site.get('centroid_pos'), dtype=np.float64)
