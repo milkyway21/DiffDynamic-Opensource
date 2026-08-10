@@ -45,6 +45,9 @@ def test_profile_contains_only_coarse_exit_and_size_priors(tmp_path):
     loaded = load_scaffold_profile(output)
     assert loaded["n_scaffold"] == 18
     assert loaded["exit_site_weights"] == profile["exit_site_weights"]
+    assert loaded["reference_extra_element_counts"]["N"] == 32
+    assert loaded["reference_extra_element_counts"]["S"] == 6
+    assert loaded["reference_extra_aromatic_element_counts"]["C|1"] == 104
 
 
 @pytest.mark.skipif(

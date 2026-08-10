@@ -66,6 +66,10 @@ VARIANTS = (
     # isolates size selection from the legacy pocket-size control.
     ("profile_size_tbr_020", "native_template", 0.20, 0.25, True, True,
      "reference_size_prior", "weighted_single"),
+    # Weak chemistry marginal ablation: aggregate reference element/aromatic
+    # counts initialize extra atom classes without exposing any graph detail.
+    ("profile_type_prior_020", "native_template", 0.20, 0.25, True, True,
+     "prior_minus_scaffold", "weighted_single"),
     # Ablation: keep the native single exit geometry, but use the reference
     # heavy-atom count prior and the same baseline refine.
     ("native_size_baseline_020", "native_template", 0.20, 0.25, False, True,
@@ -119,6 +123,7 @@ def _variant_config(
     n_extra_mode: str,
     site_selection_mode: str,
     profile: dict[str, Any],
+    extra_type_prior_strength: float = 0.0,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base)
     scaffold = config.setdefault("sample", {}).setdefault("scaffold", {})
@@ -134,6 +139,9 @@ def _variant_config(
             # atoms across exits before concentration erased the weights.
             sites["per_site_count_mode"] = "split"
     sites["site_budget_mode"] = "requested"
+    sites["reference_extra_type_prior_strength"] = float(
+        extra_type_prior_strength
+    )
     sites["jitter_mode"] = jitter_mode
     sites["jitter_std"] = jitter_std
     scaffold.setdefault("grow", {})["extra_anchor_strength"] = anchor_strength
@@ -202,6 +210,8 @@ def _write_manifest(
         "reference_profile": profile,
         "anti_cheating": {
             "reference_target_side_atoms_passed_to_model": False,
+            "aggregate_reference_target_side_element_counts_used_as_prior": True,
+            "aggregate_reference_target_side_element_prior_strength": 0.35,
             "reference_target_side_bonds_passed_to_model": False,
             "reference_target_side_coordinates_passed_to_model": False,
             "native_target_side_coordinates_used_as_spatial_prior": True,
@@ -426,6 +436,9 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 n_extra_mode,
                 site_selection_mode,
                 profile,
+                extra_type_prior_strength={
+                    "profile_type_prior_020": 0.35,
+                }.get(name, 0.0),
             )
             _write_yaml(config, variant_config)
             jobs.append(

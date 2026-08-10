@@ -51,6 +51,7 @@ from models.molopt_score_model import (  # 导入模型及辅助函数。
 )  # ensure_log_ligand：prudent 前向加噪时与 refine 输入一致。
 from utils.evaluation import atom_num, scoring_func  # 导入原子数量采样与化学评分函数。
 import utils.reconstruct as reconstruct  # 导入分子重建工具。
+from utils.gspt1_scaffold_prior import load_scaffold_profile
 from utils.monitor import GPUMonitor, MemoryProfiler  # 导入GPU监控工具。
 from utils.gpu_monitor_recorder import log_gpu_monitor_record  # 导入GPU监控记录器。
 from utils.sampling_recorder import extract_sampling_params, log_sampling_record  # 导入采样记录工具。
@@ -74,6 +75,82 @@ def _murcko_placement_cfg(grow_cfg: dict, sites_cfg: dict) -> dict:
             if k in grow_cfg:
                 cfg[k] = grow_cfg[k]
     return cfg
+
+
+def _reference_extra_type_log_prior(
+    sites_cfg: dict,
+    ligand_atom_mode: str,
+    n_classes: int,
+    device,
+    logger=None,
+):
+    """Build a weak aggregate extra-atom class prior for scaffold sampling.
+
+    Only aggregate element/aromatic counts are used.  No reference atom
+    ordering, bonds, coordinates, or target-side fragment is exposed to the
+    diffusion model.  A zero strength keeps the historical uniform prior.
+    """
+    strength = float(
+        sites_cfg.get('reference_extra_type_prior_strength', 0.0) or 0.0
+    )
+    profile_path = sites_cfg.get('reference_exit_profile')
+    if strength <= 0.0 or not profile_path:
+        return None
+    try:
+        profile = load_scaffold_profile(profile_path)
+    except Exception as exc:
+        if logger:
+            logger.warning(f'[ScaffoldTypes] aggregate prior unavailable: {exc}')
+        return None
+
+    strength = min(max(strength, 0.0), 1.0)
+    element_counts = profile.get('reference_extra_element_counts') or {}
+    aromatic_counts = (
+        profile.get('reference_extra_aromatic_element_counts') or {}
+    )
+    class_counts = np.full(int(n_classes), 0.25, dtype=np.float64)
+    if ligand_atom_mode == 'add_aromatic':
+        periodic_table = Chem.GetPeriodicTable()
+        for (atomic_number, aromatic), class_idx in (
+            trans.MAP_ATOM_TYPE_AROMATIC_TO_INDEX.items()
+        ):
+            class_idx = int(class_idx)
+            if class_idx >= int(n_classes):
+                continue
+            symbol = periodic_table.GetElementSymbol(int(atomic_number))
+            key = f'{symbol}|{int(bool(aromatic))}'
+            class_counts[class_idx] += float(aromatic_counts.get(key, 0.0))
+    elif ligand_atom_mode == 'basic':
+        periodic_table = Chem.GetPeriodicTable()
+        for atomic_number, class_idx in (
+            trans.MAP_ATOM_TYPE_ONLY_TO_INDEX.items()
+        ):
+            class_idx = int(class_idx)
+            if class_idx >= int(n_classes):
+                continue
+            symbol = periodic_table.GetElementSymbol(int(atomic_number))
+            class_counts[class_idx] += float(element_counts.get(symbol, 0.0))
+    else:
+        return None
+
+    # Extra atoms represent heavy atoms; leave H with a small legal mass so
+    # the existing post-processing rule remains a last-resort guard only.
+    if class_counts.size > 0:
+        class_counts[0] = min(class_counts[0], 0.25)
+    prior = class_counts / max(float(class_counts.sum()), 1e-12)
+    uniform = np.full(int(n_classes), 1.0 / max(int(n_classes), 1))
+    mixed = (1.0 - strength) * uniform + strength * prior
+    log_prior = torch.tensor(
+        np.log(np.clip(mixed, 1e-8, 1.0)),
+        dtype=torch.float32,
+        device=device,
+    )
+    if logger:
+        logger.info(
+            f'[ScaffoldTypes] aggregate reference class prior enabled: '
+            f'strength={strength:.2f} mode={ligand_atom_mode}'
+        )
+    return log_prior
 
 
 def _resolve_init_preserved_atoms(
@@ -7358,6 +7435,22 @@ def scaffold_dynamic_locked_molecule(
     log_mode_is_log_prob = (getattr(model, 'ligand_v_input', 'onehot') == 'log_prob')
 
     extra_anchor_strength = float(grow_cfg.get('extra_anchor_strength', 0.0))
+    extra_type_log_prior = _reference_extra_type_log_prior(
+        _murcko_sites_cfg,
+        ligand_atom_mode,
+        model.num_classes,
+        device,
+        logger=logger,
+    )
+
+    def _extra_log_v_init(count: int):
+        if count <= 0:
+            return torch.zeros(0, model.num_classes, device=device)
+        if extra_type_log_prior is not None:
+            return extra_type_log_prior.unsqueeze(0).expand(count, -1)
+        return F.log_softmax(
+            torch.zeros(count, model.num_classes, device=device), dim=-1
+        )
 
     # ---- 逐样本循环（batch_size=1，处理可变 n_extra）-----------------------
     for sample_idx in range(num_samples):
@@ -7418,9 +7511,7 @@ def scaffold_dynamic_locked_molecule(
                 log_ref_v[scaffold_indices] if n_scaffold > 0
                 else torch.zeros(0, model.num_classes, device=device)
             )
-            extra_log_v = F.log_softmax(
-                torch.zeros(n_extra, model.num_classes, device=device), dim=-1
-            ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+            extra_log_v = _extra_log_v_init(n_extra)
             init_ligand_v_input = torch.cat(
                 [scaffold_log_part, preserved_log_v, extra_log_v], dim=0
             )
@@ -7450,9 +7541,7 @@ def scaffold_dynamic_locked_molecule(
                 log_ref_v[scaffold_indices] if n_scaffold > 0
                 else torch.zeros(0, model.num_classes, device=device)
             )
-            extra_log_v_pad = F.log_softmax(
-                torch.zeros(n_extra, model.num_classes, device=device), dim=-1
-            ) if n_extra > 0 else torch.zeros(0, model.num_classes, device=device)
+            extra_log_v_pad = _extra_log_v_init(n_extra)
             x0_log_v_ref = torch.cat(
                 [scaffold_log_v, preserved_log_v, extra_log_v_pad], dim=0
             )

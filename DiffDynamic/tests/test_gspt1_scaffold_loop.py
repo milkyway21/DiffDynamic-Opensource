@@ -58,3 +58,21 @@ def test_legacy_site_mode_preserves_sequential_allocation():
     sites = config["sample"]["scaffold"]["murcko_sites"]
     assert "site_selection_mode" not in sites
     assert sites["per_site_count_mode"] == "sequential_random"
+
+
+def test_aggregate_type_prior_is_opt_in_on_scaffold_sites():
+    config = _variant_config(
+        _base_config(),
+        Path("profile.json"),
+        "native_template",
+        0.2,
+        0.25,
+        True,
+        True,
+        "prior_minus_scaffold",
+        "weighted_single",
+        _profile(),
+        extra_type_prior_strength=0.35,
+    )
+    sites = config["sample"]["scaffold"]["murcko_sites"]
+    assert sites["reference_extra_type_prior_strength"] == 0.35

@@ -1,8 +1,9 @@
 """Reference-derived priors for GSPT1 scaffold generation.
 
 The profile intentionally contains only coarse information: scaffold-local
-exit frequencies and extra-heavy-atom counts.  It never stores a reference
-target-side fragment, atom type, bond, coordinate, or SMILES.
+exit frequencies, extra-heavy-atom counts, and optional aggregate element
+counts.  It never stores a reference target-side fragment, atom order, bond,
+coordinate, or SMILES.
 """
 
 from __future__ import annotations
@@ -141,6 +142,34 @@ def _reference_exit_counts(
     return exits, max(int(n_extra), 0)
 
 
+def _reference_extra_element_counts(
+    mol: Chem.Mol,
+    scaffold_smarts: str,
+) -> tuple[Counter[str], Counter[str]]:
+    """Return aggregate target-side element/aromatic counts only.
+
+    The result is deliberately not keyed by atom index or connected
+    component.  It is suitable for a weak class-marginal initialization
+    ablation, but cannot reconstruct a target-side graph.
+    """
+    pattern = Chem.MolFromSmarts(scaffold_smarts)
+    if pattern is None:
+        return Counter(), Counter()
+    matches = mol.GetSubstructMatches(pattern, uniquify=True)
+    if not matches:
+        return Counter(), Counter()
+    scaffold_set = set(int(i) for i in matches[0])
+    elements: Counter[str] = Counter()
+    aromatic: Counter[str] = Counter()
+    for atom_idx, atom in enumerate(mol.GetAtoms()):
+        if atom_idx in scaffold_set or atom.GetAtomicNum() <= 1:
+            continue
+        symbol = atom.GetSymbol()
+        elements[symbol] += 1
+        aromatic[f'{symbol}|{int(atom.GetIsAromatic())}'] += 1
+    return elements, aromatic
+
+
 def build_scaffold_profile(
     reference_sdf: str | Path,
     native_ligand_sdf: str | Path,
@@ -160,6 +189,8 @@ def build_scaffold_profile(
 
     exit_counts: Counter[int] = Counter()
     size_counts: Counter[int] = Counter()
+    element_counts: Counter[str] = Counter()
+    aromatic_element_counts: Counter[str] = Counter()
     matched = 0
     unmatched: list[int] = []
     total = 0
@@ -174,6 +205,11 @@ def build_scaffold_profile(
         matched += 1
         exit_counts.update(counts)
         size_counts[n_extra] += 1
+        elements, aromatic = _reference_extra_element_counts(
+            mol, scaffold_smarts,
+        )
+        element_counts.update(elements)
+        aromatic_element_counts.update(aromatic)
 
     all_slots = sorted(exit_counts)
     weights = {
@@ -191,6 +227,10 @@ def build_scaffold_profile(
         "exit_site_weights": weights,
         "n_extra_values": [int(k) for k in sorted(size_counts)],
         "n_extra_weights": [int(size_counts[k]) for k in sorted(size_counts)],
+        "reference_extra_element_counts": dict(element_counts),
+        "reference_extra_aromatic_element_counts": dict(
+            aromatic_element_counts
+        ),
         "exploration_floor": float(exploration_floor),
     }
 
@@ -213,12 +253,24 @@ def load_scaffold_profile(path: str | Path) -> dict[str, Any]:
     size_weights = [float(v) for v in payload.get("n_extra_weights", [])]
     if len(values) != len(size_weights) or not values:
         values, size_weights = [], []
+    element_counts = {
+        str(symbol): max(float(count), 0.0)
+        for symbol, count in (payload.get("reference_extra_element_counts") or {}).items()
+    }
+    aromatic_counts = {
+        str(key): max(float(count), 0.0)
+        for key, count in (
+            payload.get("reference_extra_aromatic_element_counts") or {}
+        ).items()
+    }
     return {
         "profile_version": PROFILE_VERSION,
         "n_scaffold": n_scaffold,
         "exit_site_weights": clean_weights,
         "n_extra_values": values,
         "n_extra_weights": size_weights,
+        "reference_extra_element_counts": element_counts,
+        "reference_extra_aromatic_element_counts": aromatic_counts,
         "matched_reference_records": int(
             payload.get("matched_reference_records", 0)
         ),
