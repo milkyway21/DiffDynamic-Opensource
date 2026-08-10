@@ -1,0 +1,61 @@
+# T4 —— 理化性质微调
+#
+# 目标窗口对齐 Lipinski Ro5 与 Veber（RotB ≤ 10、TPSA ≤ 140）。
+# 这一层的变换幅度小，主要靠奖励函数里的 QED / TPSA 项拉动。
+
+tier: T4
+description: 理化性质微调（溶解度、pKa、配体效率）
+
+transforms:
+
+  # ---------- 增溶 ----------
+  - id: T4_ARYL_HALIDE_TO_MORPHOLINE
+    name: 芳卤 → 吗啉
+    smarts: "[c:1][F,Cl,Br,I]>>[c:1]N1CCOCC1"
+    delta_heavy: 5
+    cost: 3.0
+    rationale: 吗啉是最常用的增溶尾基，兼顾溶解度与低碱性
+
+  - id: T4_ARYL_HALIDE_TO_METHYLPIPERAZINE
+    name: 芳卤 → N-甲基哌嗪
+    smarts: "[c:1][F,Cl,Br,I]>>[c:1]N1CCN(C)CC1"
+    delta_heavy: 6
+    cost: 3.0
+    rationale: 引入可成盐碱性中心，大幅提升水溶性
+
+  - id: T4_ARYL_HALIDE_TO_SULFONAMIDE
+    name: 芳卤 → 甲磺酰胺
+    smarts: "[c:1][F,Cl,Br,I]>>[c:1][NH]S(=O)(=O)C"
+    delta_heavy: 4
+    cost: 3.0
+    rationale: 提高 TPSA 与氢键能力，磺酰胺代谢稳定
+
+  # ---------- 亲和力微调 ----------
+  - id: T4_MAGIC_METHYL
+    name: 芳环 CH → CH3（magic methyl）
+    smarts: "[cH:1]>>[c:1]C"
+    delta_heavy: 1
+    cost: 2.0
+    rationale: 邻位甲基锁定二面角，经典的数量级效力提升手段
+
+  - id: T4_ALIPHATIC_CH_TO_CF
+    name: 脂肪链 CH2 邻位加氟调 pKa
+    smarts: "[NX3:1][CH2;!R:2][#6:3]>>[N:1][CH:2](F)[#6:3]"
+    delta_heavy: 1
+    cost: 2.5
+    rationale: β-氟显著降低胺的碱性，改善膜透性与 hERG
+
+  # ---------- 降分子量 / 提配体效率 ----------
+  - id: T4_TRUNCATE_TERMINAL_ETHYL
+    name: 末端乙基 → 甲基
+    smarts: "[#6:1][CH2][CH3]>>[#6:1][CH3]"
+    delta_heavy: -1
+    cost: 1.5
+    rationale: 切掉无贡献的疏水尾，降 MW 与 logP，提升配体效率
+
+  - id: T4_TRUNCATE_TERMINAL_PROPYL
+    name: 末端丙基 → 甲基
+    smarts: "[#6:1][CH2][CH2][CH3]>>[#6:1][CH3]"
+    delta_heavy: -2
+    cost: 1.5
+    rationale: 长烷基尾往往只增亲脂性不增亲和力，截断提升 LE

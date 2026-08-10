@@ -1,0 +1,33 @@
+# T2 —— 构象锁定 / 成环（含开环后长链固定）
+
+tier: T2
+description: 构象锁定与成环
+
+transforms:
+  - id: T2_ETHYLENE_TO_ETHER
+    name: CH2CH2 → OCH2 醚锁定
+    smarts: "[#6:1][CH2;!R:2][CH2;!R:3][#6:4]>>[#6:1][O:2][CH2:3][#6:4]"
+    delta_heavy: 0
+    cost: 1.0
+    rationale: 长链加 O 降 RotB、加 HBA（用户点名的固定手段）
+
+  - id: T2_HYDROXYALKYL_TO_THF
+    name: 1,4-羟基烷基 → 四氢呋喃
+    smarts: "[#6:1][CH2:2][CH2:3][CH2:4][OH:5]>>[#6:1]1[CH2:2][CH2:3][CH2:4][O:5]1"
+    delta_heavy: 0
+    cost: 2.0
+    rationale: 闭环锁定柔性链为 THF
+
+  - id: T2_CATECHOL_TO_BENZODIOXOLE
+    name: 邻苯二酚 → 苯并二噁茂
+    smarts: "[c:1]1[c:2]([OH])[c:3]([OH])[c:4][c:5][c:6]1>>[c:1]1[c:2]2[c:3]([c:4][c:5][c:6]1)OCO2"
+    delta_heavy: 1
+    cost: 1.5
+    rationale: 儿茶酚 PAINS / 代谢软点 → 刚性杂环
+
+  - id: T2_GEM_DIMETHYL
+    name: 亚甲基 → gem-二甲基
+    smarts: "[#6:1][CH2;!R:2][#6:3]>>[#6:1][C:2](C)(C)[#6:3]"
+    delta_heavy: 2
+    cost: 1.8
+    rationale: Thorpe–Ingold 效应压缩构象空间

@@ -1,0 +1,44 @@
+# T5 —— 合成可及性导向
+#
+# 生成模型很容易吐出高张力桥环、密集季碳与相邻手性中心，这些是 SA 评分
+# 恶化的主因。本层专门拆掉这类基序。
+
+tier: T5
+description: 合成可及性导向的结构简化
+
+transforms:
+
+  - id: T5_CYCLOPROPYL_TO_ISOPROPYL
+    name: 环丙基 → 异丙基
+    smarts: "[#6:4][CH;r3:1]1[CH2;r3:2][CH2;r3:3]1>>[#6:4][CH:1]([CH3:2])[CH3:3]"
+    delta_heavy: 0
+    cost: 2.0
+    rationale: 拆掉三元环张力，异丙基体积相近但合成简单得多
+
+  - id: T5_TBU_TO_IPR
+    name: 叔丁基 → 异丙基
+    smarts: "[#6:1][CX4:2]([CH3:3])([CH3:4])[CH3]>>[#6:1][CH:2]([CH3:3])[CH3:4]"
+    delta_heavy: -1
+    cost: 1.5
+    rationale: 降低季碳密度与亲脂性，同时降 MW
+
+  - id: T5_QUATERNARY_CARBON_DEMETHYL
+    name: 季碳去甲基
+    smarts: "[#6:1][CX4:2]([#6:3])([#6:4])[CH3]>>[#6:1][CH:2]([#6:3])[#6:4]"
+    delta_heavy: -1
+    cost: 2.0
+    rationale: 全取代季碳是合成难点，去一个甲基即可显著改善 SA
+
+  - id: T5_OPEN_STRAINED_CYCLOBUTANE
+    name: 环丁烷开环
+    smarts: "[CH2;r4:1]1[CH2;r4:2][CH2;r4:3][CH2;r4:4]1>>[CH3:1][CH2:2][CH2:3][CH3:4]"
+    delta_heavy: 0
+    cost: 3.0
+    rationale: 四元环张力大且合成困难，开环换取合成可及性
+
+  - id: T5_GEM_DIFLUORO_TO_CH2
+    name: gem-二氟 → 亚甲基
+    smarts: "[#6:1][CX4:2](F)(F)[#6:3]>>[#6:1][CH2:2][#6:3]"
+    delta_heavy: -2
+    cost: 2.0
+    rationale: 生成模型常堆叠无意义的氟，去除可降 MW 并简化合成

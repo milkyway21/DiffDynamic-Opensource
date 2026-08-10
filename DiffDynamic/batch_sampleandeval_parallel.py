@@ -709,6 +709,21 @@ def resolve_eval_vina_modes(cli_value, *, config_path=None, pt_path=None):
     return str(raw).strip()
 
 
+def medchem_opts_from_args(args):
+    """Collect the --medchem-* passthrough switches into one dict.
+
+    Empty when the layer is off, so evaluate keeps its own defaults and the
+    command line stays identical to historical runs.
+    """
+    if not getattr(args, 'medchem_optimize', False):
+        return {}
+    return {
+        'medchem_optimize': True,
+        'medchem_optimize_config': getattr(args, 'medchem_optimize_config', None),
+        'keep_preopt_sdf': getattr(args, 'keep_preopt_sdf', None),
+    }
+
+
 def _pick_result_pt_standard_layout(base_dir: Path, pocket_id: int):
     """在目录顶层查找 result_{id}.pt 或最新的 result_{id}_*.pt。"""
     if not base_dir.is_dir():
@@ -1822,6 +1837,8 @@ def run_single_evaluation(
     eval_show_output=False, eval_save_subprocess_log=False,
     force_mmff_minimize=False, mmff_max_iters=None,
     vina_modes=None,
+    medchem_optimize=False, medchem_optimize_config=None,
+    keep_preopt_sdf=None,
 ):
     """
     执行单个评估任务
@@ -1839,6 +1856,9 @@ def run_single_evaluation(
         force_mmff_minimize: True 时向 evaluate 传入 --force-mmff-minimize（对接前 MMFF）
         mmff_max_iters: 非 None 时传入 --mmff-max-iters
         vina_modes: 传给 evaluate 的 ``--vina-modes``；None 表示不传参（evaluate 默认 dock+score_only+minimize）
+        medchem_optimize: True 时传入 --medchem-optimize，启用激进 medchem 结构优化（会改分子式，须作为独立 ablation 臂）
+        medchem_optimize_config: 非 None 时传入 --medchem-optimize-config
+        keep_preopt_sdf: 非 None 时传入 --keep-preopt-sdf（none / structure_only / evaluated）
     
     Returns:
         tuple: (success, message, eval_output_dir)
@@ -1872,6 +1892,12 @@ def run_single_evaluation(
         cmd.extend(['--mmff-max-iters', str(mmff_max_iters)])
     if vina_modes is not None and str(vina_modes).strip():
         cmd.extend(['--vina-modes', str(vina_modes).strip()])
+    if medchem_optimize:
+        cmd.append('--medchem-optimize')
+        if medchem_optimize_config:
+            cmd.extend(['--medchem-optimize-config', str(medchem_optimize_config)])
+        if keep_preopt_sdf:
+            cmd.extend(['--keep-preopt-sdf', str(keep_preopt_sdf)])
     if eval_show_output:
         print(f"[评估] [data_id={data_id}] 命令: {' '.join(cmd)}")
     
@@ -2269,12 +2295,14 @@ def process_evaluation_task(args_tuple):
     Args:
         args_tuple: (data_id, pt_file, protein_root, atom_mode, exhaustiveness, excel_file,
             batch_start_time, excel_lock, cores_per_task, save_intermediate_interval,
-            eval_show_output, eval_save_subprocess_log[, force_mmff_minimize, mmff_max_iters[, vina_modes]]）；
-            兼容10 / 12 / 14 / 15 元组（缺省则 force_mmff=False、mmff_max_iters=None、vina_modes=None）
+            eval_show_output, eval_save_subprocess_log[, force_mmff_minimize, mmff_max_iters[, vina_modes[, medchem_opts]]]）；
+            兼容10 / 12 / 14 / 15 / 16 元组（缺省则 force_mmff=False、mmff_max_iters=None、vina_modes=None、medchem_opts={}）。
+            medchem_opts 是个 dict，新开关都往里加，免得每加一个参数就多一条元组长度分支。
     
     Returns:
         tuple: (data_id, success, message, log_file, pt_file, eval_output_dir)
     """
+    medchem_opts = args_tuple[15] if len(args_tuple) >= 16 and isinstance(args_tuple[15], dict) else {}
     if len(args_tuple) >= 15:
         (data_id, pt_file, protein_root, atom_mode, exhaustiveness,
          excel_file, batch_start_time, excel_lock, cores_per_task, save_intermediate_interval,
@@ -2301,7 +2329,7 @@ def process_evaluation_task(args_tuple):
         mmff_max_iters = None
         vina_modes = None
     else:
-        raise ValueError(f"process_evaluation_task: 元组长度应为 10、12、14 或 15，实际 {len(args_tuple)}")
+        raise ValueError(f"process_evaluation_task: 元组长度应为 10、12、14、15 或 16，实际 {len(args_tuple)}")
     
     # 设置全局锁（与 excel_file 同 stem 的评估记录 CSV 写入）
     global excel_write_lock
@@ -2322,6 +2350,9 @@ def process_evaluation_task(args_tuple):
             force_mmff_minimize=force_mmff_minimize,
             mmff_max_iters=mmff_max_iters,
             vina_modes=vina_modes,
+            medchem_optimize=medchem_opts.get('medchem_optimize', False),
+            medchem_optimize_config=medchem_opts.get('medchem_optimize_config'),
+            keep_preopt_sdf=medchem_opts.get('keep_preopt_sdf'),
         )
         
         task_time = time.time() - task_start_time
@@ -4087,6 +4118,26 @@ def main():
         help='与 --molecular-repair mmff 联用时传给 evaluate 的 MMFF 最大迭代次数（不设则与 evaluate/yaml 默认一致）',
     )
     parser.add_argument(
+        '--medchem-optimize',
+        action='store_true',
+        help='透传给 evaluate 的 --medchem-optimize：重建后、理化性质与 Vina 之前做激进 medchem 结构优化。'
+             '会改变分子式，开启后生成分子不再是模型原始输出，论文里必须作为独立 ablation 臂汇报。',
+    )
+    parser.add_argument(
+        '--medchem-optimize-config',
+        type=str,
+        default=None,
+        help='透传给 evaluate 的 --medchem-optimize-config（默认用 evaluate 侧的 '
+             'rdkit-structure-repair/configs/medchem_optimize.yaml）',
+    )
+    parser.add_argument(
+        '--keep-preopt-sdf',
+        type=str,
+        choices=['none', 'structure_only', 'evaluated'],
+        default=None,
+        help='透传给 evaluate 的 --keep-preopt-sdf：优化前分子如何保留（不设则用 evaluate 默认 structure_only）',
+    )
+    parser.add_argument(
         '--collect-benchmark-pocket',
         type=int,
         default=None,
@@ -4453,6 +4504,12 @@ def main():
 
         manager_eval = Manager()
         excel_lock_eval = manager_eval.Lock()
+        _eval_medchem_opts = medchem_opts_from_args(args)
+        if _eval_medchem_opts:
+            print(
+                '提示: 已启用 medchem 结构优化 → 生成分子不再是模型原始输出，'
+                '请作为独立 ablation 臂汇报。\n'
+            )
         evaluation_tasks = []
         for pt_path in pt_files:
             data_id = extract_data_id_from_pt_filename(pt_path)
@@ -4471,6 +4528,7 @@ def main():
                 _eval_force_mmff,
                 _eval_mmff_iters,
                 _vm_pt,
+                _eval_medchem_opts,
             ))
 
         all_results = []
@@ -4587,6 +4645,7 @@ def main():
             force_mmff_minimize=args.molecular_repair == 'mmff',
             mmff_max_iters=args.mmff_max_iters if args.molecular_repair == 'mmff' else None,
             vina_modes=_vm_custom,
+            **medchem_opts_from_args(args),
         )
         all_results = [(pocket_id, sample_success, sample_msg, None, pt_file_str, eval_output_dir)]
         molecule_records, summary_stats, pocket_stats_list = collect_all_evaluation_results(all_results, batch_start_time)
@@ -4849,6 +4908,12 @@ def main():
         cores_per_task = getattr(args, 'cores_per_task', 1)
         _batch_eval_force_mmff = args.molecular_repair == 'mmff'
         _batch_eval_mmff_iters = args.mmff_max_iters if _batch_eval_force_mmff else None
+        _batch_medchem_opts = medchem_opts_from_args(args)
+        if _batch_medchem_opts:
+            print(
+                '提示: 已启用 medchem 结构优化 → 生成分子不再是模型原始输出，'
+                '请作为独立 ablation 臂汇报。\n'
+            )
         evaluation_tasks = []
         for r in sampling_success:
             data_id, success, pt_file, msg = r
@@ -4862,6 +4927,7 @@ def main():
                 _batch_eval_force_mmff,
                 _batch_eval_mmff_iters,
                 _vm_batch,
+                _batch_medchem_opts,
             ))
         
         # 对于采样失败的任务，也记录到结果中

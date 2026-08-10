@@ -22,6 +22,9 @@
   # 指定输出目录（默认: .pt 同目录下 eval_<data_id>_<CST时间戳>/）
   python extract_pt_to_sdf_excel.py path/to/result.pt --output_dir ./my_eval_out
 
+  # 激进 medchem 结构优化（默认关闭；开启后 SDF 不再是模型原始输出）
+  python extract_pt_to_sdf_excel.py path/to/result.pt --medchem-optimize --keep-preopt-sdf structure_only
+
 其余参数（如 --exhaustiveness、--force-mmff-minimize）与 evaluate_pt_with_correct_reconstruct.py 一致，可追加在命令末尾。
 """
 
@@ -130,6 +133,25 @@ def main() -> int:
         help="对接前去除小碎片，仅保留最大连通片段",
     )
     parser.add_argument(
+        "--medchem-optimize",
+        action="store_true",
+        help="重建后、理化性质与 Vina 之前做激进 medchem 结构优化（传给 evaluate）。"
+             "会改变分子式，提取出的 SDF 不再是模型原始输出。",
+    )
+    parser.add_argument(
+        "--medchem-optimize-config",
+        type=str,
+        default=None,
+        help="medchem 优化 YAML 配置路径（不设则用 evaluate 默认）",
+    )
+    parser.add_argument(
+        "--keep-preopt-sdf",
+        type=str,
+        choices=["none", "structure_only", "evaluated"],
+        default=None,
+        help="优化前分子如何保留（不设则用 evaluate 默认 structure_only）",
+    )
+    parser.add_argument(
         "extra_eval_args",
         nargs=argparse.REMAINDER,
         help="其余参数原样传给 evaluate_pt_with_correct_reconstruct.py（勿以 -- 开头时可省略 --）",
@@ -198,6 +220,12 @@ def main() -> int:
         cmd.extend(["--mmff-max-iters", str(args.mmff_max_iters)])
     if args.remove_fragments:
         cmd.append("--remove-fragments")
+    if args.medchem_optimize:
+        cmd.append("--medchem-optimize")
+        if args.medchem_optimize_config:
+            cmd.extend(["--medchem-optimize-config", str(args.medchem_optimize_config)])
+        if args.keep_preopt_sdf:
+            cmd.extend(["--keep-preopt-sdf", str(args.keep_preopt_sdf)])
 
     # REMAINDER 可能带前导的 "--"；去掉与上面已显式传入等价的重复项（避免命令行里出现两次 --protein_root）
     rest = list(args.extra_eval_args or [])

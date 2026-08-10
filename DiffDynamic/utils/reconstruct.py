@@ -255,6 +255,19 @@ def connect_the_dots(
         if a.GetExplicitValence() <= atom_maxb[a.GetIdx()]:  # 若未超价则跳过。
             continue
         binfo = get_bond_info(ob.OBAtomBondIter(a))  # 获取该原子相关键的拉伸信息。
+        # Prioritize deleting extra-extra bonds over scaffold-extra bonds:
+        # scaffold-extra bonds connect the sidechain to the scaffold and are
+        # geometrically correct (placed at 2-4 A), so they should be kept.
+        def _bond_priority(bond_item):
+            stretch, bond = bond_item
+            a1_idx = ob_to_i.get(bond.GetBeginAtom().GetIdx(), -1)
+            a2_idx = ob_to_i.get(bond.GetEndAtom().GetIdx(), -1)
+            is_scaffold_extra = (
+                (a1_idx < n_sc and a2_idx >= n_sc) or
+                (a2_idx < n_sc and a1_idx >= n_sc)
+            ) if n_sc > 0 else False
+            return (1 if is_scaffold_extra else 0, stretch)
+        binfo.sort(reverse=True, key=_bond_priority)
         for stretch, bond in binfo:
             if _is_protected_bond(bond):
                 continue
@@ -583,13 +596,28 @@ def reconstruct_from_generated(
         n_sc = max(max(i, j) for i, j, *_ in _normalize_scaffold_bonds(scaffold_bonds)) + 1
 
     connect_the_dots(
-        mol, atoms, indicators, covalent_factor=1.3,
+        mol, atoms, indicators, covalent_factor=2.0,
         protected_pairs=protected, n_scaffold=n_sc,
     )  # 根据距离连接键（骨架内参考键受保护）。
     fixup(atoms, mol, indicators)  # 再次调整原子属性确保一致。
 
     mol.AddPolarHydrogens()  # 添加极性氢。
     mol.PerceiveBondOrders()  # 让 OpenBabel 感知键级。
+    # Re-seed scaffold aromaticity after PerceiveBondOrders, which may
+    # have cleared the aromatic flags set by seed_scaffold_bonds.
+    if protected:
+        norm_bonds = _normalize_scaffold_bonds(scaffold_bonds)
+        for i, j, order, aromatic in norm_bonds:
+            if i >= len(atoms) or j >= len(atoms):
+                continue
+            a, b = atoms[i], atoms[j]
+            bond = mol.GetBond(a, b)
+            if bond is None:
+                continue
+            if aromatic:
+                a.SetAromatic(True)
+                b.SetAromatic(True)
+                bond.SetAromatic(True)
     fixup(atoms, mol, indicators)  # 再次修正芳香标记。
 
     for (i, a) in enumerate(atoms):
@@ -597,6 +625,20 @@ def reconstruct_from_generated(
     fixup(atoms, mol, indicators)  # 再次同步属性。
 
     mol.AddHydrogens()  # 添加全部氢原子。
+    # Re-seed scaffold aromaticity again after hydrogen addition.
+    if protected:
+        norm_bonds = _normalize_scaffold_bonds(scaffold_bonds)
+        for i, j, order, aromatic in norm_bonds:
+            if i >= len(atoms) or j >= len(atoms):
+                continue
+            a, b = atoms[i], atoms[j]
+            bond = mol.GetBond(a, b)
+            if bond is None:
+                continue
+            if aromatic:
+                a.SetAromatic(True)
+                b.SetAromatic(True)
+                bond.SetAromatic(True)
     fixup(atoms, mol, indicators)  # 再次修正属性。
 
     # make rings all aromatic if majority of carbons are aromatic
@@ -629,11 +671,67 @@ def reconstruct_from_generated(
         # Post-processing
         rd_mol = postprocess_rd_mol_1(rd_mol)
         rd_mol = postprocess_rd_mol_2(rd_mol, n_scaffold=n_sc)
+        rd_mol = _force_scaffold_aromaticity(rd_mol, scaffold_bonds, n_sc)
     except:
         raise MolReconsError()
 
     rd_mol = _maybe_apply_rdkit_structure_repair(rd_mol, rdkit_structure_repair)
     return rd_mol
+
+
+def _force_scaffold_aromaticity(rd_mol, scaffold_bonds, n_scaffold):
+    """Force aromaticity on scaffold bonds that were specified as aromatic.
+
+    After OpenBabel -> RDKit conversion and post-processing, aromatic flags
+    on scaffold bonds may be lost. This restores them by re-assigning bond
+    orders to match the scaffold and then letting RDKit perceive aromaticity.
+    """
+    if not scaffold_bonds or rd_mol is None:
+        return rd_mol
+    norm = _normalize_scaffold_bonds(scaffold_bonds)
+    if not norm:
+        return rd_mol
+    # Build a map of what the scaffold bonds should be
+    target_bonds = {}
+    for i, j, order, aromatic in norm:
+        key = (min(i, j), max(i, j))
+        target_bonds[key] = (order, aromatic)
+    if not target_bonds:
+        return rd_mol
+    rwmol = Chem.RWMol(rd_mol)
+    changed = False
+    for (i, j), (order, aromatic) in target_bonds.items():
+        if i >= rwmol.GetNumAtoms() or j >= rwmol.GetNumAtoms():
+            continue
+        bond = rwmol.GetBondBetweenAtoms(i, j)
+        if bond is None:
+            continue
+        # Set bond order to match scaffold
+        if aromatic:
+            target_type = Chem.BondType.AROMATIC
+        elif order == 2:
+            target_type = Chem.BondType.DOUBLE
+        elif order == 3:
+            target_type = Chem.BondType.TRIPLE
+        else:
+            target_type = Chem.BondType.SINGLE
+        if bond.GetBondType() != target_type:
+            bond.SetBondType(target_type)
+            changed = True
+        if aromatic and not bond.GetIsAromatic():
+            bond.SetIsAromatic(True)
+            changed = True
+    if not changed:
+        return rd_mol
+    result = rwmol.GetMol()
+    # Update property cache and re-derive aromaticity
+    try:
+        result.UpdatePropertyCache(strict=False)
+        Chem.SanitizeMol(result, sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_PROPERTIES)
+        Chem.SetAromaticity(result)
+        return result
+    except Exception:
+        return rd_mol
 
 
 def _maybe_apply_rdkit_structure_repair(rd_mol, repair_cfg):

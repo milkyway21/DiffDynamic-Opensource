@@ -1,0 +1,47 @@
+# T1 —— 经典 / 非经典生物电子等排
+
+tier: T1
+description: 生物电子等排替换
+
+transforms:
+  - id: T1_ESTER_TO_AMIDE
+    name: 酯 → 酰胺
+    smarts: "[C:1](=[O:2])[O:3][#6:4]>>[C:1](=[O:2])[NH:3][#6:4]"
+    delta_heavy: 0
+    cost: 1.0
+    rationale: 酯易水解，酰胺更代谢稳定
+
+  - id: T1_COOH_TO_TETRAZOLE
+    name: 羧酸 → 四氮唑
+    smarts: "[C:1](=O)[OH]>>[C:1]1=NNN=N1"
+    delta_heavy: 3
+    cost: 2.5
+    rationale: 四氮唑是羧酸最经典的酸等排体
+
+  - id: T1_PHENOL_TO_FLUORIDE
+    name: 酚 OH → F
+    smarts: "[c:1][OH]>>[c:1]F"
+    delta_heavy: 0
+    cost: 1.5
+    rationale: 阻断酚代谢氧化，保留氢键受体性的电子效应
+
+  - id: T1_CH2_TO_O
+    name: 脂肪 CH2 → O
+    smarts: "[#6:1][CH2;!R:2][#6:3]>>[#6:1][O:2][#6:3]"
+    delta_heavy: 0
+    cost: 1.2
+    rationale: 引入醚氧降 logP、加 HBA
+
+  - id: T1_S_TO_SO2
+    name: 硫醚 → 砜
+    smarts: "[#6:1][S;X2:2][#6:3]>>[#6:1][S:2](=O)(=O)[#6:3]"
+    delta_heavy: 2
+    cost: 2.0
+    rationale: 氧化态阶梯，增强极性与代谢稳定性
+
+  - id: T1_OME_TO_OCHF2
+    name: 芳甲醚 → 二氟甲醚
+    smarts: "[c:1][O:2][CH3]>>[c:1][O:2]C(F)F"
+    delta_heavy: 2
+    cost: 2.0
+    rationale: 阻断 O-脱甲基代谢

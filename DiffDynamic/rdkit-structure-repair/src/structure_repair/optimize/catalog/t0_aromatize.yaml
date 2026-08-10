@@ -1,0 +1,42 @@
+# T0 —— 芳构化策略（程序化，非 SMARTS）
+#
+# 真正的候选生成在 aromatize.py / ring_contract.py / ring_break.py；本文件只声明策略阈值。
+
+tier: T0
+description: 芳构化、中环缩成苯/杂芳、超大环拆键
+
+policy:
+  c6_carbocycle:
+    enabled: true
+    min_ring_double_bonds: 0
+    max_ring_double_bonds: 3
+    # 双键数 < 该阈值时必须有平面性证据（避免把真环己二烯压成苯）
+    require_planar_below_double_bonds: 3
+    max_ring_h_count: 10
+    cost: 1.0
+  c5_heterocycle:
+    enabled: true
+    min_ring_double_bonds: 0
+    max_ring_double_bonds: 2
+    require_planar_below_double_bonds: 2
+    max_ring_h_count: 8
+    allowed_heteroatoms: [7, 8, 16]
+    cost: 1.5
+  fused_to_aromatic_relaxation:
+    enabled: true
+    extra_ring_h_allowance: 2
+    waive_planarity: true
+
+  # ≥10 元大环：拆键开环 → 醚锁定
+  macrocycle:
+    enabled: true
+    min_size: 10
+  # 7/8 中环：优先缩成苯/吡啶等 6 元芳环；缩不成再拆开
+  medium_ring:
+    enabled: true
+    sizes: [7, 8, 9]
+    prefer_contract: true
+    prefer_break: true
+    contract_offer_aza: true
+
+transforms: []

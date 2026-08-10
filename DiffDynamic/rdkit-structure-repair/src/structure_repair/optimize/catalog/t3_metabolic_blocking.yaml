@@ -1,0 +1,96 @@
+# T3 —— 代谢软点封堵与结构警示消除
+#
+# 这一层的价值主要体现在警示子结构计数下降与 Lilly/PAINS 通过率上升，
+# 不一定反映在 QED 上，奖励函数里 w_alert 需要给足权重。
+
+tier: T3
+description: 代谢软点封堵与结构警示消除
+
+transforms:
+
+  # ---------- 结构警示：硝基 ----------
+  - id: T3_NITRO_TO_NITRILE
+    name: 芳硝基 → 氰基
+    smarts: "[c:1][NX3+](=[OX1])[OX1-]>>[c:1]C#N"
+    delta_heavy: -1
+    cost: 2.0
+    rationale: 硝基有致突变与还原代谢风险，氰基电子效应相近且干净
+
+  - id: T3_NITRO_TO_TRIFLUOROMETHYL
+    name: 芳硝基 → 三氟甲基
+    smarts: "[c:1][NX3+](=[OX1])[OX1-]>>[c:1]C(F)(F)F"
+    delta_heavy: 1
+    cost: 2.0
+    rationale: 保留强吸电子性，去除硝基还原生成芳胺的毒性通路
+
+  - id: T3_NITRO_TO_METHYLSULFONYL
+    name: 芳硝基 → 甲砜基
+    smarts: "[c:1][NX3+](=[OX1])[OX1-]>>[c:1]S(=O)(=O)C"
+    delta_heavy: 1
+    cost: 2.5
+    rationale: 吸电子与氢键受体特性相近，代谢与毒理谱明显更好
+
+  # ---------- 结构警示：芳胺、醛 ----------
+  - id: T3_ANILINE_ACYLATION
+    name: 芳伯胺 → 乙酰胺
+    smarts: "[c:1][NX3H2:2]>>[c:1][N:2]C(=O)C"
+    delta_heavy: 3
+    cost: 2.0
+    rationale: 游离芳胺经 N-羟化产生亲电中间体，酰化即可封堵
+
+  - id: T3_ALDEHYDE_TO_NITRILE
+    name: 醛 → 腈
+    smarts: "[#6:1][CX3H1]=[OX1]>>[#6:1]C#N"
+    delta_heavy: 0
+    cost: 2.0
+    rationale: 醛是高反应性亲电基团，腈保留线性与吸电子性且稳定
+
+  - id: T3_MICHAEL_ACCEPTOR_SATURATE
+    name: 迈克尔受体 → 饱和羰基
+    smarts: "[#6:1][CH:2]=[CH:3][CX3:4]=[OX1:5]>>[#6:1][CH2:2][CH2:3][C:4]=[O:5]"
+    delta_heavy: 0
+    cost: 2.0
+    rationale: 消除共价加成引起的非特异性毒性与假阳性
+
+  - id: T3_THIOUREA_TO_UREA
+    name: 硫脲 → 脲
+    smarts: "[NX3:1][CX3:2](=[SX1])[NX3:3]>>[N:1][C:2](=O)[N:3]"
+    delta_heavy: 0
+    cost: 2.0
+    rationale: 硫脲有甲状腺毒性与金属螯合杂泛性，脲是干净等排
+
+  - id: T3_EPOXIDE_OPEN
+    name: 环氧 → 邻二醇开环
+    smarts: "[CX4:1]1[OX2:2][CX4:3]1>>[C:1]([O:2])[C:3]O"
+    delta_heavy: 1
+    cost: 2.5
+    rationale: 环氧是直接的 DNA 烷化剂，开环消除警示
+
+  # ---------- 代谢软点封堵 ----------
+  - id: T3_ARYL_OME_TO_OCF3
+    name: 芳甲氧基 → 三氟甲氧基
+    smarts: "[c:1][OX2][CH3]>>[c:1]OC(F)(F)F"
+    delta_heavy: 3
+    cost: 2.0
+    rationale: 彻底阻断 CYP 介导的 O-脱甲基这一最常见首过代谢通路
+
+  - id: T3_ARYL_OME_TO_OCHF2
+    name: 芳甲氧基 → 二氟甲氧基
+    smarts: "[c:1][OX2][CH3]>>[c:1]OC(F)F"
+    delta_heavy: 2
+    cost: 2.0
+    rationale: 比 OCF3 更温和地阻断 O-脱甲基，亲脂性增加更少
+
+  - id: T3_BENZYLIC_CH2_TO_CF2
+    name: 苄位 CH2 → CF2
+    smarts: "[c:1][CH2;!R:2][#6:3]>>[c:1][C:2](F)(F)[#6:3]"
+    delta_heavy: 2
+    cost: 2.5
+    rationale: 苄位是最易羟基化的位点，双氟取代直接封死
+
+  - id: T3_BENZYLIC_CH2_TO_CHF
+    name: 苄位 CH2 → CHF
+    smarts: "[c:1][CH2;!R:2][#6:3]>>[c:1][CH:2](F)[#6:3]"
+    delta_heavy: 1
+    cost: 2.0
+    rationale: 单氟即可显著降低苄位氧化速率，体积代价最小

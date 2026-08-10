@@ -8,9 +8,40 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 from .io import mol_to_canonical_smiles
-from .models import BondEdit, RepairResult, StructureIssue
+from .models import BondEdit, OptimizeResult, RepairResult, StructureIssue
 
 PathLike = Union[str, Path]
+
+OPTIMIZE_AUDIT_FIELDS = [
+    "molecule_id",
+    "status",
+    "smiles_before",
+    "smiles_after",
+    "transform_chain",
+    "transform_tiers",
+    "n_transforms",
+    "total_reward",
+    "reward_qed",
+    "reward_sa",
+    "reward_rotb",
+    "reward_alerts",
+    "reward_tpsa",
+    "reward_le",
+    "reward_cost",
+    "reward_bonus",
+    "qed_before",
+    "qed_after",
+    "sa_before",
+    "sa_after",
+    "rotb_before",
+    "rotb_after",
+    "alerts_before",
+    "alerts_after",
+    "heavy_before",
+    "heavy_after",
+    "top_reject_reasons",
+    "reject_reason",
+]
 
 
 def result_to_audit_dict(result: RepairResult) -> Dict[str, Any]:
@@ -107,6 +138,67 @@ def write_summary_csv(path: PathLike, results: Iterable[RepairResult]) -> None:
                     "reject_reason": d["reject_reason"] or "",
                 }
             )
+
+
+def _heavy_atom_smiles(mol) -> Optional[str]:
+    """Canonical SMILES without the explicit hydrogens the 3D pipeline carries."""
+    if mol is None:
+        return None
+    try:
+        from rdkit import Chem
+
+        return mol_to_canonical_smiles(Chem.RemoveHs(Chem.Mol(mol)))
+    except Exception:  # noqa: BLE001
+        return mol_to_canonical_smiles(mol)
+
+
+def optimize_result_to_audit_dict(result: OptimizeResult) -> Dict[str, Any]:
+    before = result.properties_before or {}
+    after = result.properties_after or {}
+    breakdown = result.reward_breakdown or {}
+    top_rejects = sorted(
+        (result.rejected_counts or {}).items(), key=lambda kv: -kv[1]
+    )[:5]
+    return {
+        "molecule_id": result.molecule_id,
+        "status": result.status,
+        "smiles_before": _heavy_atom_smiles(result.original_mol),
+        "smiles_after": _heavy_atom_smiles(result.optimized_mol),
+        "transform_chain": result.transform_chain,
+        "transform_tiers": ">".join(a.tier for a in result.applied),
+        "n_transforms": len(result.applied),
+        "total_reward": result.total_reward,
+        "reward_qed": breakdown.get("qed", 0.0),
+        "reward_sa": breakdown.get("sa", 0.0),
+        "reward_rotb": breakdown.get("rotb", 0.0),
+        "reward_alerts": breakdown.get("alerts", 0.0),
+        "reward_tpsa": breakdown.get("tpsa", 0.0),
+        "reward_le": breakdown.get("le", 0.0),
+        "reward_cost": breakdown.get("cost", 0.0),
+        "reward_bonus": breakdown.get("bonus", 0.0),
+        "qed_before": round(before.get("qed", 0.0), 4),
+        "qed_after": round(after.get("qed", 0.0), 4),
+        "sa_before": round(before.get("sa", 0.0), 3),
+        "sa_after": round(after.get("sa", 0.0), 3),
+        "rotb_before": int(before.get("rotb", 0)),
+        "rotb_after": int(after.get("rotb", 0)),
+        "alerts_before": int(before.get("alerts", 0)),
+        "alerts_after": int(after.get("alerts", 0)),
+        "heavy_before": int(before.get("heavy_atoms", 0)),
+        "heavy_after": int(after.get("heavy_atoms", 0)),
+        "top_reject_reasons": ";".join(f"{k}:{v}" for k, v in top_rejects),
+        "reject_reason": result.reject_reason or "",
+    }
+
+
+def write_optimize_audit_csv(path: PathLike, results: Iterable[OptimizeResult]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=OPTIMIZE_AUDIT_FIELDS)
+        writer.writeheader()
+        for result in results:
+            writer.writerow(optimize_result_to_audit_dict(result))
 
 
 def load_audit_jsonl(path: PathLike) -> List[Dict[str, Any]]:

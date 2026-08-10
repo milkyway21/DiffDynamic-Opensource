@@ -71,6 +71,205 @@ if str(REPO_ROOT) not in sys.path:
 # Set via --rdkit-structure-repair CLI; default None keeps paper baselines unchanged.
 _RDKIT_STRUCTURE_REPAIR_CFG = None
 
+# Optional aggressive medchem optimization, applied after reconstruct + fragment
+# removal and *before* physchem / Vina, so every reported metric describes the
+# optimized molecule. Set via --medchem-optimize; default None keeps paper
+# baselines unchanged. Unlike the repair layer above, this one changes the
+# molecular formula, so runs with it enabled are a separate ablation arm.
+_MEDCHEM_OPTIMIZE_CFG = None
+_MEDCHEM_OPTIMIZE_STATE = {'loaded': False, 'fn': None, 'config': None, 'repair_config': {}}
+
+
+def _resolve_repo_path(path_str):
+    """Resolve a config path relative to the DiffDynamic root when not absolute."""
+    if not path_str:
+        return None
+    p = Path(path_str)
+    return p if p.is_absolute() else (REPO_ROOT / p)
+
+
+def _load_medchem_optimizer():
+    """Import and configure the medchem optimize engine once per process."""
+    state = _MEDCHEM_OPTIMIZE_STATE
+    if state['loaded']:
+        return state
+    state['loaded'] = True
+
+    cfg = _MEDCHEM_OPTIMIZE_CFG
+    if not cfg or not cfg.get('enable'):
+        return state
+
+    pkg_src = REPO_ROOT / 'rdkit-structure-repair' / 'src'
+    if pkg_src.is_dir() and str(pkg_src) not in sys.path:
+        sys.path.insert(0, str(pkg_src))
+    try:
+        from structure_repair.config import load_config, load_optimize_config
+        from structure_repair.optimize import optimize_molecule
+    except ImportError as exc:
+        print(f"⚠️  medchem optimize 不可用，已跳过: {exc}")
+        return state
+
+    try:
+        optimize_config = load_optimize_config(_resolve_repo_path(cfg.get('config')))
+    except Exception as exc:
+        print(f"⚠️  medchem optimize 配置读取失败，已跳过: {exc}")
+        return state
+    optimize_config['enable'] = True
+
+    repair_config = {}
+    repair_cfg_path = (_RDKIT_STRUCTURE_REPAIR_CFG or {}).get('config')
+    if repair_cfg_path:
+        try:
+            repair_config = load_config(_resolve_repo_path(repair_cfg_path))
+        except Exception:
+            repair_config = {}
+
+    # evaluate_single_molecule_isolated forks the molecule to a subprocess;
+    # without this the optimize provenance properties are lost in transit.
+    try:
+        Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+    except Exception:
+        pass
+
+    state['fn'] = optimize_molecule
+    state['config'] = optimize_config
+    state['repair_config'] = repair_config
+    return state
+
+
+def _safe_heavy_smiles(mol):
+    """Canonical SMILES without explicit hydrogens; None when unusable."""
+    if mol is None:
+        return None
+    try:
+        return Chem.MolToSmiles(Chem.RemoveHs(Chem.Mol(mol)))
+    except Exception:
+        try:
+            return Chem.MolToSmiles(mol)
+        except Exception:
+            return None
+
+
+def _evaluate_preopt_molecule(mol_preopt, mol_idx, ligand_filename, protein_root, **kwargs):
+    """Full evaluation of the pre-optimization molecule for side-by-side rows.
+
+    Only used by ``--keep-preopt-sdf evaluated``; it doubles evaluation cost
+    because it reruns docking.
+    """
+    if mol_preopt is None:
+        return None
+    try:
+        result = evaluate_single_molecule_isolated(
+            mol_preopt, ligand_filename, protein_root, mol_idx=mol_idx, **kwargs
+        )
+    except Exception:
+        return None
+    chem = result.get('chem') or {}
+    vina_dock = result.get('vina_dock') or []
+    return {
+        'smiles': result.get('smiles'),
+        'qed': chem.get('qed'),
+        'sa': chem.get('sa'),
+        'logp': result.get('logp'),
+        'lipinski': result.get('lipinski'),
+        'tpsa': result.get('tpsa'),
+        'vina_dock': vina_dock[0]['affinity'] if vina_dock else None,
+        'vina_score_only': result.get('vina_score_only'),
+        'vina_minimize': result.get('vina_minimize'),
+        'success': result.get('success'),
+        'mol': result.get('mol') or mol_preopt,
+    }
+
+
+def _write_optimize_audit(csv_path, optimize_results):
+    """Full audit trail of the medchem layer: what changed, why, what was rejected."""
+    if not optimize_results:
+        return
+    try:
+        from structure_repair.audit import write_optimize_audit_csv
+
+        write_optimize_audit_csv(csv_path, optimize_results)
+        print(f"✅ medchem 优化审计已写入: {csv_path}")
+    except Exception as exc:
+        print(f"⚠️  medchem 优化审计写入失败: {exc}")
+
+
+def _write_preopt_sdf(sdf_path, mol_preopt, molecule_id, mol_idx, eval_result):
+    """Write the pre-optimization structure alongside the optimized one.
+
+    Under ``structure_only`` this carries geometry and provenance but no
+    QED/Vina properties, which is what makes that mode free.
+    """
+    if mol_preopt is None:
+        return
+    opt_info = eval_result.get('medchem_optimize') or {}
+    preopt_eval = eval_result.get('preopt_eval') or {}
+    mol_out = preopt_eval.get('mol') or mol_preopt
+    try:
+        mol_out = Chem.Mol(mol_out)
+        mol_out.SetProp('Molecule_ID', str(molecule_id))
+        mol_out.SetProp('Molecule_Index', str(mol_idx))
+        mol_out.SetProp('Medchem_Stage', 'pre_optimization')
+        if opt_info.get('preopt_smiles'):
+            mol_out.SetProp('SMILES', opt_info['preopt_smiles'])
+        if opt_info.get('transform_chain'):
+            mol_out.SetProp('Applied_Transforms', opt_info['transform_chain'])
+        for prop, key, fmt in (
+            ('QED', 'qed', '{:.3f}'),
+            ('SA', 'sa', '{:.3f}'),
+            ('Vina_Dock', 'vina_dock', '{:.3f}'),
+            ('Vina_ScoreOnly', 'vina_score_only', '{:.3f}'),
+            ('Vina_Minimize', 'vina_minimize', '{:.3f}'),
+        ):
+            value = preopt_eval.get(key)
+            if value is not None:
+                mol_out.SetProp(prop, fmt.format(float(value)))
+        writer = Chem.SDWriter(str(sdf_path))
+        writer.write(mol_out)
+        writer.close()
+    except Exception:
+        pass
+
+
+def _apply_medchem_optimize(mol, molecule_index, protein_path=None, debug=False):
+    """Return ``(mol_to_evaluate, optimize_result)``; a no-op when disabled.
+
+    The returned molecule carries ``_dd_*`` provenance properties so downstream
+    SDF and Excel writers can report what the optimizer did. They survive the
+    fork in ``evaluate_single_molecule_isolated`` thanks to the AllProps pickle
+    setting above.
+    """
+    state = _load_medchem_optimizer()
+    if state['fn'] is None or mol is None:
+        return mol, None
+
+    try:
+        result = state['fn'](
+            mol,
+            molecule_id=str(molecule_index),
+            config=state['config'],
+            protein_path=protein_path,
+            repair_config=state['repair_config'],
+        )
+    except Exception as exc:
+        if debug:
+            print(f"  ⚠️  medchem optimize 异常（分子 {molecule_index}）: {exc}")
+        return mol, None
+
+    if not result.changed or result.optimized_mol is None:
+        return mol, result
+
+    optimized = result.optimized_mol
+    try:
+        optimized.SetProp('_dd_preopt_smiles', Chem.MolToSmiles(Chem.RemoveHs(Chem.Mol(mol))))
+        optimized.SetProp('_dd_opt_transforms', result.transform_chain)
+        optimized.SetProp('_dd_opt_reward', f"{result.total_reward:.5f}")
+    except Exception:
+        pass
+    if debug:
+        print(f"  🧪 medchem optimize: {result.transform_chain} (reward {result.total_reward:+.3f})")
+    return optimized, result
+
 # 定义对接临时目录
 DOCK_TMP_DIR = Path(REPO_ROOT) / 'docktmp'
 # 确保目录存在
@@ -753,30 +952,63 @@ def validate_pt_data(data):
     return True
 
 
-def remove_small_fragments(mol, debug=False):
-    """Remove small fragments from a molecule, keeping only the largest connected component.
+def remove_small_fragments(mol, debug=False, scaffold_substruct=None):
+    """Remove very small fragments (< min_atoms), keeping all substantial fragments.
+
+    When scaffold_substruct is provided, the scaffold-containing fragment is
+    always kept regardless of size. Other fragments are kept if they have at
+    least min_atoms heavy atoms.
 
     Args:
         mol: RDKit Mol object (may contain multiple fragments)
         debug: print debug info
+        scaffold_substruct: optional RDKit Mol; scaffold fragment always kept.
 
     Returns:
-        RDKit Mol with only the largest fragment, or None if input is invalid
+        RDKit Mol with small fragments removed, or None if input is invalid
     """
     if mol is None:
         return None
     frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=True)
     if len(frags) <= 1:
         return mol  # No fragments to remove
-    # Keep the largest fragment by atom count
-    largest = max(frags, key=lambda m: m.GetNumAtoms())
+    min_atoms = 3  # Remove fragments with fewer than 3 heavy atoms
+    kept = []
+    for f in frags:
+        keep = f.GetNumAtoms() >= min_atoms
+        if not keep and scaffold_substruct is not None:
+            if f.HasSubstructMatch(scaffold_substruct):
+                keep = True
+        if keep:
+            kept.append(f)
+    if not kept:
+        # Fallback: keep largest
+        largest = max(frags, key=lambda m: m.GetNumAtoms())
+        if debug:
+            sizes = [m.GetNumAtoms() for m in frags]
+            print(f"  Fragment removal: {len(frags)} fragments, sizes={sizes}, "
+                  f"all below min_atoms={min_atoms}, keeping largest ({largest.GetNumAtoms()} atoms)")
+        return largest
+    if len(kept) == len(frags):
+        if debug:
+            sizes = [m.GetNumAtoms() for m in frags]
+            print(f"  Fragment removal: {len(frags)} fragments, sizes={sizes}, "
+                  f"all >= {min_atoms} atoms, keeping all")
+        return mol  # Nothing removed
+    # Combine kept fragments
+    combined = kept[0]
+    for f in kept[1:]:
+        combined = Chem.CombineMols(combined, f)
     if debug:
         sizes = [m.GetNumAtoms() for m in frags]
-        print(f"  Fragment removal: {len(frags)} fragments, sizes={sizes}, keeping largest ({largest.GetNumAtoms()} atoms)")
-    return largest
+        kept_sizes = [m.GetNumAtoms() for m in kept]
+        print(f"  Fragment removal: {len(frags)} fragments, sizes={sizes}, "
+              f"kept={kept_sizes}, removed {len(frags)-len(kept)} small fragments")
+    return combined
 
 
-def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_structure_repair=None):
+def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_structure_repair=None,
+                         scaffold_bonds=None, n_scaffold=None):
     """
     使用正确的reconstruct方法重建单个分子
     
@@ -787,6 +1019,10 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_st
         debug: 是否打印调试信息
         rdkit_structure_repair: optional dict for sample.rdkit_structure_repair;
             if None, uses module-level ``_RDKIT_STRUCTURE_REPAIR_CFG`` (set by CLI).
+        scaffold_bonds: optional list of (i, j[, order[, aromatic]]) for scaffold atoms;
+            passed to reconstruct_from_generated to protect scaffold topology.
+        n_scaffold: int, number of scaffold atoms at the start of the atom list;
+            passed to reconstruct_from_generated to protect scaffold bonds.
         
     Returns:
         tuple: (mol, error_info)
@@ -837,6 +1073,8 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_st
             atom_numbers,        # 原子序数列表（从 get_atomic_number_from_index 返回）
             aromatic_flags,      # 芳香性标记列表或 None（从 is_aromatic_from_index 返回）
             basic_mode=(atom_mode == 'basic'),  # basic 模式时设为 True，add_aromatic 模式时设为 False
+            scaffold_bonds=scaffold_bonds,
+            n_scaffold=n_scaffold,
             rdkit_structure_repair=rdkit_structure_repair,
         )
         
@@ -1484,7 +1722,6 @@ def _evaluate_single_molecule_worker(args_tuple):
         
         return result
     except Exception as e:
-        import traceback
         error_trace = traceback.format_exc()
         # 返回错误结果
         return {
@@ -1925,7 +2162,7 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                      receptor_pdb=None, index_pkl=None, data_id_override=None,
                      benchmark_ligands_csv=None, reference_ligand_rel=None,
                      vina_modes=None, save_distribution_plots=True,
-                     remove_fragments=True):
+                     remove_fragments=True, keep_preopt_sdf='structure_only'):
     """
     评估整个.pt文件
     
@@ -1943,6 +2180,10 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
         reference_ligand_rel: 自定义口袋评测时，参考配体相对 ``protein_root`` 的路径（如 shoc2ligand.sdf）；与 ``--receptor_pdb`` 联用，并跳过 CSV/index 补全配体。
         vina_modes: 可选 frozenset/set，元素为 dock / score_only / minimize；None 表示三种均运行（与历史默认一致）。
         save_distribution_plots: False 时不写入 bond_length_hist.png / pair_dist_hist.png 等聚合分布图。
+        keep_preopt_sdf: 仅在 medchem 优化开启时生效，控制优化前分子如何保留：
+            ``none`` 只留优化后分子；``structure_only`` 额外写 reconstructed_molecules_preopt/
+            仅含 3D 结构（零额外计算）；``evaluated`` 优化前分子也跑一遍完整评估，
+            Excel 出双份指标可直接对照（计算成本翻倍，含 Vina）。
     
     Returns:
         dict: 包含所有评估结果和统计信息
@@ -2173,6 +2414,163 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
     meta = data.get('meta') or {}
     refined_for_pt_vina = meta.get('refined_candidates') or []
     meta_records = meta.get('records', [])
+
+    # ---- scaffold bond extraction for reconstruct_molecule ----
+    # Extract complete scaffold bonds from the reference ligand SDF + SMARTS,
+    # because data.ligand_bond_index may be incomplete (missing ring bonds).
+    scaffold_bonds_pt = None
+    n_scaffold_pt = None
+    scaffold_cfg_meta = meta.get('scaffold_cfg') or {}
+    if scaffold_cfg_meta:
+        n_scaffold_pt = scaffold_cfg_meta.get('n_scaffold_atoms')
+        scaffold_indices = scaffold_cfg_meta.get('scaffold_indices') or []
+        scaffold_smarts = scaffold_cfg_meta.get('scaffold_smarts') or ''
+        # scaffold_smarts may not be saved in meta; try config_backup
+        if not scaffold_smarts:
+            extra_info = data.get('extra_info') or {}
+            cfg_backup = extra_info.get('config_backup')
+            if cfg_backup:
+                try:
+                    if isinstance(cfg_backup, dict):
+                        sc_backup = (cfg_backup.get('sample') or {}).get('scaffold', {})
+                    else:
+                        sc_backup = {}
+                    scaffold_smarts = sc_backup.get('scaffold_smarts', '') or ''
+                except Exception:
+                    scaffold_smarts = ''
+        raw_data = data.get('data')
+        # ligand_filename gives us the path to the reference ligand SDF
+        ref_ligand_path = getattr(raw_data, 'ligand_filename', None) or ''
+        if (n_scaffold_pt and scaffold_indices and ref_ligand_path
+                and int(n_scaffold_pt) > 0):
+            try:
+                from rdkit import Chem as _Chem
+                ref_mol = None
+                # Try loading the reference ligand SDF
+                ref_path = Path(ref_ligand_path)
+                if ref_path.exists():
+                    suppl = _Chem.SDMolSupplier(str(ref_path), sanitize=False)
+                    ref_mol = suppl[0] if len(suppl) > 0 else None
+                    if ref_mol is not None:
+                        try:
+                            _Chem.SanitizeMol(ref_mol)
+                        except Exception:
+                            pass
+                # Also try with protein_root + reference_ligand_rel
+                if ref_mol is None and reference_ligand_rel and protein_root:
+                    alt_path = Path(protein_root) / reference_ligand_rel
+                    if alt_path.exists():
+                        suppl = _Chem.SDMolSupplier(str(alt_path), sanitize=False)
+                        ref_mol = suppl[0] if len(suppl) > 0 else None
+                        if ref_mol is not None:
+                            try:
+                                _Chem.SanitizeMol(ref_mol)
+                            except Exception:
+                                pass
+
+                if ref_mol is not None:
+                    # Extract scaffold bonds directly from the reference ligand:
+                    # any bond whose both endpoints are in scaffold_indices
+                    orig_to_gen = {int(orig): gen for gen, orig in enumerate(scaffold_indices)}
+                    scaffold_bonds_pt = []
+                    for bond in ref_mol.GetBonds():
+                        a, b = int(bond.GetBeginAtomIdx()), int(bond.GetEndAtomIdx())
+                        if a in orig_to_gen and b in orig_to_gen:
+                            bt_val = bond.GetBondType()
+                            arom = bond.GetIsAromatic()
+                            if arom:
+                                order = 1
+                            elif bt_val == _Chem.BondType.DOUBLE:
+                                order = 2
+                            elif bt_val == _Chem.BondType.TRIPLE:
+                                order = 3
+                            else:
+                                order = 1
+                            ga, gb = orig_to_gen[a], orig_to_gen[b]
+                            scaffold_bonds_pt.append((ga, gb, order, arom))
+
+                if scaffold_bonds_pt:
+                    print(f"  🔒 scaffold bonds from SMARTS: {len(scaffold_bonds_pt)} bonds, "
+                          f"n_scaffold={n_scaffold_pt}")
+                else:
+                    # Fallback: try from ligand_bond_index (may be incomplete)
+                    bond_index = getattr(raw_data, 'ligand_bond_index', None)
+                    bond_type = getattr(raw_data, 'ligand_bond_type', None)
+                    if (bond_index is not None and bond_type is not None):
+                        orig_to_gen = {int(orig): gen for gen, orig in enumerate(scaffold_indices)}
+                        bi = bond_index if not torch.is_tensor(bond_index) else bond_index.cpu()
+                        bt_arr = bond_type if not torch.is_tensor(bond_type) else bond_type.cpu()
+                        seen = set()
+                        scaffold_bonds_pt = []
+                        for bidx in range(bi.shape[1]):
+                            a, b = int(bi[0, bidx]), int(bi[1, bidx])
+                            if a in orig_to_gen and b in orig_to_gen:
+                                ga, gb = orig_to_gen[a], orig_to_gen[b]
+                                key = (min(ga, gb), max(ga, gb))
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                order = int(bt_arr[bidx])
+                                if order == 4:
+                                    scaffold_bonds_pt.append((ga, gb, 1, True))
+                                else:
+                                    scaffold_bonds_pt.append((ga, gb, order))
+                        if scaffold_bonds_pt:
+                            print(f"  🔒 scaffold bonds from bond_index (fallback): "
+                                  f"{len(scaffold_bonds_pt)} bonds, n_scaffold={n_scaffold_pt}")
+
+                if not scaffold_bonds_pt:
+                    n_scaffold_pt = None
+            except Exception as e:
+                print(f"  ⚠️ scaffold bond extraction failed: {e}")
+                traceback.print_exc()
+                n_scaffold_pt = None
+        else:
+            n_scaffold_pt = None
+
+    # Build scaffold substructure Mol for fragment preference
+    scaffold_substruct_mol = None
+    if n_scaffold_pt and scaffold_indices:
+        _sc_smarts = scaffold_cfg_meta.get('scaffold_smarts') or ''
+        if not _sc_smarts:
+            extra_info = data.get('extra_info') or {}
+            cfg_backup = extra_info.get('config_backup')
+            if cfg_backup:
+                try:
+                    if isinstance(cfg_backup, dict):
+                        sc_backup = (cfg_backup.get('sample') or {}).get('scaffold', {})
+                    else:
+                        sc_backup = {}
+                    _sc_smarts = sc_backup.get('scaffold_smarts', '') or ''
+                except Exception:
+                    _sc_smarts = ''
+        if _sc_smarts:
+            try:
+                scaffold_substruct_mol = Chem.MolFromSmarts(_sc_smarts)
+            except Exception:
+                scaffold_substruct_mol = None
+        # If no SMARTS, try extracting substructure from reference ligand
+        if scaffold_substruct_mol is None:
+            raw_data = data.get('data')
+            ref_ligand_path = getattr(raw_data, 'ligand_filename', None) or ''
+            ref_path = Path(ref_ligand_path)
+            if not ref_path.exists() and reference_ligand_rel and protein_root:
+                ref_path = Path(protein_root) / reference_ligand_rel
+            if ref_path.exists():
+                try:
+                    suppl = Chem.SDMolSupplier(str(ref_path), sanitize=False)
+                    ref_mol = suppl[0] if len(suppl) > 0 else None
+                    if ref_mol is not None:
+                        try:
+                            Chem.SanitizeMol(ref_mol)
+                        except Exception:
+                            pass
+                        # Use SMARTS-style match to extract scaffold as query Mol
+                        scaffold_smiles = 'O=C1CCC(N2Cc3ccccc3C2=O)C(=O)N1'
+                        scaffold_substruct_mol = Chem.MolFromSmiles(scaffold_smiles)
+                except Exception:
+                    pass
+
     opt_style = meta.get('optimization_style_naming', True)
     use_split_sdf_dirs = (
         pt_mode in ('dynamic_then_optimization', 'dynamic_then_scaffold')
@@ -2331,7 +2729,17 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
     n_reconstruct_success = 0
     n_eval_success = 0
     n_complete = 0
-    
+
+    # 激进 medchem 优化（默认关闭）的产出
+    optimize_results = []
+    n_medchem_optimized = 0
+    medchem_enabled = bool((_MEDCHEM_OPTIMIZE_CFG or {}).get('enable'))
+    preopt_sdf_dir = None
+    if medchem_enabled and save_sdf and keep_preopt_sdf != 'none':
+        preopt_sdf_dir = eval_output_dir / 'reconstructed_molecules_preopt'
+        preopt_sdf_dir.mkdir(parents=True, exist_ok=True)
+        print(f"✅ 优化前结构将保存至: {preopt_sdf_dir} (模式={keep_preopt_sdf})")
+
     # 重建失败统计
     reconstruct_failures = []  # 记录所有重建失败的详细信息
     failure_stats = {
@@ -2397,7 +2805,11 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
             
             # 3.1 重建分子
             try:
-                mol, error_info = reconstruct_molecule(pos, v, atom_mode=atom_mode, debug=debug)
+                mol, error_info = reconstruct_molecule(
+                    pos, v, atom_mode=atom_mode, debug=debug,
+                    scaffold_bonds=scaffold_bonds_pt,
+                    n_scaffold=n_scaffold_pt,
+                )
             except Exception as e:
                 # 捕获重建过程中的异常
                 error_msg = f"重建过程异常: {str(e)}"
@@ -2448,11 +2860,23 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
             # 3.1.5 Fragment removal (optional): keep only the largest connected component
             if remove_fragments:
                 mol_before = mol
-                mol = remove_small_fragments(mol, debug=debug)
+                mol = remove_small_fragments(mol, debug=debug,
+                                             scaffold_substruct=scaffold_substruct_mol)
                 if mol is None:
                     if debug:
                         print(f"  ❌ Fragment removal returned None for molecule {idx+1}, skipping")
                     continue
+
+            # 3.1.6 激进 medchem 结构优化（默认关闭）
+            # 必须在理化性质与 Vina 之前，这样报告的每一项指标描述的都是优化后的分子。
+            mol_preopt = mol
+            mol, optimize_result = _apply_medchem_optimize(
+                mol, idx, protein_path=resolved_protein_path, debug=debug
+            )
+            if optimize_result is not None:
+                optimize_results.append(optimize_result)
+                if optimize_result.changed:
+                    n_medchem_optimized += 1
 
             # 3.2 评估分子（默认同进程；可选子进程隔离）
             try:
@@ -2589,6 +3013,33 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                 
                 continue  # 继续处理下一个分子
             
+            # 3.2.5 medchem 优化的溯源信息与（可选的）优化前对照评估
+            if optimize_result is not None and optimize_result.changed:
+                eval_result['medchem_optimize'] = {
+                    'transform_chain': optimize_result.transform_chain,
+                    'transform_tiers': '>'.join(a.tier for a in optimize_result.applied),
+                    'total_reward': optimize_result.total_reward,
+                    'preopt_smiles': _safe_heavy_smiles(mol_preopt),
+                    'qed_before': optimize_result.properties_before.get('qed'),
+                    'qed_after': optimize_result.properties_after.get('qed'),
+                    'sa_before': optimize_result.properties_before.get('sa'),
+                    'sa_after': optimize_result.properties_after.get('sa'),
+                }
+                if keep_preopt_sdf == 'evaluated':
+                    eval_result['preopt_eval'] = _evaluate_preopt_molecule(
+                        mol_preopt, idx, ligand_filename, protein_root,
+                        exhaustiveness=exhaustiveness, n_poses=n_poses,
+                        size_factor=size_factor, buffer=buffer, debug=debug,
+                        tmp_dir=tmp_dir, timeout=single_eval_timeout,
+                        use_isolation=use_isolation,
+                        protein_path=resolved_protein_path,
+                        pre_docking_mmff_minimize=pre_docking_mmff_minimize,
+                        pre_docking_mmff_max_iters=pre_docking_mmff_max_iters,
+                        pre_docking_use_uff_fallback=pre_docking_use_uff_fallback,
+                        pre_docking_etkdg_reembed=pre_docking_etkdg_reembed,
+                        vina_modes=_vina_modes,
+                    )
+
             if eval_result['success']:
                 n_eval_success += 1
                 
@@ -2717,6 +3168,16 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                     
                     if debug:
                         print(f"  💾 已保存SDF: {molecule_id}.sdf")
+
+                    # 优化前结构（同名文件，便于逐一对照）
+                    if preopt_sdf_dir is not None and eval_result.get('medchem_optimize'):
+                        _write_preopt_sdf(
+                            preopt_sdf_dir / f'{molecule_id}.sdf',
+                            mol_preopt,
+                            molecule_id,
+                            idx,
+                            eval_result,
+                        )
                     
                     # 根据综合评分分类并复制文件
                     comprehensive_score = eval_result.get('comprehensive_score')
@@ -2819,6 +3280,8 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                 'lilly_medchem_passed': eval_result.get('lilly_medchem_passed'),
                 'lilly_medchem_demerit': eval_result.get('lilly_medchem_demerit'),
                 'lilly_medchem_description': eval_result.get('lilly_medchem_description'),
+                'medchem_optimize': eval_result.get('medchem_optimize'),
+                'preopt_eval': eval_result.get('preopt_eval'),
             })
             
             # 每16个分子保存一次中间结果（防止丢失太多数据）
@@ -2901,6 +3364,13 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
     print(f"重建成功: {n_reconstruct_success} ({_pct(n_reconstruct_success, num_samples):.1f}%)")
     print(f"评估成功: {n_eval_success} ({_pct(n_eval_success, num_samples):.1f}%)")
     print(f"完整分子: {n_complete} ({_pct(n_complete, num_samples):.1f}%)")
+
+    if optimize_results:
+        print(
+            f"medchem 优化: {n_medchem_optimized} / {len(optimize_results)} "
+            f"({_pct(n_medchem_optimized, len(optimize_results)):.1f}%)"
+        )
+        _write_optimize_audit(eval_output_dir / 'optimize_audit.csv', optimize_results)
     
     # 4.1 详细的分子重建成功率统计
     n_reconstruct_fail = num_samples - n_reconstruct_success
@@ -3565,7 +4035,29 @@ def _build_evaluation_record(result, pt_file, ligand_filename, atom_mode, exhaus
         for key in ['JSD_CC_2A', 'JSD_All_12A']:
             if f'原子对距离JSD_{key}' not in record:
                 record[f'原子对距离JSD_{key}'] = 'N/A'
+    _add_medchem_optimize_columns(record, result)
     return record
+
+
+def _add_medchem_optimize_columns(record, result):
+    """Append medchem provenance columns; all N/A when the layer is off."""
+    opt = result.get('medchem_optimize') or {}
+    record['优化前SMILES'] = opt.get('preopt_smiles', 'N/A') or 'N/A'
+    record['应用变换'] = opt.get('transform_chain', 'N/A') or 'N/A'
+    record['奖励增益'] = opt.get('total_reward', 'N/A')
+
+    preopt = result.get('preopt_eval') or {}
+    if preopt:
+        for column, key in (
+            ('优化前QED评分', 'qed'),
+            ('优化前SA评分', 'sa'),
+            ('优化前Vina_Dock_亲和力', 'vina_dock'),
+            ('优化前Vina_ScoreOnly_亲和力', 'vina_score_only'),
+            ('优化前Vina_Minimize_亲和力', 'vina_minimize'),
+            ('优化前Lipinski规则得分', 'lipinski'),
+        ):
+            value = preopt.get(key)
+            record[column] = 'N/A' if value is None else value
 
 
 def record_evaluation_results_to_excel(results, output_dir, pt_file, ligand_filename,
@@ -5130,6 +5622,26 @@ def main():
         default='rdkit-structure-repair/configs/conservative.yaml',
         help='rdkit-structure-repair YAML 配置路径（相对 DiffDynamic 根目录）',
     )
+    parser.add_argument(
+        '--medchem-optimize',
+        action='store_true',
+        help='重建后、理化性质与 Vina 之前，启用激进 medchem 结构优化（默认关闭）。'
+             '会改变分子式，开启后必须作为独立 ablation 臂汇报。',
+    )
+    parser.add_argument(
+        '--medchem-optimize-config',
+        type=str,
+        default='rdkit-structure-repair/configs/medchem_optimize.yaml',
+        help='medchem 优化 YAML 配置路径（相对 DiffDynamic 根目录）',
+    )
+    parser.add_argument(
+        '--keep-preopt-sdf',
+        choices=['none', 'structure_only', 'evaluated'],
+        default='structure_only',
+        help='优化前分子如何保留：none 不留；structure_only 另写 '
+             'reconstructed_molecules_preopt/ 仅含 3D 结构（零额外成本）；'
+             'evaluated 优化前分子也跑完整评估，Excel 出双份指标（成本翻倍，含 Vina）',
+    )
     
     args = parser.parse_args()
 
@@ -5143,6 +5655,18 @@ def main():
         print(f"RDKit structure repair: ON ({args.rdkit_structure_repair_config})")
     else:
         _RDKIT_STRUCTURE_REPAIR_CFG = None
+
+    global _MEDCHEM_OPTIMIZE_CFG
+    if args.medchem_optimize:
+        _MEDCHEM_OPTIMIZE_CFG = {
+            'enable': True,
+            'config': args.medchem_optimize_config,
+        }
+        print(f"Medchem optimize: ON ({args.medchem_optimize_config}), "
+              f"keep-preopt-sdf={args.keep_preopt_sdf}")
+        print("⚠️  生成分子不再是模型原始输出，请作为独立 ablation 臂汇报。")
+    else:
+        _MEDCHEM_OPTIMIZE_CFG = None
 
     try:
         vina_modes_cli = parse_vina_modes_arg(args.vina_modes)
@@ -5212,6 +5736,7 @@ def main():
         vina_modes=vina_modes_cli,
         save_distribution_plots=not args.no_distribution_plots,
         remove_fragments=args.remove_fragments,
+        keep_preopt_sdf=args.keep_preopt_sdf,
     )
     
     # 记录评估结束时间

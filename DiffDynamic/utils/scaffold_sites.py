@@ -41,7 +41,7 @@ DEFAULT_MURCKO_SITES_CFG = {
     'jitter_std': 1.0,
     'jitter_mode': 'gaussian',  # gaussian|isotropic|clustered | directional（旧：沿位点射线离散外推）
     # 多原子时沿 anchor→centroid 径向外推（Å）：r = radial_step*atom_idx + radial_bulk*max(0, count-start)
-    'radial_step': 0.25,
+    'radial_step': 1.3,
     'radial_bulk': 0.35,
     'radial_bulk_start': 4,
     # directional 模式：沿射线第 k 个原子再外推 directional_step Å
@@ -219,6 +219,7 @@ def extract_murcko_attachment_sites(
             'centroid_pos': centroid.tolist(),
             'removed_atom_indices': [int(x) for x in comp],
             'removed_atom_count': len(comp),
+            'removed_atom_positions': frag_pos.tolist(),
         })
 
     # 按质心距离去重
@@ -235,6 +236,9 @@ def extract_murcko_attachment_sites(
                         set(kept['removed_atom_indices']) | set(site['removed_atom_indices'])
                     )
                     kept['removed_atom_count'] = len(kept['removed_atom_indices'])
+                    kept_pos = kept.get('removed_atom_positions', [])
+                    site_pos = site.get('removed_atom_positions', [])
+                    kept['removed_atom_positions'] = kept_pos + site_pos
                     break
             if not dup:
                 site['site_id'] = len(merged)
@@ -360,6 +364,16 @@ def merge_attachment_and_exit_vector_sites(
     return merged
 
 
+# 骨架选择入口（Murcko 与自定义并列）；选出 indices 后位点提取路径相同
+SCAFFOLD_SOURCES_WITH_ATTACHMENT_SITES = (
+    'auto_murcko',
+    'auto_murcko_generic',
+    'smarts',
+    'custom',  # alias of smarts
+    'atom_indices',
+)
+
+
 def load_or_extract_attachment_sites(
     mol,
     scaffold_indices: List[int],
@@ -370,8 +384,9 @@ def load_or_extract_attachment_sites(
     sites_cfg: dict,
     logger=None,
 ) -> List[Dict[str, Any]]:
-    """Murcko 来源时提取/加载位点；其它 source 返回空列表。"""
-    if scaffold_source not in ('auto_murcko', 'auto_murcko_generic'):
+    """从（全分子 − 骨架索引）提取侧链自由基位点；Murcko/自定义骨架共用。"""
+    source = str(scaffold_source or '').strip().lower()
+    if source not in SCAFFOLD_SOURCES_WITH_ATTACHMENT_SITES:
         if logger:
             logger.info(
                 f'[MurckoSites] scaffold_source={scaffold_source}，跳过侧链位点提取，使用口袋随机放置'
@@ -830,23 +845,76 @@ def _gaussian_site_position(
     rng: np.random.Generator,
     atom_idx: int = 0,
     site_count: int = 1,
-    radial_step: float = 0.25,
+    radial_step: float = 1.3,
     radial_bulk: float = 0.35,
     radial_bulk_start: int = 4,
 ) -> np.ndarray:
-    """质心附近高斯云；多原子时沿 attachment 径向外推，避免贴骨架堆叠。
+    """Place extra atom from anchor along anchor->centroid direction.
 
-    r = radial_step * atom_idx + radial_bulk * max(0, site_count - radial_bulk_start)
-    pos = centroid + direction * r + N(0, jitter_std)
+    The first atom is placed at ~1.3 Å from the scaffold anchor (bonding
+    distance), then each subsequent atom extends further along the
+    attachment direction.  A small gaussian jitter is added for diversity.
+
+    r = radial_step * (atom_idx + 1) + radial_bulk * max(0, site_count - radial_bulk_start)
+    pos = anchor + direction * r + N(0, jitter_std)
     """
-    centroid = np.array(site['centroid_pos'], dtype=np.float64)
-    r = float(radial_step) * float(atom_idx) + float(radial_bulk) * max(
-        0.0, float(site_count) - float(radial_bulk_start),
+    anchor = np.array(site['anchor_pos'], dtype=np.float64)
+    r = float(radial_step) * (float(atom_idx) + 1.0) + float(radial_bulk) * max(
+        0.0, float(atom_idx) + 1.0 - float(radial_bulk_start),
     )
     direction = _attachment_direction(site)
     if direction is not None and r > 0.0:
-        centroid = centroid + direction * r
-    return centroid + rng.normal(0.0, float(jitter_std), size=3)
+        pos = anchor + direction * r
+    else:
+        pos = anchor + np.array([1.5, 0.0, 0.0])
+    return pos + rng.normal(0.0, float(jitter_std), size=3)
+
+
+def _original_site_position(
+    site: Dict[str, Any],
+    jitter_std: float,
+    rng: np.random.Generator,
+    atom_idx: int = 0,
+    site_count: int = 1,
+    radial_step: float = 1.3,
+    min_dist: float = 2.0,
+    max_dist: float = 4.0,
+) -> np.ndarray:
+    """Place extra atom using the original removed sidechain atom's 3D position.
+
+    Falls back to radial extrapolation when original positions are exhausted
+    or unavailable.
+    """
+    anchor = np.array(site['anchor_pos'], dtype=np.float64)
+    orig_positions = site.get('removed_atom_positions')
+
+    if orig_positions and atom_idx < len(orig_positions):
+        pos = np.array(orig_positions[atom_idx], dtype=np.float64)
+        dist = float(np.linalg.norm(pos - anchor))
+        if dist < 1e-6:
+            direction = np.array([1.0, 0.0, 0.0])
+        else:
+            direction = (pos - anchor) / dist
+        if dist < min_dist:
+            pos = anchor + direction * min_dist
+        elif dist > max_dist:
+            pos = anchor + direction * max_dist
+        return pos + rng.normal(0.0, float(jitter_std), size=3)
+
+    if orig_positions:
+        last = np.array(orig_positions[-1], dtype=np.float64)
+        diff = last - anchor
+        norm = float(np.linalg.norm(diff))
+        direction = diff / norm if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+        extra = atom_idx - len(orig_positions) + 1
+        pos = last + direction * float(radial_step) * float(extra)
+    else:
+        direction = _attachment_direction(site)
+        if direction is not None:
+            pos = anchor + direction * float(radial_step) * (float(atom_idx) + 1.0)
+        else:
+            pos = anchor + np.array([1.5, 0.0, 0.0])
+    return pos + rng.normal(0.0, float(jitter_std), size=3)
 
 
 def _is_gaussian_jitter(jitter_mode: str) -> bool:
@@ -1080,7 +1148,8 @@ def init_extra_positions_at_sites(
 ) -> torch.Tensor:
     """按位点分配生成世界坐标系 extra 位置 [n_extra, 3]。
 
-    gaussian（默认）：质心 + 径向偏移 + N(0, jitter_std)；多原子时略远离骨架。
+    gaussian（默认）：若有 removed_atom_positions，则使用参考 target-side 的空间
+    构象作模板并加高斯扰动；缺少模板时沿 anchor→centroid 径向外推。
     directional：沿 anchor→centroid 射线外推（旧离散方案）。
     """
     cfg = sites_cfg or {}
@@ -1094,16 +1163,18 @@ def init_extra_positions_at_sites(
     rng = rng or np.random.default_rng()
     positions = []
     use_gauss = _is_gaussian_jitter(jitter_mode)
+    orig_min_dist = float(cfg.get('original_min_dist', 2.0))
+    orig_max_dist = float(cfg.get('original_max_dist', 4.0))
     for site, cnt in zip(active_sites, counts):
         if cnt <= 0:
             continue
         for atom_i in range(cnt):
             if use_gauss:
-                positions.append(_gaussian_site_position(
+                positions.append(_original_site_position(
                     site, jitter_std, rng,
                     atom_idx=atom_i, site_count=cnt,
-                    radial_step=radial_step, radial_bulk=radial_bulk,
-                    radial_bulk_start=radial_bulk_start,
+                    radial_step=radial_step,
+                    min_dist=orig_min_dist, max_dist=orig_max_dist,
                 ))
             elif str(jitter_mode).lower() == 'directional':
                 positions.append(_directional_site_position(
@@ -1112,11 +1183,11 @@ def init_extra_positions_at_sites(
                     min_base_dist=min_base_dist,
                 ))
             else:
-                positions.append(_gaussian_site_position(
+                positions.append(_original_site_position(
                     site, jitter_std, rng,
                     atom_idx=atom_i, site_count=cnt,
-                    radial_step=radial_step, radial_bulk=radial_bulk,
-                    radial_bulk_start=radial_bulk_start,
+                    radial_step=radial_step,
+                    min_dist=orig_min_dist, max_dist=orig_max_dist,
                 ))
 
     if not positions:

@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
-from typing import List, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from rdkit import Chem
 
 from .atom_mapping import bond_map_pair
 from .models import StructureIssue
+from .planarity import (
+    has_3d_conformer,
+    planarity_thresholds_from_config,
+    ring_planarity,
+)
+
+# Aromatization opportunities are *not* legality defects, so they carry
+# severity "info" and repairable=False: the repair layer ignores them
+# (see repair_engine actionable filters) while the medchem optimize layer
+# treats them as candidate sites.
+AROMATIZABLE_C6_RING = "AROMATIZABLE_C6_RING"
+AROMATIZABLE_C5_HETEROCYCLE = "AROMATIZABLE_C5_HETEROCYCLE"
+AROMATIZATION_OPPORTUNITY_CODES = (
+    AROMATIZABLE_C6_RING,
+    AROMATIZABLE_C5_HETEROCYCLE,
+)
 
 
 def _ring_bonds(mol: Chem.Mol, ring: Sequence[int]) -> List[Chem.Bond]:
@@ -213,6 +229,196 @@ def detect_ring_issues(mol: Chem.Mol) -> List[StructureIssue]:
                     )
                 )
 
+    return issues
+
+
+def _heavy_degree(mol: Chem.Mol, idx: int) -> int:
+    atom = mol.GetAtomWithIdx(int(idx))
+    return sum(1 for nbr in atom.GetNeighbors() if nbr.GetAtomicNum() > 1)
+
+
+def _has_exocyclic_unsaturation(mol: Chem.Mol, idx: int, ring_set: Set[int]) -> bool:
+    """True when the atom carries a double/triple bond leaving the ring.
+
+    Cyclohexadienones and exocyclic methylenes are legitimately non-aromatic;
+    aromatizing them would destroy a real functional group.
+    """
+    atom = mol.GetAtomWithIdx(int(idx))
+    for bond in atom.GetBonds():
+        other = bond.GetOtherAtomIdx(int(idx))
+        if other in ring_set:
+            continue
+        if bond.GetBondType() in (Chem.BondType.DOUBLE, Chem.BondType.TRIPLE):
+            return True
+    return False
+
+
+def _carbon_can_be_aromatic(mol: Chem.Mol, idx: int, ring_set: Set[int]) -> bool:
+    atom = mol.GetAtomWithIdx(int(idx))
+    if atom.GetAtomicNum() != 6:
+        return False
+    if atom.GetFormalCharge() != 0:
+        return False
+    if atom.GetNumRadicalElectrons() > 0:
+        return False
+    if _heavy_degree(mol, idx) > 3:
+        return False
+    return not _has_exocyclic_unsaturation(mol, idx, ring_set)
+
+
+def _heteroatom_can_be_aromatic(mol: Chem.Mol, idx: int, ring_set: Set[int]) -> bool:
+    atom = mol.GetAtomWithIdx(int(idx))
+    z = atom.GetAtomicNum()
+    if atom.GetFormalCharge() != 0 or atom.GetNumRadicalElectrons() > 0:
+        return False
+    if _has_exocyclic_unsaturation(mol, idx, ring_set):
+        return False
+    degree = _heavy_degree(mol, idx)
+    if z == 7:
+        # pyrrole-type NH (2 heavy) or N-substituted (3 heavy)
+        return degree in (2, 3)
+    if z in (8, 16):
+        # furan / thiophene oxygen and sulfur are strictly divalent
+        return degree == 2
+    return False
+
+
+def _ring_is_fused_to_aromatic(mol: Chem.Mol, ring: Sequence[int]) -> bool:
+    ring_set = set(int(i) for i in ring)
+    for other in mol.GetRingInfo().AtomRings():
+        other_set = set(int(i) for i in other)
+        if other_set == ring_set:
+            continue
+        if len(ring_set & other_set) < 2:
+            continue
+        if all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in other_set):
+            return True
+    return False
+
+
+def _ring_hydrogen_count(mol: Chem.Mol, ring: Sequence[int]) -> int:
+    total = 0
+    for idx in ring:
+        atom = mol.GetAtomWithIdx(int(idx))
+        try:
+            total += int(atom.GetTotalNumHs(includeNeighbors=False))
+        except Exception:  # noqa: BLE001
+            total += int(atom.GetNumExplicitHs())
+    return total
+
+
+def detect_aromatization_opportunities(
+    mol: Chem.Mol,
+    config: Optional[Dict[str, Any]] = None,
+) -> List[StructureIssue]:
+    """Report rings that could plausibly be aromatic but currently are not.
+
+    These are opportunities, not defects: severity is ``info`` and
+    ``repairable`` is False so the legality repair layer leaves them alone.
+    The medchem optimize layer consumes them and decides using the recorded
+    evidence (ring double-bond count, 3D planarity, aromatic fusion).
+    """
+    config = config or {}
+    thresholds = planarity_thresholds_from_config(config)
+    have_3d = has_3d_conformer(mol)
+
+    try:
+        Chem.GetSymmSSSR(mol)
+    except Exception:  # noqa: BLE001
+        pass
+
+    issues: List[StructureIssue] = []
+    for ring in mol.GetRingInfo().AtomRings():
+        size = len(ring)
+        if size not in (5, 6):
+            continue
+        ring_set = set(int(i) for i in ring)
+        if all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in ring_set):
+            continue
+
+        ordered = order_ring_atoms(mol, list(ring))
+        if len(ordered) != size:
+            continue
+        bonds = _ring_bonds(mol, ordered)
+        if len(bonds) != size:
+            continue
+        if any(b.GetBondType() == Chem.BondType.TRIPLE for b in bonds):
+            continue
+
+        atomic_nums = [mol.GetAtomWithIdx(i).GetAtomicNum() for i in ordered]
+        hetero_idxs = [i for i in ordered if mol.GetAtomWithIdx(i).GetAtomicNum() != 6]
+
+        if size == 6:
+            # Only all-carbon benzene recovery here; aza-scan lives in the T1 catalog.
+            if any(z != 6 for z in atomic_nums):
+                continue
+            if not all(_carbon_can_be_aromatic(mol, i, ring_set) for i in ordered):
+                continue
+            issue_code = AROMATIZABLE_C6_RING
+        else:
+            if not hetero_idxs or len(hetero_idxs) > 2:
+                continue
+            ok = True
+            for i in ordered:
+                if mol.GetAtomWithIdx(i).GetAtomicNum() == 6:
+                    ok = _carbon_can_be_aromatic(mol, i, ring_set)
+                else:
+                    ok = _heteroatom_can_be_aromatic(mol, i, ring_set)
+                if not ok:
+                    break
+            if not ok:
+                continue
+            issue_code = AROMATIZABLE_C5_HETEROCYCLE
+
+        n_double = sum(1 for b in bonds if b.GetBondType() == Chem.BondType.DOUBLE)
+        planarity = (
+            ring_planarity(
+                mol,
+                ordered,
+                rmsd_threshold=thresholds["rmsd_threshold"],
+                torsion_threshold=thresholds["torsion_threshold"],
+            )
+            if have_3d
+            else None
+        )
+        planar = planarity["planar"] if planarity else None
+
+        # A fully saturated, clearly puckered ring is a real aliphatic ring.
+        if n_double == 0 and planar is not True:
+            continue
+
+        evidence: Dict[str, Any] = {
+            "ring_idxs": list(ordered),
+            "ring_size": size,
+            "n_ring_double_bonds": n_double,
+            "ring_h_count": _ring_hydrogen_count(mol, ordered),
+            "fused_to_aromatic": _ring_is_fused_to_aromatic(mol, ordered),
+            "hetero_atomic_nums": [
+                mol.GetAtomWithIdx(i).GetAtomicNum() for i in hetero_idxs
+            ],
+            "planar": planar,
+        }
+        if planarity:
+            evidence.update(planarity)
+
+        issues.append(
+            StructureIssue(
+                issue_code=issue_code,
+                severity="info",
+                atom_map_ids=[mol.GetAtomWithIdx(i).GetAtomMapNum() for i in ordered],
+                bond_atom_map_pairs=[
+                    bond_map_pair(mol, b.GetBeginAtomIdx(), b.GetEndAtomIdx())
+                    for b in bonds
+                ],
+                description=(
+                    f"{size}-membered ring with {n_double} ring double bond(s) "
+                    f"is a candidate for aromatization"
+                ),
+                evidence=evidence,
+                repairable=False,
+                candidate_rule_ids=[],
+            )
+        )
     return issues
 
 

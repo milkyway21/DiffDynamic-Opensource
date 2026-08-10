@@ -1,0 +1,61 @@
+# Medchem aggressive optimizer (post-reconstruct, pre-chem/Vina).
+# Loaded by --medchem-optimize / structure-repair optimize.
+
+enable: true
+tiers: [T0, T1, T2, T3, T4, T5]
+max_rounds: 3
+max_products_per_transform: 4
+min_reward_gain: 0.01
+require_conformer: true
+check_pocket_clash: true
+clash_cutoff: 2.2
+time_budget_s: 30.0
+embed_attempts: 10
+embed_time_budget_s: 3.0
+random_seed: 61453
+
+rings:
+  macrocycle_min_size: 10
+  medium_ring_sizes: [7, 8]
+  medium_ring_min_size: 7
+  # 7/8: prefer contract→benzene/heteroarene; break→chain is fallback
+  prefer_contract_medium_rings: true
+  prefer_break_medium_rings: true
+  contract_offer_aza: true
+  contract_max_plans_per_ring: 4
+
+planarity:
+  rmsd_threshold: 0.10
+  torsion_threshold: 10.0
+
+constraints:
+  min_tanimoto_to_parent: 0.55
+  tanimoto_exempt_tiers: [T0, T2]
+  scaffold_mode: ring_systems
+  scaffold_exempt_tiers: [T0, T2, T5]
+  max_heavy_atom_delta: 4
+  min_heavy_atom_delta: -3
+  mw_window: [150, 600]
+  max_transforms_per_molecule: 3
+
+reward:
+  w_qed: 1.0
+  w_sa: 0.6
+  w_rotb: 0.3
+  w_alert: 0.5
+  w_tpsa: 0.2
+  w_le: 0.3
+  w_cost: 0.02
+
+# Legality scorer weights (must not regress)
+scoring:
+  parse_failure: 10000
+  sanitize_failure: 8000
+  invalid_valence_count: 3000
+  kekulization_failure_count: 2000
+  unexpected_radical_count: 1500
+  aromaticity_conflict_count: 1000
+  impossible_bond_order_count: 800
+  implausible_charge_count: 500
+  ring_conflict_count: 300
+  disconnected_fragment_penalty: 100
