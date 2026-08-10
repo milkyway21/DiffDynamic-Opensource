@@ -18,7 +18,7 @@ BASE_SEED="${BASE_SEED:-20270600}"
 GPU="${GPU:?GPU required}"
 JOB_ID="${JOB_ID:?JOB_ID required (0..999)}"
 TARGET="${TARGET:?TARGET required: ikzf2|gspt1}"
-PROFILE="${PROFILE:?PROFILE required}"
+PROFILE="${PROFILE:-}"
 SEED=$((BASE_SEED + JOB_ID))
 
 STRUCT_ROOT="/data/ye/e-drug-lab/Scientist_In_E-Drug-Lab/runs/molecular_glue_structures_ikzf2_gspt1_20260803_235811"
@@ -55,7 +55,9 @@ fi
 CFG="$CFG_DIR/run_scaffold_seed_${SEED}.yml"
 cp "$CFG_SRC" "$CFG"
 sed -i "s/^  seed: .*/  seed: ${SEED}/" "$CFG"
-sed -i "s|^      reference_exit_profile:.*|      reference_exit_profile: \"${PROFILE}\"|" "$CFG"
+if [[ -n "$PROFILE" ]]; then
+  sed -i "s|^      reference_exit_profile:.*|      reference_exit_profile: \"${PROFILE}\"|" "$CFG"
+fi
 if [[ -n "${NUM_SAMPLES:-}" ]]; then
   python3 - "$CFG" "$NUM_SAMPLES" <<'PY'
 import sys
