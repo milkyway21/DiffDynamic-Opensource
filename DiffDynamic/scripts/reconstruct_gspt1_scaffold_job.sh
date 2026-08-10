@@ -7,6 +7,9 @@ source /home/user/anaconda3/etc/profile.d/conda.sh
 set +u
 conda activate diffdynamic
 export PYTHONPATH="/data/ye/DiffDynamic${PYTHONPATH:+:$PYTHONPATH}"
+# Three scaffold jobs run concurrently on the 80-core host.  Keep the total
+# evaluator fan-out near the host capacity while leaving headroom for Python.
+export EVAL_PARALLEL_WORKERS="${EVAL_PARALLEL_WORKERS:-24}"
 set -u
 cd /data/ye/DiffDynamic
 
@@ -62,6 +65,7 @@ fi
 mkdir -p "$OUT"
 echo "[RUN] $TARGET/$JOB_TAG PT=$PT"
 echo "[POLICY] Vina disabled: --vina-modes none"
+echo "[POLICY] EVAL_PARALLEL_WORKERS=$EVAL_PARALLEL_WORKERS"
 python -u evaluate_pt_with_correct_reconstruct.py "$PT" \
   --vina-modes none \
   --receptor_pdb "$PROTEIN" \
