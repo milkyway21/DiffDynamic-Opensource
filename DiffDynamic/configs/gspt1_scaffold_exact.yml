@@ -1,0 +1,242 @@
+# GSPT1：CRBN 侧固定、多出口 target-side scaffold generation
+# - scaffold_source: custom + warhead SMARTS（戊二酰亚胺→异吲哚啉-1-酮）
+# - 全配体 --ligand_path（口袋 + 侧链自由基位点）；不必 --molecule_path
+# - n_extra 12–20；径向放置；TBR on；rdkit_structure_repair off
+# - 每 job num_samples=100；1000 seeds → ≈100k / 靶点
+
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  force_model_type: diffdynamic
+  use_grad_fusion: true
+  grad_fusion_lambda:
+    mode: quadratic
+    start: 1
+    end: 0
+    power: 2
+sample:
+  seed: 2021
+  mode: dynamic
+  num_steps: 1000
+  sample_num_atoms: prior
+  center_pos_mode: protein
+  pos_only: false
+  dynamic:
+    method: legacy
+    time_boundary: 650
+    skip_refine: false
+    large_step:
+      batch_size: 100
+      n_repeat: 1
+      schedule: lambda
+      lambda_coeff_a: 58
+      lambda_coeff_b: 20
+      linear_step_lower: 15
+      linear_step_upper: 15
+      step_size: 0.33
+      stride: 15
+      noise_scale: 0.1
+      use_adaptive_step: true
+      use_time_scale: false
+    selector:
+      enable_selection: false
+      selection_time: 250
+      top_percent: 0.3
+      top_n: 20
+      min_sa: 0.1
+      min_qed: 0.1
+      qed_weight: 1
+      sa_weight: 1
+    prudent:
+      enable: false
+      n_sampling: 20
+      segment_evolution_mode: true
+      checkpoint_frame: 24
+      total_frames: 24
+      max_checkpoint_rounds: 1
+      advance_top_k: 5
+      vina_weight: 0.5
+      qed_weight: 0.15
+      sa_weight: 0.15
+      lipinski_weight: 0.1
+      lilly_demerit_weight: 0.1
+      vina_exhaustiveness: 1
+      log_per_chain_scores: true
+      advance_top_k_mode: cap
+      continue_when_no_advance: true
+      fallback_keep_top_k: 1
+      min_qed_for_docking: 0
+      min_sa_for_docking: 0
+      max_vina_affinity_for_advance: null
+      winner_select_by_composite: true
+      save_checkpoint_every_segment: true
+      segment_checkpoint_subdirectory: null
+      save_segment_breakpoint_pt: false
+      save_segment_generation_pool_pt: true
+      segment_generation_pt_seeds: first
+      async_vina_max_workers: 2
+      protein_root: null
+    refine:
+      n_sampling: 1
+      cycles: 1
+      schedule: lambda
+      lambda_coeff_a: 60
+      lambda_coeff_b: 5
+      linear_step_lower: 3
+      linear_step_upper: 8
+      step_size: 0.47
+      stride: 5
+      time_lower: 0
+      noise_scale: 0
+      use_adaptive_step: true
+      use_time_scale: false
+      max_grad_fusion_iterations: 15
+  optimization:
+    enable: false
+    after_dynamic: true
+    molecule_path: null
+    num_samples: 2
+    keep_original: true
+    start_t: 16
+    stride: 2
+    step_size: 0.2
+    noise_scale: 0
+    schedule: linear
+    cycles: 5
+    use_with_noise: true
+    use_adaptive_step: true
+    use_time_scale: false
+    lambda_coeff_a: 1
+    lambda_coeff_b: 1
+    pos_clip: null
+    v_clip: null
+    selector:
+      enable_filter: true
+      filter_incomplete: true
+      max_survivors_per_cycle: 10
+      max_survivors_total: 300
+      min_qed: 0.3
+      min_sa: 0.3
+      qed_weight: 1
+      sa_weight: 1
+    mask_repaint:
+      enable: false
+    property_guidance:
+      enable: false
+  scaffold:
+    enable: true
+    mode: dynamic_locked
+    num_samples: 100
+    after_dynamic: false
+    save_dynamic_before_scaffold: true
+    optimization_style_naming: true
+    scaffold_source: custom
+    scaffold_atom_indices: null
+    scaffold_smarts: "O=C1CCC(N2Cc3ccccc3C2=O)C(=O)N1"
+    fix_scaffold_pos: true
+    fix_scaffold_type: true
+    schedule: lambda
+    use_with_noise: true
+    use_adaptive_step: true
+    use_time_scale: false
+    qed_weight: 1.0
+    sa_weight: 1.0
+    diversity_weight: 0.5
+    rmsd_penalty_weight: 0.0
+    min_qed: 0.15
+    min_sa: 0.15
+    keep_original: true
+    filter_incomplete: true
+    diversity_filter:
+      enable: true
+      max_tanimoto: 0.9
+      fingerprint_radius: 2
+      fingerprint_nbits: 2048
+    murcko_sites:
+      # reference_exit_profile 由 17 个已知分子只提取出口频率和 extra 数量先验。
+      reference_exit_profile: null
+      reference_exit_offset: 1.5
+      reference_exit_dedup_dist: 1.2
+      site_selection_mode: weighted_single
+      site_budget_mode: requested
+      p_active: 1.0
+      max_per_site: 25
+      min_per_site: 0
+      per_site_count_mode: sequential_random
+      per_site_add_mode: fragment_prior
+      jitter_std: 0.25
+      jitter_mode: native_template
+      # 仅借用 native target-side 的空间范围，不借用其元素/键；GSPT1 侧链最远约 9.6 Å
+      original_min_dist: 1.3
+      original_max_dist: 10.0
+      radial_step: 1.25
+      radial_bulk: 0.2
+      radial_bulk_start: 5
+      max_active_sites: 1
+      prefer_murcko_sites: false
+      save_json: true
+      overflow_mode: cap
+      dedup_dist: 0.5
+      # 只锁 CRBN 侧 custom scaffold；target-side 由模型重新生成，不能复制 native 侧链
+      preserve_zero_allocation_sidechains: false
+      include_exit_vectors: false
+    adaptive_gates:
+      enable: true
+    evolve:
+      population_size: 50
+      n_generations: 5
+      children_per_parent: 10
+      start_t_high: 200
+      start_t_low: 30
+      noise_anneal: true
+      stride: 2
+      step_size: 0.2
+      lambda_coeff_a: 10
+      lambda_coeff_b: 1
+    grow:
+      n_extra_mode: reference_size_prior
+      n_extra_fixed: 8
+      n_extra_min: 13
+      n_extra_max: 25
+      n_extra_min_clamp: 13
+      n_extra_max_clamp: 25
+      reference_size_values: [13, 14, 15, 16, 17, 21, 25]
+      reference_size_weights: [4, 7, 1, 1, 1, 1, 1]
+      num_samples: 200
+      start_t: 650
+      # 新原子保留少量 site 几何先验，避免大步扩散一开始就丢出 target-side pocket
+      extra_anchor_strength: 0.2
+      stride: 15
+      step_size: 0.3363
+      lambda_coeff_a: 37
+      lambda_coeff_b: 6
+      min_qed: 0.2
+      min_sa: 0.2
+      filter_incomplete: false
+    prudent:
+      n_generations: 3
+      n_chains_per_seed: 4
+      advance_top_k: 2
+      renoise_t: 50
+      target_final_count: null
+  targetdiff_baseline_refine:
+    enable: true
+    start_t: 50
+    lock_prefix: types_and_pos
+    after_scaffold_init_only: false
+    run_every_prudent_round: true
+    refine_batch_size: 100
+  rdkit_structure_repair:
+    enable: false
+    config: rdkit-structure-repair/configs/conservative.yaml
+    on_reject: keep_original
+  pre_docking:
+    etkdg_reembed: false
+    mmff_minimize: false
+    mmff_max_iters: 2000
+    use_uff_fallback: false
+  step_trajectory_save:
+    enable: false
+    output_dir: ./diffway
+    bond_threshold: 500
+    merge_pymol_sdf: true
+    merge_sdf_filename: trajectory_pymol.sdf

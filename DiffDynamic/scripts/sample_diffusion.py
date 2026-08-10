@@ -6504,6 +6504,19 @@ def _sample_n_extra_atoms(
         total = int(np.clip(total, size_min, size_max))
         n_extra = total - int(n_scaffold_atoms)
 
+    elif mode in ('reference_size_prior', 'reference_n_extra_prior'):
+        values = [int(v) for v in grow_cfg.get('reference_size_values', [])]
+        weights = [float(v) for v in grow_cfg.get('reference_size_weights', [])]
+        if not values or len(values) != len(weights) or sum(weights) <= 0:
+            n_extra = int(grow_cfg.get('n_extra_fixed', 8))
+        else:
+            size_rng = np.random.default_rng(
+                int(grow_cfg.get('seed', 42))
+                + _murcko_rng_offset(sample_idx, retry)
+                + 23
+            )
+            n_extra = int(size_rng.choice(values, p=np.asarray(weights) / sum(weights)))
+
     else:
         n_extra = int(grow_cfg.get('n_extra_fixed', 8))
 
@@ -7091,16 +7104,13 @@ def scaffold_grow_molecule(
         pos_np = final_pos.detach().cpu().numpy().astype(np.float64)
         v_np = log_v_out.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
 
-        # 后处理：修复额外原子中价态不兼容的元素 → C
-        # 单价元素 H(0), Cl(12) 作为重原子会超价破坏重建
+        # 骨架路径只把 H 节点转换为 C；F/Cl 是可表达的 target-side 元素，
+        # 不能为了提高重建率而静默丢失。
         # add_aromatic 模式索引: 0=H, 1=C, 2=C_arom, 3=N, 4=N_arom,
         #   5=O, 6=O_arom, 7=F, 8=P, 9=P_arom, 10=S, 11=S_arom, 12=Cl
         if n_extra > 0:
             extra_v = v_np[n_locked:]
             to_carbon = (extra_v == 0)   # H: 单价，永远不是重原子
-            # Cl (index 12) 单价，F (index 7) 单价 — 替换为碳
-            to_carbon |= (extra_v == 12)  # Cl
-            to_carbon |= (extra_v == 7)   # F
             if to_carbon.any():
                 extra_v[to_carbon] = 1  # → 非芳香 C
                 v_np[n_locked:] = extra_v
@@ -7581,12 +7591,10 @@ def scaffold_dynamic_locked_molecule(
         pos_np = final_pos_t.detach().cpu().numpy().astype(np.float64)
         v_np = log_v_out.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
 
-        # 后处理：修复额外原子中价态不兼容元素 → C（与 grow 一致）
+        # 保留 F/Cl；仅清除不应作为新增重原子节点的 H 类别。
         if n_extra > 0:
             extra_v = v_np[n_locked:]
             to_carbon = (extra_v == 0)    # H
-            to_carbon |= (extra_v == 12)  # Cl
-            to_carbon |= (extra_v == 7)   # F
             if to_carbon.any():
                 extra_v[to_carbon] = 1    # → 非芳香 C
                 v_np[n_locked:] = extra_v
@@ -7867,7 +7875,7 @@ def _prudent_locked_sample_once(
     log_v_np = log_v_out.detach().cpu().numpy().astype(np.float32)
     if n_extra > 0:
         extra_v = v_np[n_locked:]
-        to_carbon = (extra_v == 0) | (extra_v == 12) | (extra_v == 7)
+        to_carbon = (extra_v == 0)
         if to_carbon.any():
             extra_v[to_carbon] = 1
             v_np[n_locked:] = extra_v
@@ -8289,7 +8297,7 @@ def scaffold_prudent_molecule(
         # 后处理：修复额外原子中价态不兼容元素 → C
         if n_extra > 0:
             extra_v = v_np[n_locked:]
-            to_carbon = (extra_v == 0) | (extra_v == 12) | (extra_v == 7)
+            to_carbon = (extra_v == 0)
             if to_carbon.any():
                 extra_v[to_carbon] = 1
                 v_np[n_locked:] = extra_v

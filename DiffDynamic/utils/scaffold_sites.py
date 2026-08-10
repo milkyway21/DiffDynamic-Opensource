@@ -18,6 +18,8 @@ import numpy as np
 import torch
 from rdkit import Chem
 
+from utils.gspt1_scaffold_prior import load_scaffold_profile
+
 CST = timezone(timedelta(hours=8))
 
 # 常见/复杂自由基重原子数先验（抬高单苯/稠环/联苯等）
@@ -41,7 +43,7 @@ DEFAULT_MURCKO_SITES_CFG = {
     'jitter_std': 1.0,
     'jitter_mode': 'gaussian',  # gaussian|isotropic|clustered | directional（旧：沿位点射线离散外推）
     # 多原子时沿 anchor→centroid 径向外推（Å）：r = radial_step*atom_idx + radial_bulk*max(0, count-start)
-    'radial_step': 1.3,
+    'radial_step': 0.25,
     'radial_bulk': 0.35,
     'radial_bulk_start': 4,
     # directional 模式：沿射线第 k 个原子再外推 directional_step Å
@@ -364,6 +366,174 @@ def merge_attachment_and_exit_vector_sites(
     return merged
 
 
+def extract_reference_exit_vector_sites(
+    mol,
+    scaffold_indices: List[int],
+    ref_pos_np: Optional[np.ndarray],
+    profile: Dict[str, Any],
+    offset: float = 1.5,
+) -> List[Dict[str, Any]]:
+    """Create geometry-only virtual exits from a scaffold-local profile.
+
+    ``profile`` contains only scaffold-local weights.  Coordinates come from
+    the supplied native ligand and no reference target-side atom is copied.
+    """
+    if mol is None or not scaffold_indices:
+        return []
+    if int(profile.get('n_scaffold', 0)) != len(scaffold_indices):
+        return []
+
+    positions = _atom_positions(mol, ref_pos_np)
+    weights = profile.get('exit_site_weights') or {}
+    sites: List[Dict[str, Any]] = []
+    for raw_slot, raw_weight in weights.items():
+        slot = int(raw_slot)
+        if slot < 0 or slot >= len(scaffold_indices):
+            continue
+        atom_idx = int(scaffold_indices[slot])
+        atom = mol.GetAtomWithIdx(atom_idx)
+        anchor = positions[atom_idx]
+        neighbour_indices = [n.GetIdx() for n in atom.GetNeighbors()]
+        if neighbour_indices:
+            neighbour_centroid = positions[neighbour_indices].mean(axis=0)
+            direction = anchor - neighbour_centroid
+        else:
+            direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-6:
+            direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            direction = direction / norm
+        sites.append({
+            'site_id': -1,
+            'anchor_scaffold_idx': atom_idx,
+            'anchor_pos': anchor.tolist(),
+            'centroid_pos': (anchor + float(offset) * direction).tolist(),
+            'removed_atom_indices': [],
+            'removed_atom_count': 0,
+            'site_kind': 'reference_exit_vector',
+            'profile_slot': slot,
+            'site_selection_weight': max(float(raw_weight), 0.0),
+        })
+    return sites
+
+
+def _transfer_template_geometry(
+    source_site: Dict[str, Any],
+    target_site: Dict[str, Any],
+) -> Optional[List[List[float]]]:
+    """Move a native target-side coordinate cloud to another scaffold exit."""
+    raw_positions = source_site.get('removed_atom_positions') or []
+    if not raw_positions:
+        return None
+    source_anchor = np.asarray(source_site.get('anchor_pos'), dtype=np.float64)
+    target_anchor = np.asarray(target_site.get('anchor_pos'), dtype=np.float64)
+    source_positions = np.asarray(raw_positions, dtype=np.float64)
+    if source_positions.ndim != 2 or source_positions.shape[1] != 3:
+        return None
+
+    source_direction = source_positions[0] - source_anchor
+    target_direction = (
+        np.asarray(target_site.get('centroid_pos'), dtype=np.float64)
+        - target_anchor
+    )
+    source_norm = float(np.linalg.norm(source_direction))
+    target_norm = float(np.linalg.norm(target_direction))
+    if source_norm <= 1e-8 or target_norm <= 1e-8:
+        return None
+    source_direction /= source_norm
+    target_direction /= target_norm
+
+    cross = np.cross(source_direction, target_direction)
+    dot = float(np.clip(np.dot(source_direction, target_direction), -1.0, 1.0))
+    cross_norm = float(np.linalg.norm(cross))
+    if cross_norm <= 1e-8:
+        if dot >= 0.0:
+            rotation = np.eye(3, dtype=np.float64)
+        else:
+            basis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(float(np.dot(basis, source_direction))) > 0.9:
+                basis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            axis = np.cross(source_direction, basis)
+            axis /= np.linalg.norm(axis)
+            rotation = 2.0 * np.outer(axis, axis) - np.eye(3, dtype=np.float64)
+    else:
+        axis = cross / cross_norm
+        skew = np.array([
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ])
+        angle = float(np.arctan2(cross_norm, dot))
+        rotation = (
+            np.eye(3, dtype=np.float64)
+            + np.sin(angle) * skew
+            + (1.0 - np.cos(angle)) * (skew @ skew)
+        )
+
+    relative = source_positions - source_anchor
+    transformed = relative @ rotation.T + target_anchor
+    return transformed.astype(np.float64).tolist()
+
+
+def merge_reference_exit_sites(
+    attachment_sites: List[Dict[str, Any]],
+    profile_sites: List[Dict[str, Any]],
+    dedup_dist: float = 1.2,
+) -> List[Dict[str, Any]]:
+    """Merge profile exits, accumulating weight on an existing native site."""
+    merged = [dict(site) for site in attachment_sites]
+    for site in merged:
+        site.setdefault('site_selection_weight', 1.0)
+
+    for candidate in profile_sites:
+        anchor_idx = candidate.get('anchor_scaffold_idx')
+        same_anchor = next(
+            (site for site in merged
+             if site.get('anchor_scaffold_idx') == anchor_idx),
+            None,
+        )
+        if same_anchor is not None:
+            same_anchor['site_selection_weight'] = max(
+                float(same_anchor.get('site_selection_weight', 1.0)),
+                float(candidate.get('site_selection_weight', 0.0)),
+            )
+            same_anchor['profile_slot'] = candidate.get('profile_slot')
+            same_anchor['reference_exit_profile_slot'] = candidate.get('profile_slot')
+            continue
+
+        centroid = np.asarray(candidate['centroid_pos'], dtype=np.float64)
+        duplicate = any(
+            np.linalg.norm(
+                centroid - np.asarray(site['centroid_pos'], dtype=np.float64)
+            ) < float(dedup_dist)
+            for site in merged
+        )
+        if duplicate:
+            continue
+        candidate = dict(candidate)
+        template_site = next(
+            (
+                site for site in merged
+                if site.get('removed_atom_positions')
+                and site.get('removed_atom_count', 0) > 0
+            ),
+            None,
+        )
+        if template_site is not None:
+            transferred = _transfer_template_geometry(template_site, candidate)
+            if transferred is not None:
+                candidate['removed_atom_positions'] = transferred
+                candidate['removed_atom_count'] = len(transferred)
+                candidate['template_source_site_id'] = template_site.get('site_id')
+        candidate['site_id'] = len(merged)
+        merged.append(candidate)
+
+    for site_id, site in enumerate(merged):
+        site['site_id'] = site_id
+    return merged
+
+
 # 骨架选择入口（Murcko 与自定义并列）；选出 indices 后位点提取路径相同
 SCAFFOLD_SOURCES_WITH_ATTACHMENT_SITES = (
     'auto_murcko',
@@ -398,7 +568,10 @@ def load_or_extract_attachment_sites(
 
     include_ev = bool(sites_cfg.get('include_exit_vectors', False))
     ev_mode = str(sites_cfg.get('exit_vector_mode', 'aromatic_h'))
-    cache_suffix = f'_ev_{ev_mode}' if include_ev else ''
+    profile_path = sites_cfg.get('reference_exit_profile')
+    use_profile = bool(profile_path)
+    profile_tag = '_profile_exit' if use_profile else ''
+    cache_suffix = (f'_ev_{ev_mode}' if include_ev else '') + profile_tag
 
     json_path = None
     if sites_cfg.get('save_json', True) and output_dir and ref_ligand_name:
@@ -414,6 +587,12 @@ def load_or_extract_attachment_sites(
                 if include_ev:
                     cache_ok = cache_ok and any(
                         s.get('site_kind') == 'exit_vector' for s in sites
+                    )
+                if use_profile:
+                    cache_ok = cache_ok and any(
+                        s.get('site_kind') == 'reference_exit_vector'
+                        or s.get('reference_exit_profile_slot') is not None
+                        for s in sites
                     )
                 if cache_ok:
                     if logger:
@@ -450,6 +629,35 @@ def load_or_extract_attachment_sites(
                 f'[MurckoSites] exit_vector({ev_mode}): +{n_ev} 虚拟位点 → 合计 {len(sites)}'
             )
 
+    if use_profile:
+        try:
+            profile = load_scaffold_profile(profile_path)
+            profile_sites = extract_reference_exit_vector_sites(
+                mol,
+                scaffold_indices,
+                ref_pos_np,
+                profile,
+                offset=float(sites_cfg.get('reference_exit_offset', 1.5)),
+            )
+            sites = merge_reference_exit_sites(
+                sites,
+                profile_sites,
+                dedup_dist=float(
+                    sites_cfg.get('reference_exit_dedup_dist', 1.2)
+                ),
+            )
+            if logger:
+                logger.info(
+                    f'[MurckoSites] reference exit profile: '
+                    f'{len(profile_sites)} exits, matched_refs='
+                    f'{profile.get("matched_reference_records", 0)}'
+                )
+        except Exception as exc:
+            if logger:
+                logger.warning(
+                    f'[MurckoSites] reference exit profile unavailable: {exc}'
+                )
+
     if json_path and sites:
         payload = {
             'ligand_name': ref_ligand_name,
@@ -458,6 +666,7 @@ def load_or_extract_attachment_sites(
             'scaffold_source': scaffold_source,
             'include_exit_vectors': include_ev,
             'exit_vector_mode': ev_mode if include_ev else None,
+            'reference_exit_profile': str(profile_path) if use_profile else None,
             'attachment_sites': sites,
             'extracted_at': datetime.now(CST).isoformat(),
         }
@@ -793,6 +1002,39 @@ def cap_n_extra_for_sites(
     return min(n_extra, compute_site_capacity(attachment_sites, sites_cfg))
 
 
+def allocate_atoms_weighted_single_site(
+    n_extra: int,
+    sites: List[Dict[str, Any]],
+    sites_cfg: dict,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[List[Dict[str, Any]], List[int], int]:
+    """Choose one scaffold exit using profile weights and place the full budget."""
+    if n_extra <= 0 or not sites:
+        return [], [], 0
+    rng = rng or np.random.default_rng()
+    weights = np.asarray(
+        [max(float(site.get('site_selection_weight', 1.0)), 0.0) for site in sites],
+        dtype=np.float64,
+    )
+    if not np.isfinite(weights).all() or weights.sum() <= 0:
+        weights = np.ones(len(sites), dtype=np.float64)
+    weights /= weights.sum()
+    selected_idx = int(rng.choice(len(sites), p=weights))
+    selected = sites[selected_idx]
+
+    min_c = int(sites_cfg.get('n_extra_min_clamp', n_extra))
+    max_c = int(sites_cfg.get('n_extra_max_clamp', n_extra))
+    min_c = max(0, min(min_c, int(n_extra)))
+    max_c = max(min_c, max_c)
+    budget_mode = str(sites_cfg.get('site_budget_mode', 'requested')).lower()
+    if budget_mode in ('random', 'uniform'):
+        budget = int(rng.integers(min_c, max_c + 1))
+    else:
+        budget = int(np.clip(n_extra, min_c, max_c))
+    budget = min(budget, int(sites_cfg.get('max_per_site', budget)))
+    return [selected], [budget], budget
+
+
 def _attachment_direction(site: Dict[str, Any]) -> Optional[np.ndarray]:
     """返回 normalize(centroid - anchor)；缺锚点或退化时返回 None。"""
     anchor = site.get('anchor_pos')
@@ -845,29 +1087,19 @@ def _gaussian_site_position(
     rng: np.random.Generator,
     atom_idx: int = 0,
     site_count: int = 1,
-    radial_step: float = 1.3,
+    radial_step: float = 0.25,
     radial_bulk: float = 0.35,
     radial_bulk_start: int = 4,
 ) -> np.ndarray:
-    """Place extra atom from anchor along anchor->centroid direction.
-
-    The first atom is placed at ~1.3 Å from the scaffold anchor (bonding
-    distance), then each subsequent atom extends further along the
-    attachment direction.  A small gaussian jitter is added for diversity.
-
-    r = radial_step * (atom_idx + 1) + radial_bulk * max(0, site_count - radial_bulk_start)
-    pos = anchor + direction * r + N(0, jitter_std)
-    """
-    anchor = np.array(site['anchor_pos'], dtype=np.float64)
-    r = float(radial_step) * (float(atom_idx) + 1.0) + float(radial_bulk) * max(
-        0.0, float(atom_idx) + 1.0 - float(radial_bulk_start),
+    """Place extra atoms in a Gaussian cloud around the site centroid."""
+    centroid = np.array(site['centroid_pos'], dtype=np.float64)
+    r = float(radial_step) * float(atom_idx) + float(radial_bulk) * max(
+        0.0, float(site_count) - float(radial_bulk_start),
     )
     direction = _attachment_direction(site)
     if direction is not None and r > 0.0:
-        pos = anchor + direction * r
-    else:
-        pos = anchor + np.array([1.5, 0.0, 0.0])
-    return pos + rng.normal(0.0, float(jitter_std), size=3)
+        centroid = centroid + direction * r
+    return centroid + rng.normal(0.0, float(jitter_std), size=3)
 
 
 def _original_site_position(
@@ -1148,9 +1380,11 @@ def init_extra_positions_at_sites(
 ) -> torch.Tensor:
     """按位点分配生成世界坐标系 extra 位置 [n_extra, 3]。
 
-    gaussian（默认）：若有 removed_atom_positions，则使用参考 target-side 的空间
-    构象作模板并加高斯扰动；缺少模板时沿 anchor→centroid 径向外推。
+    gaussian：在 site centroid 周围生成高斯云并沿方向做轻微径向展开。
+    native_template：若有 removed_atom_positions，则使用 native target-side
+    的空间构象作模板并加高斯扰动；缺少模板时沿方向外推。
     directional：沿 anchor→centroid 射线外推（旧离散方案）。
+    hybrid：有 native 模板时使用模板，否则沿 anchor→exit 方向外推。
     """
     cfg = sites_cfg or {}
     radial_step = float(cfg.get('radial_step', DEFAULT_MURCKO_SITES_CFG['radial_step']))
@@ -1162,14 +1396,26 @@ def init_extra_positions_at_sites(
     ))
     rng = rng or np.random.default_rng()
     positions = []
-    use_gauss = _is_gaussian_jitter(jitter_mode)
+    mode = str(jitter_mode or 'gaussian').lower()
+    use_gaussian = mode in (
+        'gaussian', 'isotropic', 'clustered', 'denovo', 'random',
+    )
+    use_native = mode in ('native', 'native_template')
     orig_min_dist = float(cfg.get('original_min_dist', 2.0))
     orig_max_dist = float(cfg.get('original_max_dist', 4.0))
     for site, cnt in zip(active_sites, counts):
         if cnt <= 0:
             continue
         for atom_i in range(cnt):
-            if use_gauss:
+            if use_gaussian:
+                positions.append(_gaussian_site_position(
+                    site, jitter_std, rng,
+                    atom_idx=atom_i, site_count=cnt,
+                    radial_step=radial_step,
+                    radial_bulk=radial_bulk,
+                    radial_bulk_start=radial_bulk_start,
+                ))
+            elif use_native:
                 positions.append(_original_site_position(
                     site, jitter_std, rng,
                     atom_idx=atom_i, site_count=cnt,
@@ -1182,6 +1428,20 @@ def init_extra_positions_at_sites(
                     directional_step=directional_step,
                     min_base_dist=min_base_dist,
                 ))
+            elif mode == 'hybrid':
+                if site.get('removed_atom_positions'):
+                    positions.append(_original_site_position(
+                        site, jitter_std, rng,
+                        atom_idx=atom_i, site_count=cnt,
+                        radial_step=radial_step,
+                        min_dist=orig_min_dist, max_dist=orig_max_dist,
+                    ))
+                else:
+                    positions.append(_directional_site_position(
+                        site, atom_i, jitter_std, rng,
+                        directional_step=directional_step,
+                        min_base_dist=min_base_dist,
+                    ))
             else:
                 positions.append(_original_site_position(
                     site, jitter_std, rng,
@@ -1216,7 +1476,7 @@ def build_extra_atom_positions(
     overflow_mode = str(sites_cfg.get('overflow_mode', 'pocket_fallback'))
     meta: Dict[str, Any] = {
         'placement': 'pocket_fallback',
-        'site_allocation': None,
+    'site_allocation': None,
         'overflow_count': 0,
         'n_extra_requested': n_extra_requested,
         'n_extra_effective': n_extra_requested,
@@ -1276,6 +1536,25 @@ def build_extra_atom_positions(
             logger.info(
                 f'[MurckoSites] {count_mode}: 各位点分配 {counts} → n_extra={n_extra_eff} '
                 f'(budget∈[{min_c},{max_c}])'
+            )
+    elif str(sites_cfg.get('site_selection_mode', '')).lower() == 'weighted_single':
+        active, counts, n_extra_eff = allocate_atoms_weighted_single_site(
+            n_extra,
+            attachment_sites,
+            sites_cfg,
+            rng=rng,
+        )
+        overflow = max(0, int(n_extra) - int(n_extra_eff))
+        meta['n_extra_effective'] = n_extra_eff
+        meta['per_site_count_mode'] = 'weighted_single'
+        meta['site_selection_mode'] = 'weighted_single'
+        if logger and active:
+            logger.info(
+                f'[MurckoSites] weighted_single: site_id='
+                f'{active[0].get("site_id")} slot='
+                f'{active[0].get("profile_slot")} weight='
+                f'{active[0].get("site_selection_weight")} '
+                f'→ n_extra={n_extra_eff}'
             )
     else:
         if overflow_mode in ('cap', 'drop'):
@@ -1352,6 +1631,8 @@ def build_extra_atom_positions(
                 'site_id': active[i].get('site_id'),
                 'count': counts[i],
                 'centroid_pos': active[i].get('centroid_pos'),
+                'profile_slot': active[i].get('profile_slot'),
+                'site_selection_weight': active[i].get('site_selection_weight'),
             }
             for i in range(len(active)) if counts[i] > 0
         ]
@@ -1376,6 +1657,8 @@ def build_extra_atom_positions(
                 'site_id': active[i].get('site_id'),
                 'count': counts[i],
                 'centroid_pos': active[i].get('centroid_pos'),
+                'profile_slot': active[i].get('profile_slot'),
+                'site_selection_weight': active[i].get('site_selection_weight'),
             }
             for i in range(len(active)) if counts[i] > 0
         ]
@@ -1388,6 +1671,8 @@ def build_extra_atom_positions(
             'site_id': active[i].get('site_id'),
             'count': counts[i],
             'centroid_pos': active[i].get('centroid_pos'),
+            'profile_slot': active[i].get('profile_slot'),
+            'site_selection_weight': active[i].get('site_selection_weight'),
         }
         for i in range(len(active)) if counts[i] > 0
     ]
