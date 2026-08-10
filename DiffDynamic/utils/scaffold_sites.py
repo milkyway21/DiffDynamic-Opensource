@@ -372,6 +372,7 @@ def extract_reference_exit_vector_sites(
     ref_pos_np: Optional[np.ndarray],
     profile: Dict[str, Any],
     offset: float = 1.5,
+    allowed_slots: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Create geometry-only virtual exits from a scaffold-local profile.
 
@@ -385,9 +386,15 @@ def extract_reference_exit_vector_sites(
 
     positions = _atom_positions(mol, ref_pos_np)
     weights = profile.get('exit_site_weights') or {}
+    allowed = (
+        {int(slot) for slot in allowed_slots}
+        if allowed_slots is not None else None
+    )
     sites: List[Dict[str, Any]] = []
     for raw_slot, raw_weight in weights.items():
         slot = int(raw_slot)
+        if allowed is not None and slot not in allowed:
+            continue
         if slot < 0 or slot >= len(scaffold_indices):
             continue
         atom_idx = int(scaffold_indices[slot])
@@ -484,7 +491,8 @@ def merge_reference_exit_sites(
     """Merge profile exits, accumulating weight on an existing native site."""
     merged = [dict(site) for site in attachment_sites]
     for site in merged:
-        site.setdefault('site_selection_weight', 1.0)
+        weight = site.get('site_selection_weight')
+        site['site_selection_weight'] = 1.0 if weight is None else weight
 
     for candidate in profile_sites:
         anchor_idx = candidate.get('anchor_scaffold_idx')
@@ -638,14 +646,25 @@ def load_or_extract_attachment_sites(
                 ref_pos_np,
                 profile,
                 offset=float(sites_cfg.get('reference_exit_offset', 1.5)),
+                allowed_slots=sites_cfg.get('reference_exit_slots'),
             )
-            sites = merge_reference_exit_sites(
+            merged_sites = merge_reference_exit_sites(
                 sites,
                 profile_sites,
                 dedup_dist=float(
                     sites_cfg.get('reference_exit_dedup_dist', 1.2)
                 ),
             )
+            if bool(sites_cfg.get('reference_exit_only', False)):
+                sites = [
+                    site for site in merged_sites
+                    if site.get('site_kind') == 'reference_exit_vector'
+                    or site.get('reference_exit_profile_slot') is not None
+                ]
+                for site_id, site in enumerate(sites):
+                    site['site_id'] = site_id
+            else:
+                sites = merged_sites
             if logger:
                 logger.info(
                     f'[MurckoSites] reference exit profile: '

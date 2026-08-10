@@ -19,9 +19,11 @@ from utils.scaffold_sites import (
     cap_n_extra_for_sites,
     compute_site_capacity,
     extract_exit_vector_sites,
+    extract_reference_exit_vector_sites,
     extract_murcko_attachment_sites,
     init_extra_positions_at_sites,
     merge_attachment_and_exit_vector_sites,
+    merge_reference_exit_sites,
     sample_fragment_atom_count,
     uses_site_budget_placement,
 )
@@ -47,6 +49,48 @@ def test_extract_toluene_methyl_site():
     centroid = np.array(sites[0]['centroid_pos'])
     assert centroid.shape == (3,)
     assert sites[0]['removed_atom_count'] >= 1
+
+
+def test_reference_exit_profile_can_restrict_to_one_slot():
+    mol = _mol_with_conformer('Cc1ccccc1')
+    sites = extract_reference_exit_vector_sites(
+        mol,
+        list(range(6)),
+        None,
+        {
+            'n_scaffold': 6,
+            'exit_site_weights': {'0': 12.0, '1': 6.0},
+        },
+        allowed_slots=[0],
+    )
+    assert [site['profile_slot'] for site in sites] == [0]
+
+
+def test_reference_exit_only_keeps_transferred_template_weight():
+    native = {
+        'site_id': 0,
+        'site_kind': 'murcko_sidechain',
+        'anchor_scaffold_idx': 1,
+        'anchor_pos': [0.0, 0.0, 0.0],
+        'centroid_pos': [1.0, 0.0, 0.0],
+        'removed_atom_positions': [[1.0, 0.0, 0.0]],
+        'removed_atom_count': 1,
+        'site_selection_weight': None,
+    }
+    profile = {
+        'site_id': -1,
+        'site_kind': 'reference_exit_vector',
+        'anchor_scaffold_idx': 2,
+        'anchor_pos': [10.0, 0.0, 0.0],
+        'centroid_pos': [11.0, 0.0, 0.0],
+        'removed_atom_positions': [],
+        'removed_atom_count': 0,
+        'profile_slot': 0,
+        'site_selection_weight': 12.0,
+    }
+    merged = merge_reference_exit_sites([native], [profile])
+    assert merged[0]['site_selection_weight'] == 1.0
+    assert merged[1]['removed_atom_positions'] == [[11.0, 0.0, 0.0]]
 
 
 def test_allocate_sum_equals_n_extra():

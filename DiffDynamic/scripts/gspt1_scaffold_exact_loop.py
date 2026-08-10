@@ -13,7 +13,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional
 
 import yaml
 
@@ -61,6 +61,10 @@ VARIANTS = (
     # Exit-profile ablation: use the reference-derived exit distribution while
     # retaining the legacy pocket-size prior and TargetDiff baseline control.
     ("profile_legacy_tbr_020", "native_template", 0.20, 0.25, True, True,
+     "prior_minus_scaffold", "weighted_single"),
+    # The dominant reference exit is scaffold slot 0.  Isolate that geometry
+    # while retaining the native target-side coordinate template only.
+    ("profile_slot0_tbr_020", "native_template", 0.20, 0.25, True, True,
      "prior_minus_scaffold", "weighted_single"),
     # Same profiled exits with the observed reference extra-atom size prior;
     # isolates size selection from the legacy pocket-size control.
@@ -124,6 +128,8 @@ def _variant_config(
     site_selection_mode: str,
     profile: dict[str, Any],
     extra_type_prior_strength: float = 0.0,
+    reference_exit_slots: Optional[List[int]] = None,
+    reference_exit_only: bool = False,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base)
     scaffold = config.setdefault("sample", {}).setdefault("scaffold", {})
@@ -142,6 +148,11 @@ def _variant_config(
     sites["reference_extra_type_prior_strength"] = float(
         extra_type_prior_strength
     )
+    if reference_exit_slots is None:
+        sites.pop("reference_exit_slots", None)
+    else:
+        sites["reference_exit_slots"] = [int(slot) for slot in reference_exit_slots]
+    sites["reference_exit_only"] = bool(reference_exit_only)
     sites["jitter_mode"] = jitter_mode
     sites["jitter_std"] = jitter_std
     scaffold.setdefault("grow", {})["extra_anchor_strength"] = anchor_strength
@@ -439,6 +450,10 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 extra_type_prior_strength={
                     "profile_type_prior_020": 0.35,
                 }.get(name, 0.0),
+                reference_exit_slots={
+                    "profile_slot0_tbr_020": [0],
+                }.get(name),
+                reference_exit_only=name == "profile_slot0_tbr_020",
             )
             _write_yaml(config, variant_config)
             jobs.append(
