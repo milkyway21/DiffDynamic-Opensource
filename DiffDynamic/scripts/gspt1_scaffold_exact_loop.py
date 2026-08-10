@@ -54,6 +54,14 @@ VARIANTS = (
      "reference_size_prior", "weighted_single"),
     ("native_anchor_020", "native_template", 0.20, 0.25, True, False,
      "reference_size_prior", "weighted_single"),
+    # Ablation: keep the coarse exit profile but restore the TargetDiff
+    # baseline refine, which is the strongest control in the pilot.
+    ("profile_baseline_020", "native_template", 0.20, 0.25, True, True,
+     "reference_size_prior", "weighted_single"),
+    # Ablation: keep the native single exit geometry, but use the reference
+    # heavy-atom count prior and the same baseline refine.
+    ("native_size_baseline_020", "native_template", 0.20, 0.25, False, True,
+     "reference_size_prior", "legacy"),
     ("hybrid_anchor_035", "hybrid", 0.35, 0.25, True, False,
      "reference_size_prior", "weighted_single"),
     ("directional_anchor_020", "directional", 0.20, 0.25, True, False,
