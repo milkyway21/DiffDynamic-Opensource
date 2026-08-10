@@ -74,6 +74,10 @@ VARIANTS = (
     # namespace and seed while keeping the same scaffold-only configuration.
     ("native_tbr_legacy_020_replica", "native_template", 0.20, 0.25,
      False, True, "prior_minus_scaffold", "legacy"),
+    # Restore the pilot's anchor-radial initial coordinates as a separate
+    # control; atom types and bonds remain fully model-generated.
+    ("anchor_radial_tbr_020", "anchor_radial", 0.20, 0.25, False, True,
+     "prior_minus_scaffold", "legacy"),
 )
 
 
@@ -318,6 +322,9 @@ def _choose_variants(
             if item not in chosen:
                 chosen.append(item)
                 break
+        unseen = [item for item in VARIANTS if item[0] not in variant_summaries]
+        if unseen:
+            chosen.append(unseen[0])
         for item in ranked:
             if item not in chosen:
                 chosen.append(item)

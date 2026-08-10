@@ -1102,6 +1102,29 @@ def _gaussian_site_position(
     return centroid + rng.normal(0.0, float(jitter_std), size=3)
 
 
+def _anchor_radial_site_position(
+    site: Dict[str, Any],
+    jitter_std: float,
+    rng: np.random.Generator,
+    atom_idx: int = 0,
+    site_count: int = 1,
+    radial_step: float = 1.3,
+    radial_bulk: float = 0.35,
+    radial_bulk_start: int = 4,
+) -> np.ndarray:
+    """Place atoms from the scaffold anchor along the exit direction."""
+    anchor = np.asarray(site['anchor_pos'], dtype=np.float64)
+    r = float(radial_step) * (float(atom_idx) + 1.0) + float(radial_bulk) * max(
+        0.0, float(atom_idx) + 1.0 - float(radial_bulk_start),
+    )
+    direction = _attachment_direction(site)
+    if direction is not None and r > 0.0:
+        position = anchor + direction * r
+    else:
+        position = anchor + np.array([1.5, 0.0, 0.0], dtype=np.float64)
+    return position + rng.normal(0.0, float(jitter_std), size=3)
+
+
 def _original_site_position(
     site: Dict[str, Any],
     jitter_std: float,
@@ -1409,6 +1432,14 @@ def init_extra_positions_at_sites(
         for atom_i in range(cnt):
             if use_gaussian:
                 positions.append(_gaussian_site_position(
+                    site, jitter_std, rng,
+                    atom_idx=atom_i, site_count=cnt,
+                    radial_step=radial_step,
+                    radial_bulk=radial_bulk,
+                    radial_bulk_start=radial_bulk_start,
+                ))
+            elif mode in ('anchor_radial', 'legacy_radial'):
+                positions.append(_anchor_radial_site_position(
                     site, jitter_std, rng,
                     atom_idx=atom_i, site_count=cnt,
                     radial_step=radial_step,
