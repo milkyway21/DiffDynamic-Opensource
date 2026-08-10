@@ -279,8 +279,12 @@ def _choose_variants(
         key=lambda item: _variant_score(variant_summaries.get(item[0], {})),
         reverse=True,
     )
-    least_run = sorted(VARIANTS, key=lambda item: run_counts.get(item[0], 0))
-    chosen = [ranked[0], least_run[0]]
+    unseen = [item for item in VARIANTS if item[0] not in variant_summaries]
+    if unseen:
+        chosen = [ranked[0], unseen[0]]
+    else:
+        least_run = sorted(VARIANTS, key=lambda item: run_counts.get(item[0], 0))
+        chosen = [ranked[0], least_run[0]]
     for item in ranked:
         if item not in chosen:
             chosen.append(item)
