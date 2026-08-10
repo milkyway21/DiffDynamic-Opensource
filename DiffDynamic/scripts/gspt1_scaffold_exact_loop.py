@@ -124,6 +124,11 @@ def _variant_config(
         sites.pop("site_selection_mode", None)
     else:
         sites["site_selection_mode"] = site_selection_mode
+        if site_selection_mode == "weighted_single":
+            # weighted_single is selected after the per-site mode branch;
+            # otherwise the inherited sequential_random mode would split
+            # atoms across exits before concentration erased the weights.
+            sites["per_site_count_mode"] = "split"
     sites["site_budget_mode"] = "requested"
     sites["jitter_mode"] = jitter_mode
     sites["jitter_std"] = jitter_std
