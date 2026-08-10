@@ -66,6 +66,10 @@ VARIANTS = (
     # while retaining the native target-side coordinate template only.
     ("profile_slot0_tbr_020", "native_template", 0.20, 0.25, True, True,
      "prior_minus_scaffold", "weighted_single"),
+    # Same slot-0 geometry with the observed 13-25 heavy-atom size prior;
+    # isolates fragment completeness from exit placement.
+    ("profile_slot0_size_tbr_020", "native_template", 0.20, 0.25, True, True,
+     "reference_size_prior", "weighted_single"),
     # Same profiled exits with the observed reference extra-atom size prior;
     # isolates size selection from the legacy pocket-size control.
     ("profile_size_tbr_020", "native_template", 0.20, 0.25, True, True,
@@ -452,8 +456,12 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 }.get(name, 0.0),
                 reference_exit_slots={
                     "profile_slot0_tbr_020": [0],
+                    "profile_slot0_size_tbr_020": [0],
                 }.get(name),
-                reference_exit_only=name == "profile_slot0_tbr_020",
+                reference_exit_only=name in {
+                    "profile_slot0_tbr_020",
+                    "profile_slot0_size_tbr_020",
+                },
             )
             _write_yaml(config, variant_config)
             jobs.append(
