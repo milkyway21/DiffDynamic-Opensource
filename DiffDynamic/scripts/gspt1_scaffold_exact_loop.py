@@ -151,9 +151,20 @@ def _write_manifest(
     start_seed: int,
     gpus: list[int],
 ) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    campaign_started_at = time.time()
+    manifest_path = root / "campaign_manifest.json"
+    if manifest_path.exists():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            previous_started_at = float(previous.get("created_at_unix", 0.0))
+            if previous_started_at > 0.0:
+                campaign_started_at = previous_started_at
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
     manifest = {
         "campaign": "GSPT1 scaffold exact-match loop",
-        "created_at_unix": time.time(),
+        "created_at_unix": campaign_started_at,
         "git_sha": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
         ).strip(),
@@ -179,8 +190,7 @@ def _write_manifest(
             "vina": False,
         },
     }
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "campaign_manifest.json").write_text(
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
