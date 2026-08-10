@@ -62,6 +62,10 @@ VARIANTS = (
     # retaining the legacy pocket-size prior and TargetDiff baseline control.
     ("profile_legacy_tbr_020", "native_template", 0.20, 0.25, True, True,
      "prior_minus_scaffold", "weighted_single"),
+    # Same profiled exits with the observed reference extra-atom size prior;
+    # isolates size selection from the legacy pocket-size control.
+    ("profile_size_tbr_020", "native_template", 0.20, 0.25, True, True,
+     "reference_size_prior", "weighted_single"),
     # Ablation: keep the native single exit geometry, but use the reference
     # heavy-atom count prior and the same baseline refine.
     ("native_size_baseline_020", "native_template", 0.20, 0.25, False, True,
