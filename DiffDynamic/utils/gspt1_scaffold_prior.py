@@ -1,9 +1,9 @@
 """Reference-derived priors for GSPT1 scaffold generation.
 
 The profile intentionally contains only coarse information: scaffold-local
-exit frequencies, extra-heavy-atom counts, and optional aggregate element
-counts.  It never stores a reference target-side fragment, atom order, bond,
-coordinate, or SMILES.
+exit frequencies, extra-heavy-atom counts, and element-count multisets.  It
+never stores a reference target-side fragment, atom order, bond, coordinate,
+or SMILES.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from rdkit import Chem, RDLogger
 
 RDLogger.DisableLog("rdApp.*")
 
-PROFILE_VERSION = 2
-SUPPORTED_PROFILE_VERSIONS = {1, PROFILE_VERSION}
+PROFILE_VERSION = 3
+SUPPORTED_PROFILE_VERSIONS = {1, 2, PROFILE_VERSION}
 SUPPORTED_GENERATION_ELEMENTS = {
     "C", "N", "O", "F", "P", "S", "Cl",
 }
@@ -283,6 +283,9 @@ def build_class_scaffold_profile(
     selected -= excluded
 
     pattern_counts: Counter[tuple[tuple[int, int], ...]] = Counter()
+    type_pattern_counts: Counter[
+        tuple[int, tuple[tuple[str, int], ...]]
+    ] = Counter()
     element_counts: Counter[str] = Counter()
     aromatic_counts: Counter[str] = Counter()
     unsupported_counts: Counter[str] = Counter()
@@ -308,6 +311,15 @@ def build_class_scaffold_profile(
         element_counts.update(record["element_counts"])
         aromatic_counts.update(record["aromatic_counts"])
         unsupported_counts.update(record["unsupported_counts"])
+        if (
+            not record["unsupported_counts"]
+            and sum(record["aromatic_counts"].values()) == record["n_extra"]
+        ):
+            type_key = (
+                int(record["n_extra"]),
+                tuple(sorted(record["aromatic_counts"].items())),
+            )
+            type_pattern_counts[type_key] += 1
 
     if not pattern_counts:
         raise ValueError(f"no trusted references matched class {class_name}")
@@ -330,6 +342,19 @@ def build_class_scaffold_profile(
             },
             "weight": int(weight),
         })
+
+    extra_type_patterns = [
+        {
+            "n_extra": int(n_extra),
+            "class_counts": {
+                str(key): int(count) for key, count in class_counts
+            },
+            "weight": int(weight),
+        }
+        for (n_extra, class_counts), weight in sorted(
+            type_pattern_counts.items(), key=lambda item: item[0]
+        )
+    ]
 
     weights = {
         str(slot): float(count) + float(exploration_floor)
@@ -356,6 +381,7 @@ def build_class_scaffold_profile(
             int(size_counts[value]) for value in sorted(size_counts)
         ],
         "allocation_patterns": allocation_patterns,
+        "extra_type_patterns": extra_type_patterns,
         "reference_extra_element_counts": dict(element_counts),
         "reference_extra_aromatic_element_counts": dict(aromatic_counts),
         "unsupported_extra_element_counts": dict(unsupported_counts),
@@ -472,6 +498,39 @@ def load_scaffold_profile(path: str | Path) -> dict[str, Any]:
                 "site_counts": site_counts,
                 "weight": weight,
             })
+    extra_type_patterns = []
+    for raw_pattern in payload.get("extra_type_patterns") or []:
+        class_counts = {}
+        for raw_key, raw_count in (
+            raw_pattern.get("class_counts") or {}
+        ).items():
+            try:
+                symbol, aromatic_text = str(raw_key).rsplit("|", 1)
+                aromatic = int(aromatic_text)
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue
+            if (
+                symbol not in SUPPORTED_GENERATION_ELEMENTS
+                or aromatic not in (0, 1)
+                or count <= 0
+            ):
+                continue
+            class_counts[f"{symbol}|{aromatic}"] = count
+        n_extra = int(
+            raw_pattern.get("n_extra", sum(class_counts.values()))
+        )
+        weight = max(float(raw_pattern.get("weight", 1.0)), 0.0)
+        if (
+            class_counts
+            and sum(class_counts.values()) == n_extra
+            and weight > 0
+        ):
+            extra_type_patterns.append({
+                "n_extra": n_extra,
+                "class_counts": class_counts,
+                "weight": weight,
+            })
     return {
         "profile_version": profile_version,
         "profile_kind": str(payload.get("profile_kind", "coarse")),
@@ -489,6 +548,7 @@ def load_scaffold_profile(path: str | Path) -> dict[str, Any]:
             ).items()
         },
         "allocation_patterns": allocation_patterns,
+        "extra_type_patterns": extra_type_patterns,
         "included_reference_indices": [
             int(index) for index in payload.get("included_reference_indices", [])
         ],

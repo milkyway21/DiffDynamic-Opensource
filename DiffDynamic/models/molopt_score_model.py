@@ -1023,13 +1023,19 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
         return preds  # 返回包含隐藏表示的字典。
 
     @staticmethod
-    def _truncate_schedule_to_grad_fusion_iterations(time_indices, cap, anchor_t=None):
+    def _truncate_schedule_to_grad_fusion_iterations(
+        time_indices,
+        cap,
+        anchor_t=None,
+        preserve_endpoint=False,
+    ):
         """截断调度列表长度。
 
         `time_indices` 的每一项对应 `_dynamic_diffusion` 里 for 循环的一次迭代，即一次网络前向 +
         （若 `use_grad_fusion`）一次 λ 梯度融合更新。此处的 cap 表示最多保留多少次这样的迭代，
         与扩散步数 num_timesteps（如 1000）或某个离散 t 的数值无关。
 
+        - ``preserve_endpoint=True``：在选定起点到原调度终点之间均匀抽取最多 ``cap`` 项，确保精炼抵达低噪声终点。
         - ``anchor_t is None``：保留完整调度的前 ``cap`` 项（``time_indices[:cap]``），即从高 t 端起算。
         - ``anchor_t`` 为整数：先在**完整**调度中找与 ``anchor_t`` 最接近的离散 t 所在下标 ``i0``（并列取更小下标），
           再取 ``time_indices[i0 : i0 + cap]``，即沿用原规划的跳步间隔，从锚点附近起连续走 ``cap`` 步。
@@ -1043,6 +1049,23 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
             return out
         if n < 1:
             return out
+        if preserve_endpoint:
+            start_i = 0
+            if anchor_t is not None:
+                try:
+                    at = int(anchor_t)
+                    start_i = min(
+                        range(len(out)), key=lambda i: (abs(int(out[i]) - at), i)
+                    )
+                except (TypeError, ValueError):
+                    start_i = 0
+            window = out[start_i:]
+            if len(window) <= n:
+                return window
+            if n == 1:
+                return [window[-1]]
+            indices = np.linspace(0, len(window) - 1, n, dtype=int)
+            return [window[int(i)] for i in indices]
         if anchor_t is None:
             return out[:n] if len(out) > n else out
         try:
@@ -1639,6 +1662,7 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
                                     max_grad_fusion_iterations=GRAD_FUSION_CAP_UNSPECIFIED,
                                     max_gradient_steps=GRAD_FUSION_CAP_UNSPECIFIED,
                                     grad_fusion_anchor_t=None,
+                                    preserve_schedule_endpoint=None,
                                     repaint_cfg=None):
 
         if center_pos_mode is None:  # 未指定中心化模式时使用默认值。
@@ -1713,8 +1737,16 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
             _rcap = max_gradient_steps
         else:
             _rcap = defaults.get('max_grad_fusion_iterations', defaults.get('max_gradient_steps'))
+        if preserve_schedule_endpoint is None:
+            preserve_schedule_endpoint = bool(
+                defaults.get('preserve_schedule_endpoint', False)
+            )
         time_indices = self._truncate_schedule_to_grad_fusion_iterations(
-            time_indices, _rcap, anchor_t=grad_fusion_anchor_t)
+            time_indices,
+            _rcap,
+            anchor_t=grad_fusion_anchor_t,
+            preserve_endpoint=bool(preserve_schedule_endpoint),
+        )
 
         pos_traj_total, log_v_traj_total = [], []  # 初始化轨迹列表。
         ligand_pos_current, log_ligand_v_current = ligand_pos, log_ligand_v  # 初始化当前状态。

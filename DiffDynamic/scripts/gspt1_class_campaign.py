@@ -53,7 +53,7 @@ DEFAULT_PROTEIN = Path(
 )
 DEFAULT_ROOT = Path(
     "/data/zhang/Ye/DiffDynamic_outputs/hsvpol/"
-    "molglue_ikzf2_gspt1/diffdynamic/gspt1_class_campaign"
+    "molglue_ikzf2_gspt1/diffdynamic/gspt1_scaffold_repaint_v3"
 )
 
 
@@ -129,6 +129,7 @@ def build_class_config(
         "pocket_growth_step_max": 1.55,
         "pocket_relax_iterations": 120,
         "reference_extra_type_prior_strength": 1.0,
+        "reference_extra_type_prior_mode": "quota_random",
     })
     grow = scaffold.setdefault("grow", {})
     grow.update({
@@ -140,13 +141,26 @@ def build_class_config(
         "n_extra_max": max(profile["n_extra_values"]),
         "n_extra_min_clamp": min(profile["n_extra_values"]),
         "n_extra_max_clamp": max(profile["n_extra_values"]),
-        # Added atoms are initialized, but never position- or type-masked.
+        # Start from a valid q(x_999 | x_0) state. RePaint injects the core
+        # back at every reverse step in the same noise coordinate system.
+        "start_t": 999,
+        "forward_noise_init": True,
+        # Added-atom positions remain free; type identities receive only a
+        # weak, randomly permuted multiset prior.
         "extra_anchor_strength": 0.0,
+        # Weakly condition the element multiset without hard-locking identities.
+        "extra_type_anchor_strength": 0.2,
+    })
+    dynamic_refine = sample.setdefault("dynamic", {}).setdefault("refine", {})
+    dynamic_refine.update({
+        "max_grad_fusion_iterations": 30,
+        "preserve_schedule_endpoint": True,
     })
     targetdiff = sample.setdefault("targetdiff_baseline_refine", {})
     targetdiff.update({
         "enable": True,
-        "start_t": 19,
+        # Inclusive t=29..0 gives exactly 30 baseline repair updates.
+        "start_t": 29,
         "lock_prefix": "types_and_pos",
         "after_scaffold_init_only": False,
         "refine_batch_size": 100,
@@ -359,7 +373,10 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "original_scaffold_type_locked": True,
             "added_position_locked": False,
             "added_type_locked": False,
-            "targetdiff_reverse_steps": 20,
+            "added_type_soft_anchor_strength": 0.2,
+            "diffusion_start_t": 999,
+            "diffdynamic_refine_max_iterations": 30,
+            "targetdiff_reverse_steps": 30,
             "reference_target_graph_used": False,
             "post_generation_graph_editing": False,
             "scaffold_attachment_reconstruction": "site_anchor_first_extra",
@@ -508,7 +525,7 @@ def main() -> None:
     parser.add_argument("--reference-sdf", default=str(DEFAULT_REFERENCE))
     parser.add_argument("--native-ligand", default=str(DEFAULT_NATIVE))
     parser.add_argument("--protein", default=str(DEFAULT_PROTEIN))
-    parser.add_argument("--start-seed", type=int, default=20273000)
+    parser.add_argument("--start-seed", type=int, default=20280000)
     parser.add_argument("--gpus", default="3,4,5")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()

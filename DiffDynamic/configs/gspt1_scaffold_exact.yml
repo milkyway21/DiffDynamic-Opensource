@@ -89,7 +89,8 @@ sample:
       noise_scale: 0
       use_adaptive_step: true
       use_time_scale: false
-      max_grad_fusion_iterations: 15
+      max_grad_fusion_iterations: 30
+      preserve_schedule_endpoint: true
   optimization:
     enable: false
     after_dynamic: true
@@ -202,9 +203,11 @@ sample:
       reference_size_values: [13, 14, 15, 16, 17, 21, 25]
       reference_size_weights: [4, 7, 1, 1, 1, 1, 1]
       num_samples: 200
-      start_t: 650
+      start_t: 999
+      forward_noise_init: true
       # 新原子保留少量 site 几何先验，避免大步扩散一开始就丢出 target-side pocket
       extra_anchor_strength: 0.2
+      extra_type_anchor_strength: 0.2
       stride: 15
       step_size: 0.3363
       lambda_coeff_a: 37
@@ -220,7 +223,7 @@ sample:
       target_final_count: null
   targetdiff_baseline_refine:
     enable: true
-    start_t: 50
+    start_t: 29
     lock_prefix: types_and_pos
     after_scaffold_init_only: false
     run_every_prudent_round: true

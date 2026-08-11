@@ -10,7 +10,9 @@ import pytest
 import torch
 from rdkit import Chem
 
+from models.molopt_score_model import ScorePosNet3D
 from scripts.gspt1_class_campaign import build_class_config, geometry_preflight
+from scripts.sample_diffusion import _sample_reference_extra_type_quota
 from utils.gspt1_class_setup import (
     CLASS_SPECS,
     F_SCAFFOLD_SMARTS,
@@ -153,9 +155,18 @@ def test_class_config_locks_only_original_scaffold():
     assert scaffold["fix_scaffold_pos"] is True
     assert scaffold["fix_scaffold_type"] is True
     assert scaffold["grow"]["extra_anchor_strength"] == 0.0
+    assert scaffold["grow"]["extra_type_anchor_strength"] == 0.2
+    assert scaffold["grow"]["start_t"] == 999
+    assert scaffold["grow"]["forward_noise_init"] is True
     assert scaffold["grow"]["reference_size_values"] == [13, 14]
+    assert scaffold["murcko_sites"]["reference_extra_type_prior_mode"] == (
+        "quota_random"
+    )
+    dynamic_refine = config["sample"]["dynamic"]["refine"]
+    assert dynamic_refine["max_grad_fusion_iterations"] == 30
+    assert dynamic_refine["preserve_schedule_endpoint"] is True
     refine = config["sample"]["targetdiff_baseline_refine"]
-    assert refine["start_t"] == 19
+    assert refine["start_t"] == 29
     assert refine["lock_prefix"] == "types_and_pos"
 
 
@@ -169,12 +180,11 @@ def test_trusted_profiles_have_exact_discrete_sizes(tmp_path):
     )
     assert f_ligand.exists()
     assert profiles["no_f"]["n_extra_values"] == [13, 14]
-    assert profiles["f_main"]["n_extra_values"] == [14, 15, 16]
+    assert profiles["f_main"]["n_extra_values"] == [14, 16]
     assert profiles["f_large"]["n_extra_values"] == [24]
-    assert profiles["f_main"]["unsupported_extra_element_counts"] == {
-        "Br": 1
-    }
-    assert profiles["no_f"]["excluded_reference_indices"] == [6, 12]
+    assert profiles["f_main"]["unsupported_extra_element_counts"] == {}
+    assert profiles["no_f"]["excluded_reference_indices"] == [6, 12, 15]
+    assert profiles["f_main"]["included_reference_indices"] == [14, 16]
     assert load_scaffold_profile(paths["f_large"])["allocation_patterns"] == [
         {
             "n_extra": 24,
@@ -182,10 +192,56 @@ def test_trusted_profiles_have_exact_discrete_sizes(tmp_path):
             "weight": 1.0,
         }
     ]
+    assert load_scaffold_profile(paths["f_large"])["extra_type_patterns"] == [
+        {
+            "n_extra": 24,
+            "class_counts": {
+                "C|0": 12,
+                "C|1": 6,
+                "F|0": 2,
+                "N|0": 1,
+                "O|0": 3,
+            },
+            "weight": 1.0,
+        }
+    ]
     supplier = Chem.SDMolSupplier(str(f_ligand), removeHs=False)
     molecule = supplier[0]
     assert molecule is not None
     assert molecule.HasSubstructMatch(Chem.MolFromSmarts(F_SCAFFOLD_SMARTS))
+
+
+def test_quota_type_prior_preserves_counts_but_not_reference_order():
+    profile = {
+        "extra_type_patterns": [{
+            "n_extra": 8,
+            "class_counts": {"C|0": 3, "C|1": 2, "N|0": 1, "O|0": 2},
+            "weight": 1.0,
+        }]
+    }
+    first = _sample_reference_extra_type_quota(
+        profile, "add_aromatic", 13, 8, "cpu", np.random.default_rng(2)
+    ).argmax(dim=-1)
+    second = _sample_reference_extra_type_quota(
+        profile, "add_aromatic", 13, 8, "cpu", np.random.default_rng(3)
+    ).argmax(dim=-1)
+    assert torch.bincount(first, minlength=13).tolist()[:6] == [0, 3, 2, 1, 0, 2]
+    assert not torch.equal(first, second)
+
+
+def test_refine_cap_can_preserve_low_noise_endpoint():
+    schedule = list(range(650, -1, -5))
+    historical = ScorePosNet3D._truncate_schedule_to_grad_fusion_iterations(
+        schedule, 30
+    )
+    truncated = ScorePosNet3D._truncate_schedule_to_grad_fusion_iterations(
+        schedule, 30, preserve_endpoint=True
+    )
+    assert historical == schedule[:30]
+    assert historical[-1] != 0
+    assert len(truncated) == 30
+    assert truncated[0] == 650
+    assert truncated[-1] == 0
 
 
 @pytest.mark.skipif(

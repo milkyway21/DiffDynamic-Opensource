@@ -153,6 +153,63 @@ def _reference_extra_type_log_prior(
     return log_prior
 
 
+def _sample_reference_extra_type_quota(
+    profile: dict,
+    ligand_atom_mode: str,
+    n_classes: int,
+    n_extra: int,
+    device,
+    rng: np.random.Generator,
+):
+    """Sample a shuffled element-count multiset for one extra fragment.
+
+    Profiles contain counts such as ``C|1: 6`` but no atom ordering, bonds,
+    coordinates, or reference-side graph. Shuffling makes the assignment an
+    exchangeable type prior rather than a copied target fragment.
+    """
+    candidates = [
+        pattern
+        for pattern in profile.get('extra_type_patterns', [])
+        if int(pattern.get('n_extra', -1)) == int(n_extra)
+    ]
+    if not candidates:
+        return None
+    weights = np.asarray(
+        [max(float(pattern.get('weight', 0.0)), 0.0) for pattern in candidates],
+        dtype=np.float64,
+    )
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
+        return None
+    selected = candidates[int(rng.choice(len(candidates), p=weights / weights.sum()))]
+
+    periodic_table = Chem.GetPeriodicTable()
+    class_indices = []
+    for key, raw_count in sorted(selected.get('class_counts', {}).items()):
+        try:
+            symbol, aromatic_text = str(key).rsplit('|', 1)
+            atomic_number = int(periodic_table.GetAtomicNumber(symbol))
+            aromatic = bool(int(aromatic_text))
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            return None
+        if ligand_atom_mode == 'add_aromatic':
+            class_idx = trans.MAP_ATOM_TYPE_AROMATIC_TO_INDEX.get(
+                (atomic_number, aromatic)
+            )
+        elif ligand_atom_mode == 'basic':
+            class_idx = trans.MAP_ATOM_TYPE_ONLY_TO_INDEX.get(atomic_number)
+        else:
+            return None
+        if class_idx is None or int(class_idx) >= int(n_classes) or count <= 0:
+            return None
+        class_indices.extend([int(class_idx)] * count)
+    if len(class_indices) != int(n_extra):
+        return None
+    rng.shuffle(class_indices)
+    type_indices = torch.tensor(class_indices, dtype=torch.long, device=device)
+    return index_to_log_onehot(type_indices, int(n_classes))
+
+
 def _resolve_init_preserved_atoms(
     attachment_sites,
     place_meta,
@@ -200,7 +257,7 @@ def _dynamic_subcfg_grad_cap_kwargs(subcfg):
     仅当 YAML 显式写出键时才传入具体值；未写键用 GRAD_FUSION_CAP_UNSPECIFIED 走该段 defaults。
     显式 ``null`` 表示不截断（跑满调度），与「未写键」区分。
     """
-    return {
+    kwargs = {
         'max_grad_fusion_iterations': (
             subcfg['max_grad_fusion_iterations']
             if 'max_grad_fusion_iterations' in subcfg
@@ -212,6 +269,11 @@ def _dynamic_subcfg_grad_cap_kwargs(subcfg):
             else GRAD_FUSION_CAP_UNSPECIFIED
         ),
     }
+    if 'preserve_schedule_endpoint' in subcfg:
+        kwargs['preserve_schedule_endpoint'] = bool(
+            subcfg['preserve_schedule_endpoint']
+        )
+    return kwargs
 
 
 def get_time_boundary(dynamic_cfg, default=750):
@@ -7438,6 +7500,28 @@ def scaffold_dynamic_locked_molecule(
     log_mode_is_log_prob = (getattr(model, 'ligand_v_input', 'onehot') == 'log_prob')
 
     extra_anchor_strength = float(grow_cfg.get('extra_anchor_strength', 0.0))
+    extra_type_anchor_strength = float(
+        grow_cfg.get('extra_type_anchor_strength', 0.0)
+    )
+    extra_type_anchor_strength = min(max(extra_type_anchor_strength, 0.0), 1.0)
+    forward_noise_init = bool(grow_cfg.get('forward_noise_init', False))
+    diffusion_start_t = int(np.clip(
+        grow_cfg.get('start_t', model.num_timesteps - 1),
+        1,
+        model.num_timesteps - 1,
+    ))
+    extra_type_profile = None
+    if (
+        _murcko_sites_cfg.get('reference_extra_type_prior_mode') == 'quota_random'
+        and _murcko_sites_cfg.get('reference_exit_profile')
+    ):
+        try:
+            extra_type_profile = load_scaffold_profile(
+                _murcko_sites_cfg['reference_exit_profile']
+            )
+        except Exception as exc:
+            if logger:
+                logger.warning(f'[ScaffoldTypes] quota prior unavailable: {exc}')
     extra_type_log_prior = _reference_extra_type_log_prior(
         _murcko_sites_cfg,
         ligand_atom_mode,
@@ -7446,9 +7530,20 @@ def scaffold_dynamic_locked_molecule(
         logger=logger,
     )
 
-    def _extra_log_v_init(count: int):
+    def _extra_log_v_init(count: int, rng: np.random.Generator):
         if count <= 0:
             return torch.zeros(0, model.num_classes, device=device)
+        if extra_type_profile is not None:
+            quota_log_v = _sample_reference_extra_type_quota(
+                extra_type_profile,
+                ligand_atom_mode,
+                model.num_classes,
+                count,
+                device,
+                rng,
+            )
+            if quota_log_v is not None:
+                return quota_log_v
         if extra_type_log_prior is not None:
             return extra_type_log_prior.unsqueeze(0).expand(count, -1)
         return F.log_softmax(
@@ -7483,10 +7578,11 @@ def scaffold_dynamic_locked_molecule(
         # ---- 初始化：从 scaffold attachment/exit-vector 放置新原子；不保留旧侧链 --
         # build_extra_atom_positions 使用锚点、去除片段位置和 anchor→centroid 方向，
         # 避免把整段新片段撒在远离成键锚点的侧链质心球内。
+        sample_rng = _murcko_sample_rng(grow_cfg, sample_idx)
         extra_pos_world, _site_place_meta = build_extra_atom_positions(
             n_extra, _attachment_sites, _place_cfg,
             protein_centroid, device, fallback_noise_scale=1.0, logger=logger,
-            rng=_murcko_sample_rng(grow_cfg, sample_idx),
+            rng=sample_rng,
             protein_positions=batch.protein_pos,
         )
         n_extra = int(extra_pos_world.size(0))
@@ -7510,12 +7606,12 @@ def scaffold_dynamic_locked_molecule(
             init_ligand_pos[n_locked:] = extra_pos_world
         batch_ligand = torch.zeros(n_total, dtype=torch.long, device=device)
 
+        extra_log_v = _extra_log_v_init(n_extra, sample_rng)
         if fix_scaffold_type and n_locked > 0:
             scaffold_log_part = (
                 log_ref_v[scaffold_indices] if n_scaffold > 0
                 else torch.zeros(0, model.num_classes, device=device)
             )
-            extra_log_v = _extra_log_v_init(n_extra)
             init_ligand_v_input = torch.cat(
                 [scaffold_log_part, preserved_log_v, extra_log_v], dim=0
             )
@@ -7545,9 +7641,8 @@ def scaffold_dynamic_locked_molecule(
                 log_ref_v[scaffold_indices] if n_scaffold > 0
                 else torch.zeros(0, model.num_classes, device=device)
             )
-            extra_log_v_pad = _extra_log_v_init(n_extra)
             x0_log_v_ref = torch.cat(
-                [scaffold_log_v, preserved_log_v, extra_log_v_pad], dim=0
+                [scaffold_log_v, preserved_log_v, extra_log_v], dim=0
             )
 
             pos_mask_local = torch.zeros(n_total, device=device)
@@ -7558,9 +7653,12 @@ def scaffold_dynamic_locked_molecule(
                 pos_mask_local[n_locked:] = extra_anchor_strength
 
             type_mask_local = None
-            if fix_scaffold_type:
+            if fix_scaffold_type or extra_type_anchor_strength > 0.0:
                 type_mask_local = torch.zeros(n_total, device=device)
-                type_mask_local[:n_locked] = 1.0
+                if fix_scaffold_type:
+                    type_mask_local[:n_locked] = 1.0
+                if extra_type_anchor_strength > 0.0 and n_extra > 0:
+                    type_mask_local[n_locked:] = extra_type_anchor_strength
 
             repaint_cfg = {
                 'x0_pos': x0_pos_ref,
@@ -7570,6 +7668,34 @@ def scaffold_dynamic_locked_molecule(
                 'use_mean_for_discrete': True,
                 '_use_dual_mask': True,
             }
+
+        large_init_pos = init_ligand_pos
+        large_init_v = init_ligand_v_input
+        if forward_noise_init and not baseline_init_only and not refine_only:
+            _, init_pos_centered, init_offset = center_pos(
+                batch.protein_pos,
+                init_ligand_pos,
+                batch_protein,
+                batch_ligand,
+                mode=center_pos_mode,
+            )
+            noised_pos, noised_log_v = _forward_diffuse_molecule(
+                model,
+                init_pos_centered,
+                ensure_log_ligand(
+                    init_ligand_v_input, model.num_classes, mode='auto'
+                ),
+                batch_ligand,
+                diffusion_start_t,
+                device,
+            )
+            large_init_pos = noised_pos + init_offset[batch_ligand]
+            large_init_v = noised_log_v
+            if logger and sample_idx == 0:
+                logger.info(
+                    f'[ScaffoldDynamicLocked] q(x_t|x_0) initialization at '
+                    f't={diffusion_start_t}; scaffold is reintroduced by RePaint'
+                )
 
         t_start_wall = time.time()
         with torch.no_grad():
@@ -7629,8 +7755,8 @@ def scaffold_dynamic_locked_molecule(
                     protein_pos=batch.protein_pos,
                     protein_v=batch.protein_atom_feature.float(),
                     batch_protein=batch_protein,
-                    init_ligand_pos=init_ligand_pos,
-                    init_ligand_v=init_ligand_v_input,
+                    init_ligand_pos=large_init_pos,
+                    init_ligand_v=large_init_v,
                     batch_ligand=batch_ligand,
                     num_steps=large_cfg.get('num_steps'),
                     center_pos_mode=center_pos_mode,

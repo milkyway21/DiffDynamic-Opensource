@@ -17,7 +17,9 @@ from utils.gspt1_scaffold_prior import (
 
 BASE_SCAFFOLD_SMARTS = "O=C1CCC(N2Cc3ccccc3C2=O)C(=O)N1"
 F_SCAFFOLD_SMARTS = "O=C1CCC(N2Cc3c(F)cccc3C2=O)C(=O)N1"
-EXCLUDED_REFERENCE_INDICES = (6, 12)
+# Reference 15 contains Br, which is not represented by the checkpoint atom
+# vocabulary. Keeping it would create an impossible n_extra=15 branch.
+EXCLUDED_REFERENCE_INDICES = (6, 12, 15)
 
 
 @dataclass(frozen=True)
@@ -41,11 +43,11 @@ CLASS_SPECS = (
     ),
     Gspt1ClassSpec(
         name="f_main",
-        reference_indices=(14, 15, 16),
+        reference_indices=(14, 16),
         scaffold_smarts=F_SCAFFOLD_SMARTS,
         ligand_kind="f_core",
         jitter_mode="pocket_aware_template",
-        allowed_n_extra=(14, 15, 16),
+        allowed_n_extra=(14, 16),
     ),
     Gspt1ClassSpec(
         name="f_large",
