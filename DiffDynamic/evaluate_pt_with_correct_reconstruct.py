@@ -70,6 +70,7 @@ if str(REPO_ROOT) not in sys.path:
 # Optional RDKit topology repair after reconstruct (see sample.rdkit_structure_repair).
 # Set via --rdkit-structure-repair CLI; default None keeps paper baselines unchanged.
 _RDKIT_STRUCTURE_REPAIR_CFG = None
+_TRUE_VALUES = {'1', 'true', 'yes', 'on'}
 
 # Optional aggressive medchem optimization, applied after reconstruct + fragment
 # removal and *before* physchem / Vina, so every reported metric describes the
@@ -3089,6 +3090,9 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                 protein_id = extract_protein_id(ligand_filename=ligand_filename, protein_filename=protein_filename)
                 generation_time = datetime.now()
                 molecule_id = generate_molecule_id(protein_id, generation_time, comprehensive_score)
+                id_suffix = os.environ.get('EVAL_MOLECULE_ID_SUFFIX', '').strip()
+                if id_suffix:
+                    molecule_id = f"{molecule_id}_{id_suffix}_{idx:04d}"
                 # dynamic_then_optimization 模式下，优化变体追加 _opN_from_{原分子id}，from_id 必须源于 dynamic 结束时的分子
                 if use_split_sdf_dirs and idx < len(meta_records):
                     rec = meta_records[idx]
@@ -5749,39 +5753,40 @@ def main():
         print(f"\n✅ 评估成功完成！")
         
         _eval_out_for_history = results.get('eval_output_dir') or args.output_dir
-        # 更新sampling_history.xlsx中的评测信息
-        try:
-            update_sampling_history(
-                pt_file=str(pt_path),
-                statistics=results.get('statistics', {}),
-                output_dir=_eval_out_for_history,
-                num_samples=results.get('num_samples'),
-                n_reconstruct_success=results.get('n_reconstruct_success'),
-                n_eval_success=results.get('n_eval_success')
-            )
-        except Exception as e:
-            print(f"⚠️  更新sampling_history.xlsx失败: {e}")
-        
-        # 记录到全局日志文件
-        try:
-            record_evaluation_to_global_log(
-                pt_file=str(pt_path),
-                ligand_filename=results.get('ligand_filename', 'N/A'),
-                protein_root=args.protein_root,
-                atom_mode=args.atom_mode,
-                exhaustiveness=args.exhaustiveness,
-                start_time=start_time,
-                end_time=end_time,
-                num_samples=results.get('num_samples', 0),
-                n_reconstruct_success=results.get('n_reconstruct_success', 0),
-                n_eval_success=results.get('n_eval_success', 0),
-                n_complete=results.get('n_complete', 0),
-                statistics=results.get('statistics', {}),
-                output_dir=_eval_out_for_history,
-                data_id=results.get('data_id')  # 传递data_id
-            )
-        except Exception as e:
-            print(f"⚠️  记录全局日志失败: {e}")
+        if os.environ.get('DIFFDYNAMIC_SKIP_EVAL_RECORDS', '').lower() not in _TRUE_VALUES:
+            # Parallel scaffold chunks must not concurrently rewrite the same
+            # sampling_history.xlsx/global log files.
+            try:
+                update_sampling_history(
+                    pt_file=str(pt_path),
+                    statistics=results.get('statistics', {}),
+                    output_dir=_eval_out_for_history,
+                    num_samples=results.get('num_samples'),
+                    n_reconstruct_success=results.get('n_reconstruct_success'),
+                    n_eval_success=results.get('n_eval_success')
+                )
+            except Exception as e:
+                print(f"⚠️  更新sampling_history.xlsx失败: {e}")
+
+            try:
+                record_evaluation_to_global_log(
+                    pt_file=str(pt_path),
+                    ligand_filename=results.get('ligand_filename', 'N/A'),
+                    protein_root=args.protein_root,
+                    atom_mode=args.atom_mode,
+                    exhaustiveness=args.exhaustiveness,
+                    start_time=start_time,
+                    end_time=end_time,
+                    num_samples=results.get('num_samples', 0),
+                    n_reconstruct_success=results.get('n_reconstruct_success', 0),
+                    n_eval_success=results.get('n_eval_success', 0),
+                    n_complete=results.get('n_complete', 0),
+                    statistics=results.get('statistics', {}),
+                    output_dir=_eval_out_for_history,
+                    data_id=results.get('data_id')
+                )
+            except Exception as e:
+                print(f"⚠️  记录全局日志失败: {e}")
         
         return 0
     else:
@@ -5795,4 +5800,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-

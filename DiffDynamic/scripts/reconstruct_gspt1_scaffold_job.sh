@@ -62,14 +62,14 @@ fi
 mkdir -p "$OUT"
 echo "[RUN] $TARGET/$JOB_TAG PT=$PT"
 echo "[POLICY] Vina disabled: --vina-modes none"
-python -u evaluate_pt_with_correct_reconstruct.py "$PT" \
-  --vina-modes none \
+SCAFFOLD_RECONSTRUCT_WORKERS="${SCAFFOLD_RECONSTRUCT_WORKERS:-30}"
+echo "[POLICY] Full evaluator chunk workers=$SCAFFOLD_RECONSTRUCT_WORKERS per job"
+python -u scripts/reconstruct_gspt1_scaffold_parallel_job.py "$PT" \
   --receptor_pdb "$PROTEIN" \
   --protein_root "$PROTEIN_ROOT" \
   --reference_ligand "$REF_LIG" \
   --output_dir "$OUT" \
-  --enable_isolation \
-  --no-distribution-plots \
+  --workers "$SCAFFOLD_RECONSTRUCT_WORKERS" \
   > "$OUT/extract.log" 2>&1
 
 N_SDF=$(find "$OUT" -name '*.sdf' -type f 2>/dev/null | wc -l)
