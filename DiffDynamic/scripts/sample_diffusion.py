@@ -7487,6 +7487,7 @@ def scaffold_dynamic_locked_molecule(
             n_extra, _attachment_sites, _place_cfg,
             protein_centroid, device, fallback_noise_scale=1.0, logger=logger,
             rng=_murcko_sample_rng(grow_cfg, sample_idx),
+            protein_positions=batch.protein_pos,
         )
         n_extra = int(extra_pos_world.size(0))
         (

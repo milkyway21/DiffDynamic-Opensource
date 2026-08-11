@@ -9,7 +9,7 @@ coordinate, or SMILES.
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -17,7 +17,11 @@ from rdkit import Chem, RDLogger
 
 RDLogger.DisableLog("rdApp.*")
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
+SUPPORTED_PROFILE_VERSIONS = {1, PROFILE_VERSION}
+SUPPORTED_GENERATION_ELEMENTS = {
+    "C", "N", "O", "F", "P", "S", "Cl",
+}
 
 
 def _normalise_text(path: Path) -> str:
@@ -170,6 +174,195 @@ def _reference_extra_element_counts(
     return elements, aromatic
 
 
+def _reference_component_profile(
+    mol: Chem.Mol,
+    scaffold_smarts: str,
+    native_slot_by_query_index: dict[int, int],
+) -> Optional[dict[str, Any]]:
+    """Summarize non-scaffold components without retaining their graphs."""
+    pattern = Chem.MolFromSmarts(scaffold_smarts)
+    if pattern is None:
+        return None
+    matches = mol.GetSubstructMatches(pattern, uniquify=True)
+    if not matches:
+        return None
+    match = tuple(int(i) for i in matches[0])
+    scaffold_set = set(match)
+    extra_indices = [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if atom.GetIdx() not in scaffold_set and atom.GetAtomicNum() > 1
+    ]
+    extra_set = set(extra_indices)
+    components: list[list[int]] = []
+    seen: set[int] = set()
+    for start in extra_indices:
+        if start in seen:
+            continue
+        component: list[int] = []
+        queue = deque([start])
+        seen.add(start)
+        while queue:
+            atom_idx = queue.popleft()
+            component.append(atom_idx)
+            for neighbour in mol.GetAtomWithIdx(atom_idx).GetNeighbors():
+                neighbour_idx = int(neighbour.GetIdx())
+                if neighbour_idx in extra_set and neighbour_idx not in seen:
+                    seen.add(neighbour_idx)
+                    queue.append(neighbour_idx)
+        components.append(component)
+
+    allocation: Counter[int] = Counter()
+    element_counts: Counter[str] = Counter()
+    aromatic_counts: Counter[str] = Counter()
+    unsupported_counts: Counter[str] = Counter()
+    for component in components:
+        anchor_slots: set[int] = set()
+        for atom_idx in component:
+            atom = mol.GetAtomWithIdx(atom_idx)
+            symbol = atom.GetSymbol()
+            if symbol in SUPPORTED_GENERATION_ELEMENTS:
+                element_counts[symbol] += 1
+                aromatic_counts[
+                    f"{symbol}|{int(atom.GetIsAromatic())}"
+                ] += 1
+            else:
+                unsupported_counts[symbol] += 1
+            for neighbour in atom.GetNeighbors():
+                neighbour_idx = int(neighbour.GetIdx())
+                if neighbour_idx not in scaffold_set:
+                    continue
+                query_idx = match.index(neighbour_idx)
+                slot = native_slot_by_query_index.get(query_idx)
+                if slot is not None:
+                    anchor_slots.add(int(slot))
+        if not anchor_slots:
+            continue
+        # Reference compounds in this task attach each outside component at
+        # one scaffold atom. Reject ambiguous bridged components explicitly.
+        if len(anchor_slots) != 1:
+            return None
+        allocation[next(iter(anchor_slots))] += len(component)
+
+    return {
+        "n_extra": len(extra_indices),
+        "allocation": allocation,
+        "element_counts": element_counts,
+        "aromatic_counts": aromatic_counts,
+        "unsupported_counts": unsupported_counts,
+    }
+
+
+def build_class_scaffold_profile(
+    reference_sdf: str | Path,
+    native_ligand_sdf: str | Path,
+    scaffold_smarts: str,
+    *,
+    class_name: str,
+    reference_indices: Iterable[int],
+    excluded_reference_indices: Iterable[int] = (),
+    exploration_floor: float = 0.0,
+) -> dict[str, Any]:
+    """Build one trusted GSPT1 class profile with joint site budgets.
+
+    The output stores only aggregate chemistry and component sizes per
+    scaffold slot. It never stores an outside graph, coordinate, atom order,
+    or SMILES.
+    """
+    native = _first_molecule(native_ligand_sdf)
+    if native is None:
+        raise ValueError(f"cannot parse native ligand: {native_ligand_sdf}")
+    native_match = _native_scaffold_match(native, scaffold_smarts)
+    sorted_native = sorted(native_match)
+    native_slot_by_query_index = {
+        query_idx: sorted_native.index(atom_idx)
+        for query_idx, atom_idx in enumerate(native_match)
+    }
+    selected = {int(index) for index in reference_indices}
+    excluded = {int(index) for index in excluded_reference_indices}
+    selected -= excluded
+
+    pattern_counts: Counter[tuple[tuple[int, int], ...]] = Counter()
+    element_counts: Counter[str] = Counter()
+    aromatic_counts: Counter[str] = Counter()
+    unsupported_counts: Counter[str] = Counter()
+    matched_indices: list[int] = []
+    unmatched_indices: list[int] = []
+    total_records = 0
+    for ref_idx, mol in enumerate(iter_sdf_molecules(reference_sdf)):
+        total_records += 1
+        if ref_idx not in selected:
+            continue
+        record = _reference_component_profile(
+            mol, scaffold_smarts, native_slot_by_query_index
+        )
+        if record is None:
+            unmatched_indices.append(ref_idx)
+            continue
+        allocation = tuple(sorted(record["allocation"].items()))
+        if not allocation or sum(count for _, count in allocation) != record["n_extra"]:
+            unmatched_indices.append(ref_idx)
+            continue
+        matched_indices.append(ref_idx)
+        pattern_counts[allocation] += 1
+        element_counts.update(record["element_counts"])
+        aromatic_counts.update(record["aromatic_counts"])
+        unsupported_counts.update(record["unsupported_counts"])
+
+    if not pattern_counts:
+        raise ValueError(f"no trusted references matched class {class_name}")
+
+    exit_counts: Counter[int] = Counter()
+    size_counts: Counter[int] = Counter()
+    allocation_patterns = []
+    for allocation, weight in sorted(
+        pattern_counts.items(),
+        key=lambda item: (sum(count for _, count in item[0]), item[0]),
+    ):
+        total = sum(count for _, count in allocation)
+        size_counts[total] += weight
+        for slot, _ in allocation:
+            exit_counts[slot] += weight
+        allocation_patterns.append({
+            "n_extra": int(total),
+            "site_counts": {
+                str(slot): int(count) for slot, count in allocation
+            },
+            "weight": int(weight),
+        })
+
+    weights = {
+        str(slot): float(count) + float(exploration_floor)
+        for slot, count in sorted(exit_counts.items())
+    }
+    return {
+        "profile_version": PROFILE_VERSION,
+        "profile_kind": "gspt1_class",
+        "class_name": str(class_name),
+        "n_reference_records": total_records,
+        "included_reference_indices": sorted(selected),
+        "excluded_reference_indices": sorted(excluded),
+        "matched_reference_indices": matched_indices,
+        "unmatched_reference_indices": unmatched_indices,
+        "matched_reference_records": len(matched_indices),
+        "n_scaffold": len(native_match),
+        "native_scaffold_atom_indices_sorted": sorted_native,
+        "exit_site_counts": {
+            str(slot): int(count) for slot, count in sorted(exit_counts.items())
+        },
+        "exit_site_weights": weights,
+        "n_extra_values": [int(value) for value in sorted(size_counts)],
+        "n_extra_weights": [
+            int(size_counts[value]) for value in sorted(size_counts)
+        ],
+        "allocation_patterns": allocation_patterns,
+        "reference_extra_element_counts": dict(element_counts),
+        "reference_extra_aromatic_element_counts": dict(aromatic_counts),
+        "unsupported_extra_element_counts": dict(unsupported_counts),
+        "exploration_floor": float(exploration_floor),
+    }
+
+
 def build_scaffold_profile(
     reference_sdf: str | Path,
     native_ligand_sdf: str | Path,
@@ -238,7 +431,8 @@ def build_scaffold_profile(
 def load_scaffold_profile(path: str | Path) -> dict[str, Any]:
     """Load and validate only the public coarse-prior fields."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if int(payload.get("profile_version", -1)) != PROFILE_VERSION:
+    profile_version = int(payload.get("profile_version", -1))
+    if profile_version not in SUPPORTED_PROFILE_VERSIONS:
         raise ValueError(f"unsupported scaffold profile version: {path}")
     n_scaffold = int(payload.get("n_scaffold", 0))
     if n_scaffold <= 0:
@@ -263,14 +457,44 @@ def load_scaffold_profile(path: str | Path) -> dict[str, Any]:
             payload.get("reference_extra_aromatic_element_counts") or {}
         ).items()
     }
+    allocation_patterns = []
+    for raw_pattern in payload.get("allocation_patterns") or []:
+        site_counts = {
+            str(int(slot)): int(count)
+            for slot, count in (raw_pattern.get("site_counts") or {}).items()
+            if 0 <= int(slot) < n_scaffold and int(count) > 0
+        }
+        n_extra = int(raw_pattern.get("n_extra", sum(site_counts.values())))
+        weight = max(float(raw_pattern.get("weight", 1.0)), 0.0)
+        if site_counts and sum(site_counts.values()) == n_extra and weight > 0:
+            allocation_patterns.append({
+                "n_extra": n_extra,
+                "site_counts": site_counts,
+                "weight": weight,
+            })
     return {
-        "profile_version": PROFILE_VERSION,
+        "profile_version": profile_version,
+        "profile_kind": str(payload.get("profile_kind", "coarse")),
+        "class_name": str(payload.get("class_name", "")),
         "n_scaffold": n_scaffold,
         "exit_site_weights": clean_weights,
         "n_extra_values": values,
         "n_extra_weights": size_weights,
         "reference_extra_element_counts": element_counts,
         "reference_extra_aromatic_element_counts": aromatic_counts,
+        "unsupported_extra_element_counts": {
+            str(symbol): max(float(count), 0.0)
+            for symbol, count in (
+                payload.get("unsupported_extra_element_counts") or {}
+            ).items()
+        },
+        "allocation_patterns": allocation_patterns,
+        "included_reference_indices": [
+            int(index) for index in payload.get("included_reference_indices", [])
+        ],
+        "excluded_reference_indices": [
+            int(index) for index in payload.get("excluded_reference_indices", [])
+        ],
         "matched_reference_records": int(
             payload.get("matched_reference_records", 0)
         ),

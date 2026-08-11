@@ -273,7 +273,6 @@ def extract_exit_vector_sites(
     if mol is None or not scaffold_indices:
         return []
 
-    scaffold_set = set(int(i) for i in scaffold_indices)
     positions = _atom_positions(mol, ref_pos_np)
     ri = mol.GetRingInfo()
     ring_atoms = set()
@@ -1076,6 +1075,59 @@ def allocate_atoms_weighted_single_site(
     return [selected], [budget], budget
 
 
+def allocate_atoms_reference_joint(
+    n_extra: int,
+    sites: List[Dict[str, Any]],
+    sites_cfg: dict,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[List[Dict[str, Any]], List[int], int, Dict[str, Any]]:
+    """Sample one observed joint ``total + per-slot`` allocation pattern."""
+    profile_path = sites_cfg.get('reference_exit_profile')
+    if not profile_path:
+        raise ValueError('reference_joint requires reference_exit_profile')
+    profile = load_scaffold_profile(profile_path)
+    patterns = [
+        pattern for pattern in profile.get('allocation_patterns', [])
+        if int(pattern.get('n_extra', -1)) == int(n_extra)
+    ]
+    if not patterns:
+        raise ValueError(
+            f'no reference allocation pattern for n_extra={n_extra}'
+        )
+    rng = rng or np.random.default_rng()
+    weights = np.asarray(
+        [max(float(pattern.get('weight', 1.0)), 0.0) for pattern in patterns],
+        dtype=np.float64,
+    )
+    if not np.isfinite(weights).all() or weights.sum() <= 0:
+        weights = np.ones(len(patterns), dtype=np.float64)
+    selected = patterns[int(rng.choice(len(patterns), p=weights / weights.sum()))]
+
+    site_by_slot = {}
+    for site in sites:
+        raw_slot = site.get(
+            'profile_slot', site.get('reference_exit_profile_slot')
+        )
+        if raw_slot is not None:
+            site_by_slot[int(raw_slot)] = site
+    active: List[Dict[str, Any]] = []
+    counts: List[int] = []
+    for raw_slot, raw_count in sorted(selected['site_counts'].items()):
+        slot = int(raw_slot)
+        count = int(raw_count)
+        if slot not in site_by_slot:
+            raise ValueError(
+                f'reference allocation slot {slot} is absent from sites'
+            )
+        active.append(site_by_slot[slot])
+        counts.append(count)
+    if sum(counts) != int(n_extra):
+        raise ValueError(
+            f'reference allocation sums to {sum(counts)}, expected {n_extra}'
+        )
+    return active, counts, int(n_extra), selected
+
+
 def _attachment_direction(site: Dict[str, Any]) -> Optional[np.ndarray]:
     """返回 normalize(centroid - anchor)；缺锚点或退化时返回 None。"""
     anchor = site.get('anchor_pos')
@@ -1211,6 +1263,164 @@ def _original_site_position(
         else:
             pos = anchor + np.array([1.5, 0.0, 0.0])
     return pos + rng.normal(0.0, float(jitter_std), size=3)
+
+
+def _protein_clearance(
+    position: np.ndarray,
+    protein_positions: Optional[np.ndarray],
+) -> float:
+    if protein_positions is None or protein_positions.size == 0:
+        return float('inf')
+    distances = np.linalg.norm(protein_positions - position, axis=1)
+    return float(distances.min())
+
+
+def _random_unit_vector(rng: np.random.Generator) -> np.ndarray:
+    direction = rng.normal(size=3)
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-8:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    return direction / norm
+
+
+def _grow_pocket_position(
+    anchor: np.ndarray,
+    placed: List[np.ndarray],
+    protein_positions: Optional[np.ndarray],
+    rng: np.random.Generator,
+    sites_cfg: dict,
+) -> np.ndarray:
+    min_protein_dist = float(sites_cfg.get('pocket_min_protein_dist', 1.5))
+    min_point_dist = float(sites_cfg.get('pocket_min_point_dist', 0.9))
+    max_anchor_dist = float(sites_cfg.get('pocket_max_anchor_dist', 10.0))
+    candidates = int(sites_cfg.get('pocket_growth_candidates', 128))
+    bond_min = float(sites_cfg.get('pocket_growth_step_min', 1.25))
+    bond_max = float(sites_cfg.get('pocket_growth_step_max', 1.55))
+    parents = placed[-8:] if placed else [anchor]
+    best = None
+    best_score = -float('inf')
+    for _ in range(max(candidates, 1)):
+        parent = parents[int(rng.integers(0, len(parents)))]
+        candidate = parent + _random_unit_vector(rng) * float(
+            rng.uniform(bond_min, bond_max)
+        )
+        anchor_dist = float(np.linalg.norm(candidate - anchor))
+        if anchor_dist > max_anchor_dist:
+            continue
+        clearance = _protein_clearance(candidate, protein_positions)
+        if clearance < min_protein_dist:
+            continue
+        if placed:
+            point_distances = np.linalg.norm(
+                np.asarray(placed, dtype=np.float64) - candidate, axis=1
+            )
+            if float(point_distances.min()) < min_point_dist:
+                continue
+        score = min(clearance, 4.0) - 0.03 * anchor_dist
+        if score > best_score:
+            best = candidate
+            best_score = score
+    if best is not None:
+        return best
+    direction = _attachment_direction({
+        'anchor_pos': anchor,
+        'centroid_pos': placed[-1] if placed else anchor + [1.0, 0.0, 0.0],
+    })
+    direction = direction if direction is not None else _random_unit_vector(rng)
+    parent = placed[-1] if placed else anchor
+    return parent + direction * float(rng.uniform(bond_min, bond_max))
+
+
+def _relax_positions_from_protein(
+    positions: np.ndarray,
+    anchor: np.ndarray,
+    protein_positions: Optional[np.ndarray],
+    rng: np.random.Generator,
+    sites_cfg: dict,
+) -> np.ndarray:
+    if positions.size == 0 or protein_positions is None or protein_positions.size == 0:
+        return positions
+    relaxed = np.asarray(positions, dtype=np.float64).copy()
+    min_protein_dist = float(sites_cfg.get('pocket_min_protein_dist', 1.5))
+    min_point_dist = float(sites_cfg.get('pocket_min_point_dist', 0.9))
+    max_anchor_dist = float(sites_cfg.get('pocket_max_anchor_dist', 10.0))
+    iterations = int(sites_cfg.get('pocket_relax_iterations', 120))
+    for _ in range(max(iterations, 1)):
+        moved = False
+        for index in range(len(relaxed)):
+            deltas = relaxed[index] - protein_positions
+            distances = np.linalg.norm(deltas, axis=1)
+            nearest = int(np.argmin(distances))
+            distance = float(distances[nearest])
+            if distance < min_protein_dist:
+                direction = deltas[nearest]
+                norm = float(np.linalg.norm(direction))
+                direction = (
+                    direction / norm if norm > 1e-8
+                    else _random_unit_vector(rng)
+                )
+                relaxed[index] += direction * (
+                    min_protein_dist - distance + 0.03
+                )
+                moved = True
+        for left in range(len(relaxed)):
+            for right in range(left + 1, len(relaxed)):
+                delta = relaxed[left] - relaxed[right]
+                distance = float(np.linalg.norm(delta))
+                if distance >= min_point_dist:
+                    continue
+                direction = (
+                    delta / distance if distance > 1e-8
+                    else _random_unit_vector(rng)
+                )
+                shift = 0.5 * (min_point_dist - distance + 0.02) * direction
+                relaxed[left] += shift
+                relaxed[right] -= shift
+                moved = True
+        for index in range(len(relaxed)):
+            delta = relaxed[index] - anchor
+            distance = float(np.linalg.norm(delta))
+            if distance > max_anchor_dist:
+                relaxed[index] = anchor + delta / distance * max_anchor_dist
+                moved = True
+        if not moved:
+            break
+    return relaxed
+
+
+def _pocket_aware_site_positions(
+    site: Dict[str, Any],
+    count: int,
+    protein_positions: Optional[np.ndarray],
+    jitter_std: float,
+    rng: np.random.Generator,
+    sites_cfg: dict,
+) -> List[np.ndarray]:
+    anchor = np.asarray(site['anchor_pos'], dtype=np.float64)
+    local_protein = protein_positions
+    if protein_positions is not None and protein_positions.size > 0:
+        local_radius = float(sites_cfg.get('pocket_local_radius', 13.0))
+        local_mask = np.linalg.norm(
+            protein_positions - anchor, axis=1
+        ) <= local_radius
+        if local_mask.any():
+            local_protein = protein_positions[local_mask]
+    template = [
+        np.asarray(position, dtype=np.float64)
+        for position in (site.get('removed_atom_positions') or [])[:count]
+    ]
+    placed = [
+        position + rng.normal(0.0, float(jitter_std), size=3)
+        for position in template
+    ]
+    while len(placed) < count:
+        placed.append(_grow_pocket_position(
+            anchor, placed, local_protein, rng, sites_cfg
+        ))
+    array = _relax_positions_from_protein(
+        np.asarray(placed), anchor, local_protein, rng, sites_cfg
+    )
+    return [array[index] for index in range(len(array))]
 
 
 def _is_gaussian_jitter(jitter_mode: str) -> bool:
@@ -1441,6 +1651,7 @@ def init_extra_positions_at_sites(
     jitter_mode: str = 'gaussian',
     rng: Optional[np.random.Generator] = None,
     sites_cfg: Optional[dict] = None,
+    protein_positions: Optional[np.ndarray] = None,
 ) -> torch.Tensor:
     """按位点分配生成世界坐标系 extra 位置 [n_extra, 3]。
 
@@ -1469,6 +1680,16 @@ def init_extra_positions_at_sites(
     orig_max_dist = float(cfg.get('original_max_dist', 4.0))
     for site, cnt in zip(active_sites, counts):
         if cnt <= 0:
+            continue
+        if mode in ('pocket_aware_template', 'pocket_aware_growth'):
+            positions.extend(_pocket_aware_site_positions(
+                site,
+                cnt,
+                protein_positions,
+                jitter_std,
+                rng,
+                cfg,
+            ))
             continue
         for atom_i in range(cnt):
             if use_gaussian:
@@ -1538,6 +1759,7 @@ def build_extra_atom_positions(
     fallback_noise_scale: float = 2.0,
     logger=None,
     rng: Optional[np.random.Generator] = None,
+    protein_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
     为 grow / dynamic_locked / prudent 生成额外原子初始坐标。
@@ -1548,14 +1770,13 @@ def build_extra_atom_positions(
     overflow_mode = str(sites_cfg.get('overflow_mode', 'pocket_fallback'))
     meta: Dict[str, Any] = {
         'placement': 'pocket_fallback',
-    'site_allocation': None,
+        'site_allocation': None,
         'overflow_count': 0,
         'n_extra_requested': n_extra_requested,
         'n_extra_effective': n_extra_requested,
         'overflow_mode': overflow_mode,
     }
 
-    count_mode_early = str(sites_cfg.get('per_site_count_mode', 'split'))
     if n_extra <= 0 and not uses_site_budget_placement(sites_cfg):
         meta['n_extra_effective'] = 0
         meta['site_allocation'] = []
@@ -1580,7 +1801,20 @@ def build_extra_atom_positions(
     if overflow_mode in ('cap', 'drop'):
         p_active = float(sites_cfg.get('p_active', 0.5))
 
-    if count_mode in ('random_per_site', 'sequential_random'):
+    joint_pattern = None
+    if str(sites_cfg.get('site_selection_mode', '')).lower() == 'reference_joint':
+        active, counts, n_extra_eff, joint_pattern = allocate_atoms_reference_joint(
+            n_extra,
+            attachment_sites,
+            sites_cfg,
+            rng=rng,
+        )
+        overflow = 0
+        meta['n_extra_effective'] = n_extra_eff
+        meta['per_site_count_mode'] = 'reference_joint'
+        meta['site_selection_mode'] = 'reference_joint'
+        meta['reference_allocation_pattern'] = joint_pattern
+    elif count_mode in ('random_per_site', 'sequential_random'):
         min_c = int(sites_cfg.get('n_extra_min_clamp', 0))
         max_c = int(sites_cfg.get('n_extra_max_clamp', max(n_extra, 1)))
         cap_hi = cap_n_extra_for_sites(max_c, attachment_sites, sites_cfg)
@@ -1665,11 +1899,13 @@ def build_extra_atom_positions(
                 )
         n_extra_eff = n_extra
 
-    # 浓缩到少数去除位点，避免跨多位点离散撒点
+    # Reference-joint patterns are already the intended complete allocation.
     n_before = len([c for c in counts if c > 0])
-    active, counts = concentrate_site_allocation(
-        active, counts, max_active_sites, rng=rng, prefer_murcko=prefer_murcko,
-    )
+    if joint_pattern is None:
+        active, counts = concentrate_site_allocation(
+            active, counts, max_active_sites, rng=rng,
+            prefer_murcko=prefer_murcko,
+        )
     meta['max_active_sites'] = max_active_sites
     meta['n_sites_before_concentrate'] = n_before
     meta['n_sites_after_concentrate'] = len(active)
@@ -1679,10 +1915,16 @@ def build_extra_atom_positions(
             f'(max_active_sites={max_active_sites}, counts={counts})'
         )
 
+    protein_np = None
+    if protein_positions is not None:
+        if isinstance(protein_positions, torch.Tensor):
+            protein_np = protein_positions.detach().cpu().numpy().astype(np.float64)
+        else:
+            protein_np = np.asarray(protein_positions, dtype=np.float64)
     site_pos = init_extra_positions_at_sites(
         active, counts, device,
         jitter_std=jitter_std, jitter_mode=jitter_mode,
-        rng=rng, sites_cfg=sites_cfg,
+        rng=rng, sites_cfg=sites_cfg, protein_positions=protein_np,
     )
     n_site = site_pos.size(0)
 

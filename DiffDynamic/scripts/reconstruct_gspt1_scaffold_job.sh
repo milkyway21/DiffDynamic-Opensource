@@ -21,8 +21,8 @@ case "$TARGET" in
     LIGAND="$STRUCT_ROOT/01_ikzf2_molecular_glue/ligand/7U8F_LWK_D_502_native.sdf"
     ;;
   gspt1)
-    PROTEIN="$STRUCT_ROOT/02_gspt1_or_gstp1_molecular_glue/receptor/5HXB_receptor_clean.pdb"
-    LIGAND="$STRUCT_ROOT/02_gspt1_or_gstp1_molecular_glue/ligand/5HXB_85C_C_502_native.sdf"
+    PROTEIN="${PROTEIN:-$STRUCT_ROOT/02_gspt1_or_gstp1_molecular_glue/receptor/5HXB_receptor_clean.pdb}"
+    LIGAND="${LIGAND:-$STRUCT_ROOT/02_gspt1_or_gstp1_molecular_glue/ligand/5HXB_85C_C_502_native.sdf}"
     ;;
   *)
     echo "ERROR: TARGET must be ikzf2 or gspt1, got: $TARGET" >&2
