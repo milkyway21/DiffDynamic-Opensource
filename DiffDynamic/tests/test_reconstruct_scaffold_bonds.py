@@ -5,7 +5,10 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from utils.reconstruct import reconstruct_from_generated
+from utils.reconstruct import (
+    _repair_scaffold_extra_bonds,
+    reconstruct_from_generated,
+)
 
 
 def _benzene_scaffold_with_nearby_extra():
@@ -68,6 +71,31 @@ def test_without_scaffold_bonds_still_runs():
     xyz, atomic, _, _ = _benzene_scaffold_with_nearby_extra()
     mol = reconstruct_from_generated(xyz, atomic, basic_mode=True)
     assert mol is not None
+
+
+def test_scaffold_repair_downgrades_erroneous_aromatic_external_double_bond():
+    scaffold = Chem.MolFromSmiles('c1ccccc1')
+    editable = Chem.RWMol(scaffold)
+    extra_idx = editable.AddAtom(Chem.Atom(6))
+    editable.AddBond(0, extra_idx, Chem.BondType.DOUBLE)
+    noisy = editable.GetMol()
+    scaffold_bonds = [
+        (
+            bond.GetBeginAtomIdx(),
+            bond.GetEndAtomIdx(),
+            1,
+            True,
+        )
+        for bond in scaffold.GetBonds()
+    ]
+
+    repaired = _repair_scaffold_extra_bonds(
+        noisy, scaffold_bonds, n_scaffold=6,
+    )
+    external = repaired.GetBondBetweenAtoms(0, extra_idx)
+    assert external is not None
+    assert external.GetBondType() == Chem.BondType.SINGLE
+    Chem.SanitizeMol(repaired)
 
 
 if __name__ == '__main__':

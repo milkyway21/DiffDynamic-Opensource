@@ -672,6 +672,9 @@ def reconstruct_from_generated(
         rd_mol = postprocess_rd_mol_1(rd_mol)
         rd_mol = postprocess_rd_mol_2(rd_mol, n_scaffold=n_sc)
         rd_mol = _force_scaffold_aromaticity(rd_mol, scaffold_bonds, n_sc)
+        rd_mol = _repair_scaffold_extra_bonds(
+            rd_mol, scaffold_bonds, n_sc,
+        )
     except:
         raise MolReconsError()
 
@@ -732,6 +735,109 @@ def _force_scaffold_aromaticity(rd_mol, scaffold_bonds, n_scaffold):
         return result
     except Exception:
         return rd_mol
+
+
+def _repair_scaffold_extra_bonds(rd_mol, scaffold_bonds, n_scaffold):
+    """Keep locked scaffold valence valid after noisy extra-atom bonding.
+
+    Distance bonding can attach several generated atoms to a scaffold atom.
+    When that makes a locked carbonyl or aromatic atom hypervalent, preserving
+    the erroneous bridge is worse than dropping that bridge. This repair is
+    gated by ``scaffold_bonds`` and therefore does not affect de novo paths.
+    """
+    if rd_mol is None or not scaffold_bonds or n_scaffold is None:
+        return rd_mol
+    n_sc = int(n_scaffold)
+    if n_sc <= 0:
+        return rd_mol
+    norm = _normalize_scaffold_bonds(scaffold_bonds)
+    if not norm:
+        return rd_mol
+
+    rwmol = Chem.RWMol(rd_mol)
+    aromatic_atoms = set()
+    for i, j, order, aromatic in norm:
+        if i >= rwmol.GetNumAtoms() or j >= rwmol.GetNumAtoms():
+            continue
+        bond = rwmol.GetBondBetweenAtoms(i, j)
+        if bond is None:
+            continue
+        if aromatic:
+            target_type = Chem.BondType.AROMATIC
+            aromatic_atoms.update((i, j))
+        elif order == 2:
+            target_type = Chem.BondType.DOUBLE
+        elif order == 3:
+            target_type = Chem.BondType.TRIPLE
+        else:
+            target_type = Chem.BondType.SINGLE
+        bond.SetBondType(target_type)
+        bond.SetIsAromatic(bool(aromatic))
+    for atom_idx in aromatic_atoms:
+        rwmol.GetAtomWithIdx(atom_idx).SetIsAromatic(True)
+
+    periodic_table = Chem.GetPeriodicTable()
+
+    def _default_valence(atom):
+        value = periodic_table.GetDefaultValence(atom.GetAtomicNum())
+        if value is None or int(value) < 0:
+            return 4.0
+        if atom.GetFormalCharge() > 0 and atom.GetAtomicNum() == 7:
+            return 4.0
+        return float(value)
+
+    for core_idx in range(min(n_sc, rwmol.GetNumAtoms())):
+        atom = rwmol.GetAtomWithIdx(core_idx)
+        core_bonds = []
+        extra_bonds = []
+        for bond in atom.GetBonds():
+            begin = bond.GetBeginAtomIdx()
+            end = bond.GetEndAtomIdx()
+            other = end if begin == core_idx else begin
+            if other < n_sc:
+                core_bonds.append(bond)
+            else:
+                extra_bonds.append(bond)
+        if not extra_bonds:
+            continue
+
+        core_valence = sum(
+            bond.GetBondTypeAsDouble() for bond in core_bonds
+        )
+        available = max(_default_valence(atom) - core_valence, 0.0)
+        keep_count = int(np.floor(available + 1e-6))
+        # A generated bond from an aromatic scaffold atom is an ordinary
+        # substituent bond, never an aromatic or exocyclic double bond here.
+        if core_idx in aromatic_atoms:
+            for bond in extra_bonds:
+                bond.SetBondType(Chem.BondType.SINGLE)
+                bond.SetIsAromatic(False)
+
+        ranked = sorted(
+            extra_bonds,
+            key=lambda bond: (
+                bond.GetBondTypeAsDouble(),
+                bond.GetBeginAtomIdx(),
+                bond.GetEndAtomIdx(),
+            ),
+        )
+        for bond in ranked[keep_count:]:
+            rwmol.RemoveBond(
+                bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            )
+
+    repaired = rwmol.GetMol()
+    repaired.UpdatePropertyCache(strict=False)
+    try:
+        Chem.SanitizeMol(
+            repaired,
+            sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_PROPERTIES,
+        )
+    except Exception:
+        # Keep the explicit scaffold topology available to the caller even
+        # when an unrelated generated side chain remains chemically noisy.
+        pass
+    return repaired
 
 
 def _maybe_apply_rdkit_structure_repair(rd_mol, repair_cfg):

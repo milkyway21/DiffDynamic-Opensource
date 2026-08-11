@@ -456,7 +456,7 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict:
 
         class_summaries = {}
         for spec in CLASS_SPECS:
-            class_root = root / "rounds" / spec.name
+            class_root = root / "rounds" / spec.name / f"run_{round_index:04d}"
             class_summaries[spec.name] = audit_class(
                 [class_root],
                 prepared["reference_sdf"],
