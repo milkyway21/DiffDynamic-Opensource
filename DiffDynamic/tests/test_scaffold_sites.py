@@ -124,6 +124,35 @@ def test_reference_exit_transfer_starts_at_closest_attachment_atom():
     assert np.isclose(np.linalg.norm(transferred[0] - [10.0, 0.0, 0.0]), 1.0)
 
 
+def test_reference_exit_transfer_can_preserve_native_order():
+    native = {
+        'site_id': 0,
+        'site_kind': 'murcko_sidechain',
+        'anchor_scaffold_idx': 1,
+        'anchor_pos': [0.0, 0.0, 0.0],
+        'centroid_pos': [1.0, 0.0, 0.0],
+        'removed_atom_positions': [[0.0, 4.0, 0.0], [1.0, 0.0, 0.0]],
+        'removed_atom_count': 2,
+    }
+    profile = {
+        'site_id': -1,
+        'site_kind': 'reference_exit_vector',
+        'anchor_scaffold_idx': 2,
+        'anchor_pos': [10.0, 0.0, 0.0],
+        'centroid_pos': [11.0, 0.0, 0.0],
+        'removed_atom_positions': [],
+        'removed_atom_count': 0,
+        'profile_slot': 0,
+        'site_selection_weight': 12.0,
+    }
+    merged = merge_reference_exit_sites(
+        [native], [profile], template_atom_order='native',
+    )
+    transferred = np.asarray(merged[1]['removed_atom_positions'])
+    assert np.allclose(transferred[0], [10.0, 4.0, 0.0])
+    assert np.allclose(transferred[1], [11.0, 0.0, 0.0])
+
+
 def test_allocate_sum_equals_n_extra():
     sites = [
         {'site_id': 0, 'centroid_pos': [0, 0, 0]},

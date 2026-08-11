@@ -428,6 +428,7 @@ def extract_reference_exit_vector_sites(
 def _transfer_template_geometry(
     source_site: Dict[str, Any],
     target_site: Dict[str, Any],
+    attachment_first: bool = True,
 ) -> Optional[List[List[float]]]:
     """Move a native target-side coordinate cloud to another scaffold exit."""
     raw_positions = source_site.get('removed_atom_positions') or []
@@ -440,13 +441,16 @@ def _transfer_template_geometry(
         return None
 
     # Connected-component traversal is not guaranteed to start at the atom
-    # bonded to the scaffold.  Use the closest target-side atom as the
-    # attachment end and emit it first, so the transferred cloud preserves a
-    # chemically sensible exit direction for native_template placement.
+    # bonded to the scaffold. Use the closest target-side atom as the
+    # attachment end for the exit direction. Reordering is explicit because
+    # preserving native component order is useful as a geometry ablation.
     source_distances = np.linalg.norm(source_positions - source_anchor, axis=1)
-    attachment_order = np.argsort(source_distances, kind='stable')
-    source_positions = source_positions[attachment_order]
-    source_direction = source_positions[0] - source_anchor
+    attachment_index = int(np.argmin(source_distances))
+    if attachment_first:
+        attachment_order = np.argsort(source_distances, kind='stable')
+        source_positions = source_positions[attachment_order]
+        attachment_index = 0
+    source_direction = source_positions[attachment_index] - source_anchor
     target_direction = (
         np.asarray(target_site.get('centroid_pos'), dtype=np.float64)
         - target_anchor
@@ -494,6 +498,7 @@ def merge_reference_exit_sites(
     attachment_sites: List[Dict[str, Any]],
     profile_sites: List[Dict[str, Any]],
     dedup_dist: float = 1.2,
+    template_atom_order: str = 'attachment_first',
 ) -> List[Dict[str, Any]]:
     """Merge profile exits, accumulating weight on an existing native site."""
     merged = [dict(site) for site in attachment_sites]
@@ -536,7 +541,12 @@ def merge_reference_exit_sites(
             None,
         )
         if template_site is not None:
-            transferred = _transfer_template_geometry(template_site, candidate)
+            transferred = _transfer_template_geometry(
+                template_site,
+                candidate,
+                attachment_first=str(template_atom_order).lower()
+                in ('attachment_first', 'attached_first', 'sorted'),
+            )
             if transferred is not None:
                 candidate['removed_atom_positions'] = transferred
                 candidate['removed_atom_count'] = len(transferred)
@@ -660,6 +670,11 @@ def load_or_extract_attachment_sites(
                 profile_sites,
                 dedup_dist=float(
                     sites_cfg.get('reference_exit_dedup_dist', 1.2)
+                ),
+                template_atom_order=str(
+                    sites_cfg.get(
+                        'reference_exit_template_order', 'attachment_first'
+                    )
                 ),
             )
             if bool(sites_cfg.get('reference_exit_only', False)):

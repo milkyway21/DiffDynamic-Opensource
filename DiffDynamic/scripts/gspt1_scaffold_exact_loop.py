@@ -66,6 +66,10 @@ VARIANTS = (
     # while retaining the native target-side coordinate template only.
     ("profile_slot0_tbr_020", "native_template", 0.20, 0.25, True, True,
      "prior_minus_scaffold", "weighted_single"),
+    # Keep the native component order while rotating from its closest
+    # attachment atom; this separates coordinate order from exit direction.
+    ("profile_slot0_native_order_020", "native_template", 0.20, 0.25,
+     True, True, "prior_minus_scaffold", "weighted_single"),
     # Same slot-0 geometry with the observed 13-25 heavy-atom size prior;
     # isolates fragment completeness from exit placement.
     ("profile_slot0_size_tbr_020", "native_template", 0.20, 0.25, True, True,
@@ -134,6 +138,7 @@ def _variant_config(
     extra_type_prior_strength: float = 0.0,
     reference_exit_slots: Optional[List[int]] = None,
     reference_exit_only: bool = False,
+    reference_exit_template_order: Optional[str] = None,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base)
     scaffold = config.setdefault("sample", {}).setdefault("scaffold", {})
@@ -157,6 +162,12 @@ def _variant_config(
     else:
         sites["reference_exit_slots"] = [int(slot) for slot in reference_exit_slots]
     sites["reference_exit_only"] = bool(reference_exit_only)
+    if reference_exit_template_order is None:
+        sites.pop("reference_exit_template_order", None)
+    else:
+        sites["reference_exit_template_order"] = str(
+            reference_exit_template_order
+        )
     sites["jitter_mode"] = jitter_mode
     sites["jitter_std"] = jitter_std
     scaffold.setdefault("grow", {})["extra_anchor_strength"] = anchor_strength
@@ -457,11 +468,18 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 reference_exit_slots={
                     "profile_slot0_tbr_020": [0],
                     "profile_slot0_size_tbr_020": [0],
+                    "profile_slot0_native_order_020": [0],
                 }.get(name),
                 reference_exit_only=name in {
                     "profile_slot0_tbr_020",
                     "profile_slot0_size_tbr_020",
+                    "profile_slot0_native_order_020",
                 },
+                reference_exit_template_order=(
+                    "native"
+                    if name == "profile_slot0_native_order_020"
+                    else None
+                ),
             )
             _write_yaml(config, variant_config)
             jobs.append(
