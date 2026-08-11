@@ -6,6 +6,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from utils.reconstruct import (
+    _reconnect_scaffold_extra_components,
     _repair_scaffold_extra_bonds,
     reconstruct_from_generated,
 )
@@ -65,6 +66,35 @@ def test_scaffold_bonds_preserve_benzene_ring():
         pass
     smi = Chem.MolToSmiles(sc)
     assert 'c1ccccc1' in smi or smi.count('c') >= 6 or 'C1=CC=CC=C1' in smi, smi
+
+
+def test_scaffold_attachment_bond_keeps_distant_generated_branch():
+    xyz, atomic, bonds, n_sc = _benzene_scaffold_with_nearby_extra()
+    xyz[-1] = xyz[0] + np.array([4.0, 0.0, 0.0])
+    mol = reconstruct_from_generated(
+        xyz, atomic, aromatic=[True] * n_sc + [False],
+        basic_mode=False,
+        scaffold_bonds=bonds,
+        n_scaffold=n_sc,
+        extra_attachment_bonds=[(0, n_sc, 1, False)],
+    )
+    assert mol is not None
+    assert len(Chem.GetMolFrags(mol, asMols=False)) == 1
+    assert mol.GetBondBetweenAtoms(0, n_sc) is not None
+
+
+def test_scaffold_component_reconnect_prefers_generated_atoms():
+    mol = Chem.MolFromSmiles('c1ccccc1C.C')
+    conformer = Chem.Conformer(mol.GetNumAtoms())
+    for idx in range(mol.GetNumAtoms()):
+        conformer.SetAtomPosition(idx, (float(idx), 0.0, 0.0))
+    conformer.SetAtomPosition(6, (1.5, 0.0, 0.0))
+    conformer.SetAtomPosition(7, (3.3, 0.0, 0.0))
+    mol.AddConformer(conformer)
+
+    repaired = _reconnect_scaffold_extra_components(mol, n_scaffold=6)
+    assert len(Chem.GetMolFrags(repaired, asMols=False)) == 1
+    assert repaired.GetBondBetweenAtoms(6, 7) is not None
 
 
 def test_without_scaffold_bonds_still_runs():

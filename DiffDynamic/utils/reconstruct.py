@@ -98,7 +98,7 @@ def _normalize_scaffold_bonds(scaffold_bonds):
 
 
 def seed_scaffold_bonds(mol, atoms, scaffold_bonds):
-    """在 connect_the_dots 之前写入参考骨架键；返回受保护的 0-based 原子对集合。"""
+    """在 connect_the_dots 之前写入受保护的骨架/锚定键。"""
     bonds = _normalize_scaffold_bonds(scaffold_bonds)
     protected = set()
     if not bonds or not atoms:
@@ -518,9 +518,12 @@ def postprocess_rd_mol_1(rdmol):  # 对 RDKit 分子进行第一阶段后处理�
     return rdmol
 
 
-def postprocess_rd_mol_2(rdmol, n_scaffold=None):  # 对 RDKit 分子进行第二阶段后处理。
+def postprocess_rd_mol_2(
+    rdmol, n_scaffold=None, protected_pairs=None,
+):  # 对 RDKit 分子进行第二阶段后处理。
     rdmol_edit = Chem.RWMol(rdmol)  # 创建可编辑副本。
     n_sc = int(n_scaffold) if n_scaffold is not None else -1
+    protected = set(protected_pairs or ())
 
     ring_info = rdmol.GetRingInfo()
     ring_info.AtomRings()
@@ -541,11 +544,17 @@ def postprocess_rd_mol_2(rdmol, n_scaffold=None):  # 对 RDKit 分子进行第�
                 else:
                     atom_by_symb[symb].append(atom_idx)
             if len(non_carbon) == 2:
-                if n_sc <= 0 or not all(int(a) < n_sc for a in non_carbon):
+                pair = _pair_key(non_carbon[0], non_carbon[1])
+                if pair not in protected and (
+                    n_sc <= 0 or not all(int(a) < n_sc for a in non_carbon)
+                ):
                     rdmol_edit.RemoveBond(*non_carbon)
             if 'O' in atom_by_symb and len(atom_by_symb['O']) == 2:
                 o_pair = atom_by_symb['O']
-                if n_sc <= 0 or not all(int(a) < n_sc for a in o_pair):
+                pair = _pair_key(o_pair[0], o_pair[1])
+                if pair not in protected and (
+                    n_sc <= 0 or not all(int(a) < n_sc for a in o_pair)
+                ):
                     rdmol_edit.RemoveBond(*o_pair)
                     rdmol_edit.GetAtomWithIdx(o_pair[0]).SetNumExplicitHs(
                         rdmol_edit.GetAtomWithIdx(o_pair[0]).GetNumExplicitHs() + 1
@@ -566,12 +575,18 @@ def reconstruct_from_generated(
     xyz, atomic_nums, aromatic=None, basic_mode=True,
     scaffold_bonds=None, n_scaffold=None,
     rdkit_structure_repair=None,
+    extra_attachment_bonds=None,
 ):  # 从生成的坐标和元素重建 RDKit 分子。
     """
     will utilize data.ligand_pos, data.ligand_element, data.ligand_atom_feature_full to reconstruct mol
 
     scaffold_bonds: optional list of (i, j[, order[, aromatic]]) for atoms 0..n_scaffold-1
     to force-keep Murcko scaffold topology during OpenBabel distance bonding.
+
+    extra_attachment_bonds: optional list of generated-site anchor bonds. Each
+        bond uses generated atom indices and is protected during reconstruction;
+        this is used only by scaffold-aware generation to reconnect a site's
+        first generated atom to its locked scaffold anchor.
 
     rdkit_structure_repair: optional dict matching sample.rdkit_structure_repair in sampling.yml
         enable / config / on_reject. Applied AFTER postprocess (orthogonal to
@@ -589,11 +604,18 @@ def reconstruct_from_generated(
     mol, atoms = make_obmol(xyz, atomic_nums)  # 构建 OpenBabel 分子。
     fixup(atoms, mol, indicators)  # 根据指示器调整原子属性。
 
-    protected = seed_scaffold_bonds(mol, atoms, scaffold_bonds)
+    scaffold_seed_bonds = list(scaffold_bonds or [])
+    attachment_seed_bonds = list(extra_attachment_bonds or [])
+    protected = seed_scaffold_bonds(
+        mol, atoms, scaffold_seed_bonds + attachment_seed_bonds,
+    )
     n_sc = int(n_scaffold) if n_scaffold is not None else None
     if n_sc is None and protected:
         # 从键表推断骨架前缀长度
-        n_sc = max(max(i, j) for i, j, *_ in _normalize_scaffold_bonds(scaffold_bonds)) + 1
+        n_sc = max(
+            max(i, j)
+            for i, j, *_ in _normalize_scaffold_bonds(scaffold_seed_bonds)
+        ) + 1
 
     connect_the_dots(
         mol, atoms, indicators, covalent_factor=2.0,
@@ -606,7 +628,9 @@ def reconstruct_from_generated(
     # Re-seed scaffold aromaticity after PerceiveBondOrders, which may
     # have cleared the aromatic flags set by seed_scaffold_bonds.
     if protected:
-        norm_bonds = _normalize_scaffold_bonds(scaffold_bonds)
+        norm_bonds = _normalize_scaffold_bonds(
+            scaffold_seed_bonds + attachment_seed_bonds,
+        )
         for i, j, order, aromatic in norm_bonds:
             if i >= len(atoms) or j >= len(atoms):
                 continue
@@ -627,7 +651,9 @@ def reconstruct_from_generated(
     mol.AddHydrogens()  # 添加全部氢原子。
     # Re-seed scaffold aromaticity again after hydrogen addition.
     if protected:
-        norm_bonds = _normalize_scaffold_bonds(scaffold_bonds)
+        norm_bonds = _normalize_scaffold_bonds(
+            scaffold_seed_bonds + attachment_seed_bonds,
+        )
         for i, j, order, aromatic in norm_bonds:
             if i >= len(atoms) or j >= len(atoms):
                 continue
@@ -670,11 +696,20 @@ def reconstruct_from_generated(
     try:
         # Post-processing
         rd_mol = postprocess_rd_mol_1(rd_mol)
-        rd_mol = postprocess_rd_mol_2(rd_mol, n_scaffold=n_sc)
-        rd_mol = _force_scaffold_aromaticity(rd_mol, scaffold_bonds, n_sc)
-        rd_mol = _repair_scaffold_extra_bonds(
-            rd_mol, scaffold_bonds, n_sc,
+        rd_mol = postprocess_rd_mol_2(
+            rd_mol, n_scaffold=n_sc, protected_pairs=protected,
         )
+        rd_mol = _force_scaffold_aromaticity(
+            rd_mol, scaffold_seed_bonds + attachment_seed_bonds, n_sc,
+        )
+        rd_mol = _repair_scaffold_extra_bonds(
+            rd_mol,
+            scaffold_seed_bonds,
+            n_sc,
+            protected_extra_bonds=attachment_seed_bonds,
+        )
+        if attachment_seed_bonds:
+            rd_mol = _reconnect_scaffold_extra_components(rd_mol, n_sc)
     except:
         raise MolReconsError()
 
@@ -737,7 +772,9 @@ def _force_scaffold_aromaticity(rd_mol, scaffold_bonds, n_scaffold):
         return rd_mol
 
 
-def _repair_scaffold_extra_bonds(rd_mol, scaffold_bonds, n_scaffold):
+def _repair_scaffold_extra_bonds(
+    rd_mol, scaffold_bonds, n_scaffold, protected_extra_bonds=None,
+):
     """Keep locked scaffold valence valid after noisy extra-atom bonding.
 
     Distance bonding can attach several generated atoms to a scaffold atom.
@@ -753,6 +790,11 @@ def _repair_scaffold_extra_bonds(rd_mol, scaffold_bonds, n_scaffold):
     norm = _normalize_scaffold_bonds(scaffold_bonds)
     if not norm:
         return rd_mol
+    protected_extra = {
+        _pair_key(i, j)
+        for i, j, _, _ in _normalize_scaffold_bonds(protected_extra_bonds)
+        if i < n_sc or j < n_sc
+    }
 
     rwmol = Chem.RWMol(rd_mol)
     aromatic_atoms = set()
@@ -813,15 +855,23 @@ def _repair_scaffold_extra_bonds(rd_mol, scaffold_bonds, n_scaffold):
                 bond.SetBondType(Chem.BondType.SINGLE)
                 bond.SetIsAromatic(False)
 
+        forced = [
+            bond for bond in extra_bonds
+            if _pair_key(
+                bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(),
+            ) in protected_extra
+        ]
+        optional = [bond for bond in extra_bonds if bond not in forced]
         ranked = sorted(
-            extra_bonds,
+            optional,
             key=lambda bond: (
                 bond.GetBondTypeAsDouble(),
                 bond.GetBeginAtomIdx(),
                 bond.GetEndAtomIdx(),
             ),
         )
-        for bond in ranked[keep_count:]:
+        keep_optional = max(keep_count - len(forced), 0)
+        for bond in ranked[keep_optional:]:
             rwmol.RemoveBond(
                 bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
             )
@@ -836,6 +886,101 @@ def _repair_scaffold_extra_bonds(rd_mol, scaffold_bonds, n_scaffold):
     except Exception:
         # Keep the explicit scaffold topology available to the caller even
         # when an unrelated generated side chain remains chemically noisy.
+        pass
+    return repaired
+
+
+def _reconnect_scaffold_extra_components(
+    rd_mol, n_scaffold, max_distance=4.5,
+):
+    """Reconnect small generated components using their 3D coordinates.
+
+    This is only called when scaffold-site attachment bonds are present. It
+    repairs an extra atom that was first bonded to a full-valence scaffold
+    atom and subsequently became isolated, preferring an extra-to-extra bond
+    over adding another bond directly to the locked scaffold.
+    """
+    if rd_mol is None or n_scaffold is None:
+        return rd_mol
+    n_sc = int(n_scaffold)
+    if n_sc <= 0 or rd_mol.GetNumAtoms() <= n_sc:
+        return rd_mol
+    try:
+        conformer = rd_mol.GetConformer()
+    except Exception:
+        return rd_mol
+
+    periodic_table = Chem.GetPeriodicTable()
+
+    def _available_valence(atom):
+        value = periodic_table.GetDefaultValence(atom.GetAtomicNum())
+        if value is None or int(value) < 0:
+            value = 4
+        if atom.GetFormalCharge() > 0 and atom.GetAtomicNum() == 7:
+            value = 4
+        used = sum(bond.GetBondTypeAsDouble() for bond in atom.GetBonds())
+        return float(value) - used
+
+    rwmol = Chem.RWMol(rd_mol)
+    while True:
+        components = [
+            set(component)
+            for component in Chem.GetMolFrags(
+                rwmol.GetMol(), asMols=False, sanitizeFrags=False,
+            )
+        ]
+        main = next(
+            (component for component in components if 0 in component),
+            None,
+        )
+        if main is None:
+            return rd_mol
+        detached = [
+            component for component in components
+            if not component.issubset(main)
+            and not (component & set(range(n_sc)))
+        ]
+        if not detached:
+            break
+
+        component = min(detached, key=len)
+        candidates = []
+        for detached_idx in component:
+            detached_atom = rwmol.GetAtomWithIdx(detached_idx)
+            if _available_valence(detached_atom) < 1.0 - 1e-6:
+                continue
+            detached_pos = np.asarray(
+                conformer.GetAtomPosition(detached_idx), dtype=float,
+            )
+            for main_idx in main:
+                if rwmol.GetBondBetweenAtoms(detached_idx, main_idx):
+                    continue
+                main_atom = rwmol.GetAtomWithIdx(main_idx)
+                if _available_valence(main_atom) < 1.0 - 1e-6:
+                    continue
+                main_pos = np.asarray(
+                    conformer.GetAtomPosition(main_idx), dtype=float,
+                )
+                distance = float(np.linalg.norm(detached_pos - main_pos))
+                if distance > float(max_distance):
+                    continue
+                # Prefer reconnecting into the generated side chain, which
+                # avoids consuming another locked scaffold valence slot.
+                priority = int(detached_idx < n_sc or main_idx < n_sc)
+                candidates.append((priority, distance, detached_idx, main_idx))
+        if not candidates:
+            break
+        _, _, detached_idx, main_idx = min(candidates)
+        rwmol.AddBond(detached_idx, main_idx, Chem.BondType.SINGLE)
+
+    repaired = rwmol.GetMol()
+    repaired.UpdatePropertyCache(strict=False)
+    try:
+        Chem.SanitizeMol(
+            repaired,
+            sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_PROPERTIES,
+        )
+    except Exception:
         pass
     return repaired
 

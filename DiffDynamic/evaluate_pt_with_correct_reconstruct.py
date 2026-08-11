@@ -1008,8 +1008,42 @@ def remove_small_fragments(mol, debug=False, scaffold_substruct=None):
     return combined
 
 
+def _scaffold_attachment_bonds(record, scaffold_cfg, atom_count):
+    """Build protected anchor bonds from the generated site allocation.
+
+    The placement code emits extra atoms grouped by active site. Connecting
+    the first atom of each group to that site's scaffold anchor keeps a noisy
+    distance reconstruction from dropping an otherwise valid branch.
+    """
+    if not record or not scaffold_cfg:
+        return []
+    n_scaffold = int(scaffold_cfg.get('n_scaffold_atoms') or 0)
+    if n_scaffold <= 0 or atom_count <= n_scaffold:
+        return []
+    sites = {
+        int(site.get('site_id')): site
+        for site in scaffold_cfg.get('attachment_sites') or []
+        if site.get('site_id') is not None
+    }
+    bonds = []
+    cursor = n_scaffold
+    for allocation in record.get('site_allocation') or []:
+        count = int(allocation.get('count') or 0)
+        if count <= 0:
+            continue
+        site_id = allocation.get('site_id')
+        site = sites.get(int(site_id)) if site_id is not None else None
+        anchor = site.get('anchor_scaffold_idx') if site else None
+        if anchor is not None and 0 <= int(anchor) < n_scaffold:
+            if cursor < atom_count:
+                bonds.append((int(anchor), int(cursor), 1, False))
+        cursor += count
+    return bonds
+
+
 def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_structure_repair=None,
-                         scaffold_bonds=None, n_scaffold=None):
+                         scaffold_bonds=None, n_scaffold=None,
+                         extra_attachment_bonds=None):
     """
     使用正确的reconstruct方法重建单个分子
     
@@ -1076,6 +1110,7 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_st
             basic_mode=(atom_mode == 'basic'),  # basic 模式时设为 True，add_aromatic 模式时设为 False
             scaffold_bonds=scaffold_bonds,
             n_scaffold=n_scaffold,
+            extra_attachment_bonds=extra_attachment_bonds,
             rdkit_structure_repair=rdkit_structure_repair,
         )
         
@@ -2806,10 +2841,16 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
             
             # 3.1 重建分子
             try:
+                attachment_bonds = _scaffold_attachment_bonds(
+                    meta_records[idx] if idx < len(meta_records) else None,
+                    scaffold_cfg_meta,
+                    len(pos),
+                )
                 mol, error_info = reconstruct_molecule(
                     pos, v, atom_mode=atom_mode, debug=debug,
                     scaffold_bonds=scaffold_bonds_pt,
                     n_scaffold=n_scaffold_pt,
+                    extra_attachment_bonds=attachment_bonds,
                 )
             except Exception as e:
                 # 捕获重建过程中的异常

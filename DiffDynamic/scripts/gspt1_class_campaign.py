@@ -362,6 +362,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "targetdiff_reverse_steps": 20,
             "reference_target_graph_used": False,
             "post_generation_graph_editing": False,
+            "scaffold_attachment_reconstruction": "site_anchor_first_extra",
             "vina": False,
         },
     }
