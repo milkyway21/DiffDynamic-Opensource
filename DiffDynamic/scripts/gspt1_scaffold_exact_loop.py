@@ -94,6 +94,14 @@ VARIANTS = (
     # template, one real Murcko exit, old size prior, and baseline refine.
     ("native_tbr_legacy_020", "native_template", 0.20, 0.25, False, True,
      "prior_minus_scaffold", "legacy"),
+    # TargetDiff baseline 20 steps; keep scaffold-prefix coordinates but let
+    # the baseline refine change atom types.
+    ("profile_slot0_tbr20_posonly", "native_template", 0.20, 0.25, True,
+     True, "prior_minus_scaffold", "weighted_single"),
+    ("profile_legacy_tbr20_posonly", "native_template", 0.20, 0.25, True,
+     True, "prior_minus_scaffold", "legacy"),
+    ("native_tbr_legacy20_posonly", "native_template", 0.20, 0.25, False,
+     True, "prior_minus_scaffold", "legacy"),
     # Independent replicate of the best control; it uses a distinct job
     # namespace and seed while keeping the same scaffold-only configuration.
     ("native_tbr_legacy_020_replica", "native_template", 0.20, 0.25,
@@ -103,6 +111,22 @@ VARIANTS = (
     ("anchor_radial_tbr_020", "anchor_radial", 0.20, 0.25, False, True,
      "prior_minus_scaffold", "legacy"),
 )
+
+
+TARGETDIFF_BASELINE_OVERRIDES = {
+    "profile_slot0_tbr20_posonly": {
+        "start_t": 19,
+        "lock_prefix": "pos_only",
+    },
+    "profile_legacy_tbr20_posonly": {
+        "start_t": 19,
+        "lock_prefix": "pos_only",
+    },
+    "native_tbr_legacy20_posonly": {
+        "start_t": 19,
+        "lock_prefix": "pos_only",
+    },
+}
 
 
 def _sha256(path: Path) -> str:
@@ -139,6 +163,8 @@ def _variant_config(
     reference_exit_slots: Optional[List[int]] = None,
     reference_exit_only: bool = False,
     reference_exit_template_order: Optional[str] = None,
+    targetdiff_start_t: Optional[int] = None,
+    targetdiff_lock_prefix: Optional[str] = None,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base)
     scaffold = config.setdefault("sample", {}).setdefault("scaffold", {})
@@ -178,6 +204,10 @@ def _variant_config(
         "targetdiff_baseline_refine", {}
     )
     baseline_refine["enable"] = enable_baseline
+    if targetdiff_start_t is not None:
+        baseline_refine["start_t"] = int(targetdiff_start_t)
+    if targetdiff_lock_prefix is not None:
+        baseline_refine["lock_prefix"] = str(targetdiff_lock_prefix)
     grow = scaffold["grow"]
     grow["n_extra_mode"] = n_extra_mode
     if n_extra_mode in ("reference_size_prior", "reference_n_extra_prior"):
@@ -487,17 +517,25 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                     "profile_slot0_tbr_020": [0],
                     "profile_slot0_size_tbr_020": [0],
                     "profile_slot0_native_order_020": [0],
+                    "profile_slot0_tbr20_posonly": [0],
                 }.get(name),
                 reference_exit_only=name in {
                     "profile_slot0_tbr_020",
                     "profile_slot0_size_tbr_020",
                     "profile_slot0_native_order_020",
+                    "profile_slot0_tbr20_posonly",
                 },
                 reference_exit_template_order=(
                     "native"
                     if name == "profile_slot0_native_order_020"
                     else None
                 ),
+                targetdiff_start_t=TARGETDIFF_BASELINE_OVERRIDES.get(
+                    name, {}
+                ).get("start_t"),
+                targetdiff_lock_prefix=TARGETDIFF_BASELINE_OVERRIDES.get(
+                    name, {}
+                ).get("lock_prefix"),
             )
             _write_yaml(config, variant_config)
             jobs.append(

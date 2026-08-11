@@ -1022,6 +1022,7 @@ def _baseline_refine_lock_restore_flags(config):
 
     - ``types_only``（默认）：只锁原子类型，位置交给 refine
     - ``types_and_pos``：类型+坐标都还原（旧行为）
+    - ``pos_only``：只还原坐标，允许 refine 改变原子类型
     - ``none``：不还原
     """
     tbr = {}
@@ -1036,6 +1037,8 @@ def _baseline_refine_lock_restore_flags(config):
         return False, False
     if mode in ('types_and_pos', 'pos_and_type', 'both', 'all'):
         return True, True
+    if mode in ('pos_only', 'position_only', 'positions_only'):
+        return True, False
     # types_only / type / types / default
     return False, True
 
