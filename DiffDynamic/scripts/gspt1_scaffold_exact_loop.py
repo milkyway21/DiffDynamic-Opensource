@@ -345,17 +345,18 @@ def _choose_variants(
     variant_summaries: dict[str, dict[str, Any]],
     run_counts: dict[str, int],
     round_index: int,
+    variants=VARIANTS,
 ) -> list[tuple[str, str, float]]:
     if not variant_summaries:
-        start = (round_index * 3) % len(VARIANTS)
-        return [VARIANTS[(start + i) % len(VARIANTS)] for i in range(3)]
+        start = (round_index * 3) % len(variants)
+        return [variants[(start + i) % len(variants)] for i in range(3)]
     ranked = sorted(
-        VARIANTS,
+        variants,
         key=lambda item: _variant_score(variant_summaries.get(item[0], {})),
         reverse=True,
     )
     legacy_family = tuple(
-        item for item in VARIANTS
+        item for item in variants
         if item[0] in {
             "native_tbr_legacy_020",
             "native_tbr_legacy_020_replica",
@@ -371,7 +372,7 @@ def _choose_variants(
             if item not in chosen:
                 chosen.append(item)
                 break
-        unseen = [item for item in VARIANTS if item[0] not in variant_summaries]
+        unseen = [item for item in variants if item[0] not in variant_summaries]
         if unseen:
             chosen.append(unseen[0])
         for item in ranked:
@@ -380,11 +381,11 @@ def _choose_variants(
             if len(chosen) == 3:
                 break
         return chosen
-    unseen = [item for item in VARIANTS if item[0] not in variant_summaries]
+    unseen = [item for item in variants if item[0] not in variant_summaries]
     if unseen:
         chosen = [ranked[0], unseen[0]]
     else:
-        least_run = sorted(VARIANTS, key=lambda item: run_counts.get(item[0], 0))
+        least_run = sorted(variants, key=lambda item: run_counts.get(item[0], 0))
         chosen = [ranked[0], least_run[0]]
     for item in ranked:
         if item not in chosen:
@@ -416,6 +417,17 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
         root, reference_sdf, native_ligand, protein, config_path, profile,
         args.start_seed, args.gpus,
     )
+    variant_catalog = VARIANTS
+    if args.fixed_variants:
+        by_name = {item[0]: item for item in VARIANTS}
+        missing = [name for name in args.fixed_variants if name not in by_name]
+        if missing:
+            raise ValueError(f"unknown fixed variants: {', '.join(missing)}")
+        variant_catalog = tuple(by_name[name] for name in args.fixed_variants)
+        if len(variant_catalog) != len(args.gpus):
+            raise ValueError(
+                "--fixed-variants count must equal --gpus count"
+            )
     state_path = root / "state.json"
     state = {}
     if state_path.exists() and args.resume:
@@ -430,7 +442,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
         if args.max_rounds and round_index >= args.max_rounds:
             break
         variant_summaries = {}
-        for name, _, _, _, _, _, _, _ in VARIANTS:
+        for name, _, _, _, _, _, _, _ in variant_catalog:
             variant_root = root / "rounds" / name
             summary_path = variant_root / "audit" / "summary.json"
             if summary_path.exists():
@@ -441,7 +453,13 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 except json.JSONDecodeError:
                     pass
 
-        selected = _choose_variants(variant_summaries, run_counts, round_index)
+        selected = (
+            list(variant_catalog)
+            if args.fixed_variants
+            else _choose_variants(
+                variant_summaries, run_counts, round_index, variant_catalog
+            )
+        )
         jobs = []
         for gpu, variant in zip(args.gpus, selected):
             (
@@ -544,7 +562,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, Any]:
         campaign_summary = audit(
             [root], reference_sdf, audit_dir, scaffold_atoms=18, top_n=500
         )
-        for name, _, _, _, _, _, _, _ in VARIANTS:
+        for name, _, _, _, _, _, _, _ in variant_catalog:
             variant_root = root / "rounds" / name
             if variant_root.exists():
                 audit(
@@ -590,12 +608,20 @@ def main() -> None:
     parser.add_argument("--start-seed", type=int, default=20270600)
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--gpus", default="3,4,5")
+    parser.add_argument(
+        "--fixed-variants",
+        default="",
+        help="comma-separated variant names, one per GPU, in fixed order",
+    )
     parser.add_argument("--max-rounds", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     args.gpus = [int(item.strip()) for item in args.gpus.split(",") if item.strip()]
     if not args.gpus:
         raise SystemExit("--gpus must contain at least one GPU")
+    args.fixed_variants = [
+        item.strip() for item in args.fixed_variants.split(",") if item.strip()
+    ]
     summary = run_campaign(args)
     print(json.dumps(summary, indent=2, ensure_ascii=True))
 
