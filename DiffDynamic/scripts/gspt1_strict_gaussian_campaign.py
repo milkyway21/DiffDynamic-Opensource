@@ -552,6 +552,58 @@ def _audit_round(
     return summaries, total
 
 
+def _job_is_complete(
+    root: Path,
+    lane_name: str,
+    round_index: int,
+    job_id: int,
+) -> bool:
+    """Check the durable markers for one generation/reconstruction job."""
+    variant_root = root / "rounds" / lane_name / f"run_{round_index:04d}"
+    job_dir = variant_root / "gspt1" / "jobs" / f"job_{job_id:04d}"
+    extract_dir = (
+        variant_root / "gspt1" / "extract_cleaned" / f"job_{job_id:04d}"
+    )
+    return (
+        (job_dir / ".sample_done").is_file()
+        and (extract_dir / ".extract_done").is_file()
+    )
+
+
+def _legacy_round_in_progress(root: Path, state: dict[str, Any]) -> bool:
+    """Detect an interrupted round written by the pre-status state format."""
+    round_index = int(state.get("round_index", 0))
+    schedule = state.get("last_schedule") or []
+    if round_index <= 0 or not schedule:
+        return False
+
+    previous_round = round_index - 1
+    if any(
+        not _job_is_complete(
+            root,
+            str(item.get("lane", "")),
+            previous_round,
+            int(item.get("job_id", -1)),
+        )
+        for item in schedule
+    ):
+        return True
+
+    latest_path = root / "latest_summary.json"
+    try:
+        latest = json.loads(latest_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return True
+    return int(latest.get("round", -1)) != previous_round
+
+
+def _write_state(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str, Any]:
     root = prepared["root"]
     state_path = root / "state.json"
@@ -560,6 +612,20 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
         state = json.loads(state_path.read_text(encoding="utf-8"))
     round_index = int(state.get("round_index", 0))
     next_job_id = int(state.get("next_job_id", 0))
+    pending_schedule = None
+    state_status = state.get("status")
+    if args.resume and state_status == "running":
+        pending_schedule = state.get("last_schedule") or []
+    elif args.resume and not state_status and _legacy_round_in_progress(
+        root, state
+    ):
+        # The old launcher advanced round_index before the jobs were done.
+        # Rewind only the unfinished round and reuse its original seeds.
+        pending_schedule = state.get("last_schedule") or []
+        round_index -= 1
+        next_job_id = max(
+            int(item["job_id"]) for item in pending_schedule
+        ) + 1
     deadline = time.time() + float(args.hours) * 3600.0
     final_summary: dict[str, Any] = {}
 
@@ -570,9 +636,26 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
         if args.max_rounds and round_index >= args.max_rounds:
             break
         jobs = []
-        for lane in LANES:
-            job_id = next_job_id
-            next_job_id += 1
+        lane_by_name = {lane.name: lane for lane in LANES}
+        if pending_schedule:
+            schedule = pending_schedule
+            pending_schedule = None
+        else:
+            schedule = [
+                {
+                    "lane": lane.name,
+                    "class": lane.class_name,
+                    "gpu": lane.gpu,
+                    "job_id": next_job_id + offset,
+                    "seed": int(args.start_seed) + next_job_id + offset,
+                }
+                for offset, lane in enumerate(LANES)
+            ]
+            next_job_id += len(schedule)
+
+        for item in schedule:
+            lane = lane_by_name[str(item["lane"])]
+            job_id = int(item["job_id"])
             seed = int(args.start_seed) + job_id
             variant_root = root / "rounds" / lane.name / f"run_{round_index:04d}"
             config_path = _lane_config(
@@ -584,22 +667,17 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
             )
             jobs.append((lane, job_id, variant_root, config_path, ligand))
 
-        state_path.write_text(
-            json.dumps({
-                "round_index": round_index + 1,
+        _write_state(
+            state_path,
+            {
+                "status": "running",
+                "round_index": round_index,
+                "scheduled_job_start": min(
+                    int(item["job_id"]) for item in schedule
+                ),
                 "next_job_id": next_job_id,
-                "last_schedule": [
-                    {
-                        "lane": lane.name,
-                        "class": lane.class_name,
-                        "gpu": lane.gpu,
-                        "job_id": job_id,
-                        "seed": int(args.start_seed) + job_id,
-                    }
-                    for lane, job_id, _, _, _ in jobs
-                ],
-            }, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
+                "last_schedule": schedule,
+            },
         )
 
         results = []
@@ -647,6 +725,17 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
         (root / "latest_summary.json").write_text(
             json.dumps(final_summary, indent=2, ensure_ascii=True) + "\n",
             encoding="utf-8",
+        )
+        round_completed = round_index
+        _write_state(
+            state_path,
+            {
+                "status": "completed",
+                "round_index": round_completed + 1,
+                "completed_round": round_completed,
+                "next_job_id": next_job_id,
+                "last_schedule": schedule,
+            },
         )
         print(json.dumps(final_summary, ensure_ascii=True), flush=True)
         if final_summary["exact_reachable_count"] > 0 or int(
