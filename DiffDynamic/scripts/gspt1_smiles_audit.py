@@ -89,7 +89,36 @@ def _prop(mol: Chem.Mol, names: Iterable[str]) -> str:
     return ""
 
 
-def iter_generated_records(roots: list[Path], scaffold_atoms: int) -> Iterable[MoleculeRecord]:
+def _compile_scaffold_patterns(
+    scaffold_smarts: Iterable[str],
+) -> list[tuple[Chem.Mol, int]]:
+    patterns = []
+    for smarts in scaffold_smarts:
+        pattern = Chem.MolFromSmarts(str(smarts))
+        if pattern is None:
+            raise ValueError(f"invalid scaffold SMARTS: {smarts}")
+        patterns.append((pattern, pattern.GetNumAtoms()))
+    return patterns
+
+
+def _is_pure_scaffold(
+    molecule: Chem.Mol,
+    scaffold_patterns: list[tuple[Chem.Mol, int]],
+) -> bool:
+    heavy_atoms = molecule.GetNumHeavyAtoms()
+    return any(
+        heavy_atoms == scaffold_atom_count
+        and molecule.HasSubstructMatch(pattern)
+        for pattern, scaffold_atom_count in scaffold_patterns
+    )
+
+
+def iter_generated_records(
+    roots: list[Path],
+    scaffold_atoms: int,
+    exclude_scaffold_smarts: Iterable[str] = (),
+) -> Iterable[MoleculeRecord]:
+    scaffold_patterns = _compile_scaffold_patterns(exclude_scaffold_smarts)
     paths: set[Path] = set()
     for root in roots:
         if root.is_file() and root.suffix.lower() == ".sdf":
@@ -111,7 +140,9 @@ def iter_generated_records(roots: list[Path], scaffold_atoms: int) -> Iterable[M
             if not smiles or standardized is None:
                 continue
             heavy_atoms = standardized.GetNumHeavyAtoms()
-            if heavy_atoms <= scaffold_atoms:
+            if heavy_atoms <= scaffold_atoms or _is_pure_scaffold(
+                standardized, scaffold_patterns
+            ):
                 continue
             yield MoleculeRecord(
                 canonical_smiles=smiles,
@@ -128,6 +159,7 @@ def audit(
     output_dir: Path,
     scaffold_atoms: int = 18,
     top_n: int = 500,
+    exclude_scaffold_smarts: Iterable[str] = (),
 ) -> dict:
     references = load_reference(reference_sdf)
     reference_smiles = set(references)
@@ -138,7 +170,9 @@ def audit(
 
     unique: dict[str, MoleculeRecord] = {}
     n_records = 0
-    for record in iter_generated_records(roots, scaffold_atoms):
+    for record in iter_generated_records(
+        roots, scaffold_atoms, exclude_scaffold_smarts=exclude_scaffold_smarts
+    ):
         n_records += 1
         unique.setdefault(record.canonical_smiles, record)
 
@@ -234,6 +268,10 @@ def main() -> None:
     parser.add_argument("--reference-sdf", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--scaffold-atoms", type=int, default=18)
+    parser.add_argument(
+        "--exclude-scaffold-smarts", action="append", default=[],
+        help="exclude pure scaffold records matching this SMARTS",
+    )
     parser.add_argument("--top-n", type=int, default=500)
     args = parser.parse_args()
     summary = audit(
@@ -242,6 +280,7 @@ def main() -> None:
         Path(args.output_dir),
         scaffold_atoms=args.scaffold_atoms,
         top_n=args.top_n,
+        exclude_scaffold_smarts=args.exclude_scaffold_smarts,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=True))
 

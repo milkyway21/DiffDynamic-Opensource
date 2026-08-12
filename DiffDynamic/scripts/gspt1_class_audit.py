@@ -142,6 +142,9 @@ def audit_class(
             smiles = canonical_smiles(molecule) if molecule is not None else None
             if not smiles or molecule is None:
                 continue
+            match = molecule.GetSubstructMatch(pattern)
+            if match and molecule.GetNumHeavyAtoms() == len(match):
+                continue
             generated_records += 1
             unique.setdefault(smiles, (molecule, str(path)))
 

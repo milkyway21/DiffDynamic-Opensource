@@ -497,6 +497,9 @@ def _audit_round(
         [root / "rounds"],
         prepared["reference_sdf"],
         root / "rounds" / f"run_{round_index:04d}_all_similarity",
+        exclude_scaffold_smarts=sorted({
+            spec.scaffold_smarts for spec in CLASS_SPECS
+        }),
     )
     return summaries, total
 
