@@ -1532,6 +1532,7 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
                                     max_gradient_steps=GRAD_FUSION_CAP_UNSPECIFIED,
                                     max_grad_fusion_iterations=GRAD_FUSION_CAP_UNSPECIFIED,
                                     grad_fusion_anchor_t=None,
+                                    preserve_schedule_endpoint=None,
                                     repaint_cfg=None):
 
         if num_steps is None:  # 如果未指定步数。
@@ -1608,8 +1609,17 @@ class ScorePosNet3D(nn.Module):  # 定义三维位置-类别扩散模型。
         else:
             _cap = defaults.get('max_grad_fusion_iterations', defaults.get('max_gradient_steps'))
 
+        if preserve_schedule_endpoint is None:
+            preserve_schedule_endpoint = bool(
+                defaults.get('preserve_schedule_endpoint', False)
+            )
+
         time_indices = self._truncate_schedule_to_grad_fusion_iterations(
-            time_indices, _cap, anchor_t=grad_fusion_anchor_t)
+            time_indices,
+            _cap,
+            anchor_t=grad_fusion_anchor_t,
+            preserve_endpoint=bool(preserve_schedule_endpoint),
+        )
 
         # 大步阶段通常不使用带噪声方法，保持标准方法以获得更快的探索
         use_with_noise = defaults.get('use_with_noise', False)  # 大步阶段默认不使用带噪声方法。
