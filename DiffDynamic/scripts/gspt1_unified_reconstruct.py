@@ -1229,6 +1229,21 @@ def _source_for_molecule(path: Path, unified_root: Path, source_rows: dict[str, 
     return source_rows.get(source_id, {"source_id": source_id})
 
 
+def _is_canonical_molecule_path(path: Path, unified_root: Path) -> bool:
+    """Keep archived full/chunk attempts out of the canonical audit."""
+    reconstructed_root = (unified_root / "reconstructed").resolve()
+    try:
+        relative = path.resolve().relative_to(reconstructed_root)
+    except ValueError:
+        return False
+    if len(relative.parts) < 6 or relative.parts[-2] != "molecules":
+        return False
+    return not any(
+        part == "legacy" or part.startswith("legacy_")
+        for part in relative.parts
+    )
+
+
 def _matched_scaffold_pattern(molecule: Any, patterns: Sequence[Any]) -> Any | None:
     """Prefer the fluorinated scaffold for fluorinated molecules."""
     has_fluorine = any(atom.GetAtomicNum() == 9 for atom in molecule.GetAtoms())
@@ -1271,7 +1286,7 @@ def audit_library(
     molecule_paths = sorted(
         path
         for path in (unified_root / "reconstructed").rglob("*.sdf")
-        if "molecules" in path.parts
+        if _is_canonical_molecule_path(path, unified_root)
     )
     all_records: list[dict[str, Any]] = []
     for path in molecule_paths:
