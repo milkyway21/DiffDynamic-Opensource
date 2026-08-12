@@ -535,6 +535,7 @@ def reconstruct_one(
             "NUMEXPR_NUM_THREADS": "1",
             "DIFFDYNAMIC_SKIP_EVAL_RECORDS": "1",
             "DIFFDYNAMIC_SKIP_SCORE_CATEGORIES": "1",
+            "CUDA_VISIBLE_DEVICES": "",
             "EVAL_MOLECULE_ID_SUFFIX": source_id,
         }
     )
@@ -626,7 +627,18 @@ def reconstruct_all(
                 for row in pending
             }
             for future in as_completed(futures):
-                result = future.result()
+                source_id = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        **next(
+                            row for row in pending if row["source_id"] == source_id
+                        ),
+                        "reconstruction_status": "worker_exception",
+                        "error": repr(exc),
+                        "vina_modes": "none",
+                    }
                 results[result["source_id"]] = result
                 print(
                     json.dumps(
