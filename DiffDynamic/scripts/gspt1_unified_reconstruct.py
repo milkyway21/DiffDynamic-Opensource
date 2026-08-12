@@ -22,7 +22,12 @@ import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -43,6 +48,7 @@ DEFAULT_PROTEIN_ROOT = Path(
 DEFAULT_RECEPTOR = DEFAULT_PROTEIN_ROOT / "5HXB_receptor_clean.pdb"
 DEFAULT_REFERENCE = Path("/data/ye/sdf/GSPT1.sdf")
 EVALUATOR = REPO_ROOT / "evaluate_pt_with_correct_reconstruct.py"
+DEFAULT_CHUNK_SIZE = 40
 
 RESULT_NAME = re.compile(r"^result_.*\.pt$", re.IGNORECASE)
 EVAL_FINAL_NAME = re.compile(
@@ -476,7 +482,11 @@ def _reconstruction_output(unified_root: Path, row: dict[str, Any]) -> Path:
     )
 
 
-def _flatten_sdf_outputs(evaluation_root: Path, molecules_root: Path) -> int:
+def _flatten_sdf_outputs(
+    evaluation_root: Path,
+    molecules_root: Path,
+    prefix: str = "sample",
+) -> int:
     sdf_files = sorted(evaluation_root.rglob("*.sdf"))
     if not sdf_files:
         return 0
@@ -485,13 +495,217 @@ def _flatten_sdf_outputs(evaluation_root: Path, molecules_root: Path) -> int:
     for source in sdf_files:
         if molecules_root in source.parents:
             continue
-        destination = molecules_root / f"sample_{moved:06d}.sdf"
+        destination = molecules_root / f"{prefix}_{moved:06d}_{source.name}"
         while destination.exists():
             moved += 1
-            destination = molecules_root / f"sample_{moved:06d}.sdf"
+            destination = molecules_root / f"{prefix}_{moved:06d}_{source.name}"
         source.rename(destination)
         moved += 1
     return moved
+
+
+def _chunk_ranges(num_items: int, chunk_size: int) -> list[tuple[int, int]]:
+    if num_items <= 0:
+        return []
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    return [
+        (start, min(start + chunk_size, num_items))
+        for start in range(0, num_items, chunk_size)
+    ]
+
+
+def _prepare_source_chunks(
+    row: dict[str, Any],
+    unified_root: Path,
+    chunk_size: int,
+) -> list[dict[str, Any]]:
+    """Materialize evaluator inputs once and return resumable chunk tasks."""
+    import torch
+
+    source_root = _reconstruction_output(unified_root, row)
+    chunk_root = source_root / "chunks"
+    manifest_path = chunk_root / "chunk_manifest.json"
+    source_path = Path(str(row.get("raw_path") or row.get("current_path")))
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+
+    metadata: dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            metadata = {}
+
+    source_sha256 = str(row.get("sha256") or _sha256(source_path))
+    if (
+        metadata.get("source_sha256") != source_sha256
+        or int(metadata.get("chunk_size", 0) or 0) != chunk_size
+    ):
+        data = torch.load(source_path, map_location="cpu", weights_only=False)
+        if not isinstance(data, dict):
+            raise ValueError(f"PT is not a dict: {source_path}")
+        positions = data.get("pred_ligand_pos")
+        atom_types = data.get("pred_ligand_v")
+        if positions is None or atom_types is None:
+            raise ValueError(f"PT lacks evaluator fields: {source_path}")
+        if len(positions) != len(atom_types):
+            raise ValueError(f"PT position/type count differs: {source_path}")
+        num_items = len(positions)
+        from scripts.reconstruct_gspt1_scaffold_parallel_job import (
+            make_chunk_payload,
+        )
+
+        chunk_root.mkdir(parents=True, exist_ok=True)
+        chunks = []
+        for chunk_id, (start, end) in enumerate(
+            _chunk_ranges(num_items, chunk_size)
+        ):
+            chunk_dir = chunk_root / f"chunk_{chunk_id:04d}"
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            chunk_pt = chunk_dir / "input.pt"
+            torch.save(
+                make_chunk_payload(data, start, end, num_items),
+                chunk_pt,
+            )
+            chunks.append(
+                {
+                    "chunk_id": chunk_id,
+                    "start": start,
+                    "end": end,
+                    "sample_count": end - start,
+                    "input_pt": str(chunk_pt),
+                }
+            )
+        metadata = {
+            "source_id": row["source_id"],
+            "source_pt": str(source_path),
+            "source_sha256": source_sha256,
+            "sample_count": num_items,
+            "chunk_size": chunk_size,
+            "chunk_count": len(chunks),
+            "chunks": chunks,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        _json_dump(manifest_path, metadata)
+
+    tasks = []
+    for chunk in metadata.get("chunks", []):
+        chunk_id = int(chunk["chunk_id"])
+        chunk_dir = chunk_root / f"chunk_{chunk_id:04d}"
+        tasks.append(
+            {
+                "row": row,
+                "chunk_id": chunk_id,
+                "start": int(chunk["start"]),
+                "end": int(chunk["end"]),
+                "sample_count": int(chunk["sample_count"]),
+                "input_pt": str(chunk_dir / "input.pt"),
+                "chunk_dir": str(chunk_dir),
+            }
+        )
+    return tasks
+
+
+def _chunk_state_path(task: dict[str, Any]) -> Path:
+    return Path(task["chunk_dir"]) / "chunk_summary.json"
+
+
+def reconstruct_one_chunk(
+    task: dict[str, Any],
+    unified_root: Path,
+    protein_root: Path,
+    receptor_pdb: Path,
+) -> dict[str, Any]:
+    row = task["row"]
+    source_id = str(row["source_id"])
+    chunk_id = int(task["chunk_id"])
+    state_path = _chunk_state_path(task)
+    source_sha256 = str(row.get("sha256", ""))
+    if state_path.exists():
+        try:
+            previous = json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = {}
+        if (
+            previous.get("status") == "success"
+            and previous.get("source_sha256") == source_sha256
+            and previous.get("vina_modes") == "none"
+        ):
+            return previous | {"status": "skipped_existing"}
+
+    chunk_dir = Path(task["chunk_dir"])
+    attempt_dir = chunk_dir / f"attempt_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    evaluation_root = attempt_dir / "evaluation"
+    log_path = attempt_dir / "evaluator.log"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "DIFFDYNAMIC_SKIP_EVAL_RECORDS": "1",
+            "DIFFDYNAMIC_SKIP_SCORE_CATEGORIES": "1",
+            "CUDA_VISIBLE_DEVICES": "",
+            "EVAL_MOLECULE_ID_SUFFIX": (
+                f"{source_id}_chunk{chunk_id:04d}"
+            ),
+        }
+    )
+    command = [
+        sys.executable,
+        str(EVALUATOR),
+        str(task["input_pt"]),
+        "--protein_root",
+        str(protein_root),
+        "--receptor_pdb",
+        str(receptor_pdb),
+        "--output_dir",
+        str(evaluation_root),
+        "--vina-modes",
+        "none",
+        "--enable_isolation",
+        "--no-distribution-plots",
+        "--save_intermediate_interval",
+        "0",
+    ]
+    started = time.time()
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    molecules_root = _reconstruction_output(unified_root, row) / "molecules"
+    molecule_count = _flatten_sdf_outputs(
+        evaluation_root,
+        molecules_root,
+        prefix=f"chunk{chunk_id:04d}",
+    )
+    result = {
+        "source_id": source_id,
+        "chunk_id": chunk_id,
+        "start": int(task["start"]),
+        "end": int(task["end"]),
+        "sample_count": int(task["sample_count"]),
+        "status": "success" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "elapsed_seconds": round(time.time() - started, 3),
+        "source_sha256": source_sha256,
+        "input_pt": str(task["input_pt"]),
+        "attempt_dir": str(attempt_dir),
+        "evaluator_log": str(log_path),
+        "molecule_file_count": molecule_count,
+        "vina_modes": "none",
+        "command": command,
+    }
+    _json_dump(state_path, result)
+    return result
 
 
 def reconstruct_one(
@@ -594,71 +808,185 @@ def reconstruct_all(
     receptor_pdb: Path,
     workers: int,
     limit: int | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> dict[str, Any]:
     rows = _load_selected_after_migration(unified_root)
     if limit is not None:
         rows = rows[:limit]
     manifest_path = unified_root / "manifest" / "reconstruction_manifest.jsonl"
-    existing = {
-        row.get("source_id"): row
-        for row in _jsonl_load(manifest_path)
-        if row.get("source_id")
+    chunk_manifest_path = (
+        unified_root / "manifest" / "chunk_reconstruction_manifest.jsonl"
+    )
+    chunk_results = {
+        (str(row.get("source_id")), int(row.get("chunk_id"))): row
+        for row in _jsonl_load(chunk_manifest_path)
+        if row.get("source_id") is not None and row.get("chunk_id") is not None
     }
-    pending = []
+    tasks: list[dict[str, Any]] = []
     for row in rows:
-        prior = existing.get(row["source_id"])
-        if prior and prior.get("source_sha256") == row.get("sha256"):
-            state = _reconstruction_output(unified_root, row) / "reconstruction_summary.json"
-            if state.exists():
+        source_root = _reconstruction_output(unified_root, row)
+        chunk_root = source_root / "chunks"
+        if not (chunk_root / "chunk_manifest.json").exists():
+            legacy_root = source_root / "legacy_full_attempt"
+            legacy_root.mkdir(parents=True, exist_ok=True)
+            for name in (
+                "evaluation",
+                "molecules",
+                "reconstruction_summary.json",
+                "evaluator.log",
+            ):
+                source = source_root / name
+                if source.exists() or source.is_symlink():
+                    _move_without_overwrite(source, legacy_root / name)
+        for task in _prepare_source_chunks(row, unified_root, chunk_size):
+            key = (str(row["source_id"]), int(task["chunk_id"]))
+            prior = chunk_results.get(key)
+            if (
+                prior
+                and prior.get("source_sha256") == row.get("sha256")
+                and prior.get("status") in {"success", "skipped_existing"}
+            ):
                 continue
-        pending.append(row)
+            state_path = _chunk_state_path(task)
+            if state_path.exists():
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    state = {}
+                if (
+                    state.get("source_sha256") == row.get("sha256")
+                    and state.get("status") in {"success", "skipped_existing"}
+                ):
+                    chunk_results[key] = state
+                    continue
+            tasks.append(task)
 
-    results = dict(existing)
-    if pending:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futures = {
-                executor.submit(
-                    reconstruct_one,
-                    row,
-                    unified_root,
-                    protein_root,
-                    receptor_pdb,
-                ): row["source_id"]
-                for row in pending
-            }
-            for future in as_completed(futures):
-                source_id = futures[future]
+    pending_count = len(tasks)
+    task_by_key = {
+        (str(task["row"]["source_id"]), int(task["chunk_id"])): task
+        for task in tasks
+    }
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        pending_iter = iter(tasks)
+        futures = {}
+        for _ in range(min(max(1, workers), pending_count)):
+            task = next(pending_iter, None)
+            if task is None:
+                break
+            future = executor.submit(
+                reconstruct_one_chunk,
+                task,
+                unified_root,
+                protein_root,
+                receptor_pdb,
+            )
+            futures[future] = task
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                task = futures.pop(future)
+                key = (
+                    str(task["row"]["source_id"]),
+                    int(task["chunk_id"]),
+                )
                 try:
                     result = future.result()
                 except Exception as exc:
                     result = {
-                        **next(
-                            row for row in pending if row["source_id"] == source_id
-                        ),
-                        "reconstruction_status": "worker_exception",
+                        "source_id": key[0],
+                        "chunk_id": key[1],
+                        "start": int(task["start"]),
+                        "end": int(task["end"]),
+                        "sample_count": int(task["sample_count"]),
+                        "status": "worker_exception",
                         "error": repr(exc),
+                        "source_sha256": task["row"].get("sha256", ""),
                         "vina_modes": "none",
                     }
-                results[result["source_id"]] = result
+                chunk_results[key] = result
                 print(
                     json.dumps(
                         {
                             "source_id": result["source_id"],
-                            "status": result.get("reconstruction_status"),
-                            "molecule_file_count": result.get("molecule_file_count", 0),
+                            "chunk_id": result["chunk_id"],
+                            "status": result.get("status"),
+                            "molecule_file_count": result.get(
+                                "molecule_file_count", 0
+                            ),
                         },
                         ensure_ascii=True,
                     ),
                     flush=True,
                 )
                 _jsonl_dump(
-                    manifest_path,
-                    (results[key] for key in sorted(results)),
+                    chunk_manifest_path,
+                    (
+                        chunk_results[item_key]
+                        for item_key in sorted(chunk_results)
+                    ),
                 )
+                next_task = next(pending_iter, None)
+                if next_task is not None:
+                    next_future = executor.submit(
+                        reconstruct_one_chunk,
+                        next_task,
+                        unified_root,
+                        protein_root,
+                        receptor_pdb,
+                    )
+                    futures[next_future] = next_task
+
+    results: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        source_id = str(row["source_id"])
+        source_tasks = [
+            task
+            for task in _prepare_source_chunks(row, unified_root, chunk_size)
+        ]
+        source_chunk_results = [
+            chunk_results.get(
+                (source_id, int(task["chunk_id"])),
+                {"status": "missing", "molecule_file_count": 0},
+            )
+            for task in source_tasks
+        ]
+        statuses = {item.get("status") for item in source_chunk_results}
+        if statuses <= {"success", "skipped_existing"}:
+            source_status = "success"
+        elif statuses & {"success", "skipped_existing"}:
+            source_status = "partial_or_failed"
+        else:
+            source_status = "failed"
+        result = {
+            **row,
+            "reconstruction_status": source_status,
+            "source_sha256": row.get("sha256", ""),
+            "reconstruction_output": str(_reconstruction_output(unified_root, row)),
+            "molecules_dir": str(
+                _reconstruction_output(unified_root, row) / "molecules"
+            ),
+            "chunk_count": len(source_chunk_results),
+            "completed_chunk_count": sum(
+                item.get("status") in {"success", "skipped_existing"}
+                for item in source_chunk_results
+            ),
+            "molecule_file_count": sum(
+                int(item.get("molecule_file_count", 0) or 0)
+                for item in source_chunk_results
+            ),
+            "vina_modes": "none",
+            "chunk_size": chunk_size,
+        }
+        results[source_id] = result
+        _json_dump(
+            _reconstruction_output(unified_root, row)
+            / "reconstruction_summary.json",
+            result,
+        )
     _jsonl_dump(manifest_path, (results[key] for key in sorted(results)))
     summary = {
         "source_count": len(rows),
-        "processed_count": len(pending),
+        "processed_count": pending_count,
         "success_count": sum(
             row.get("reconstruction_status") in {"success", "skipped_existing"}
             for row in results.values()
@@ -671,6 +999,9 @@ def reconstruct_all(
             int(row.get("molecule_file_count", 0) or 0) for row in results.values()
         ),
         "workers": workers,
+        "chunk_size": chunk_size,
+        "chunk_count": len(chunk_results),
+        "chunk_manifest": str(chunk_manifest_path),
         "vina_modes": "none",
         "manifest": str(manifest_path),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1095,6 +1426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--receptor-pdb", type=Path, default=DEFAULT_RECEPTOR)
     parser.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE)
     parser.add_argument("--workers", type=int, default=90)
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--top-n", type=int, default=500)
@@ -1137,6 +1469,7 @@ def main() -> int:
             args.receptor_pdb,
             args.workers,
             limit=args.limit,
+            chunk_size=args.chunk_size,
         )
         print(json.dumps(summary, ensure_ascii=True))
 
