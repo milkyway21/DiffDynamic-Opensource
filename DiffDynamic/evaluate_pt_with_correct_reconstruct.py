@@ -2635,21 +2635,28 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
             sdf_dir.mkdir(parents=True, exist_ok=True)
             print(f"✅ SDF文件将保存至: {sdf_dir}")
     
-    # 创建按评分分类的文件夹（在主路径下）
-    score_category_dirs = {
+    # 创建按评分分类的文件夹（在主路径下）。统一历史重建只需要
+    # evaluator 的 SDF/manifest 输出，禁止额外复制副产物；默认行为保持不变。
+    skip_score_categories = os.environ.get(
+        'DIFFDYNAMIC_SKIP_SCORE_CATEGORIES', ''
+    ).lower() in _TRUE_VALUES
+    score_category_dirs = {} if skip_score_categories else {
         '65-70': REPO_ROOT / 'molecules_score_65-70',
         '70-80': REPO_ROOT / 'molecules_score_70-80',
         '80+': REPO_ROOT / 'molecules_score_80plus'
     }
-    for category, dir_path in score_category_dirs.items():
-        dir_path.mkdir(parents=True, exist_ok=True)
-        # 在每个分类文件夹下创建molecules和proteins子文件夹
-        (dir_path / 'molecules').mkdir(parents=True, exist_ok=True)
-        (dir_path / 'proteins').mkdir(parents=True, exist_ok=True)
-    print(f"✅ 评分分类文件夹已创建:")
-    print(f"   - 65-70分: {score_category_dirs['65-70']}")
-    print(f"   - 70-80分: {score_category_dirs['70-80']}")
-    print(f"   - 80分以上: {score_category_dirs['80+']}")
+    if score_category_dirs:
+        for category, dir_path in score_category_dirs.items():
+            dir_path.mkdir(parents=True, exist_ok=True)
+            # 在每个分类文件夹下创建molecules和proteins子文件夹
+            (dir_path / 'molecules').mkdir(parents=True, exist_ok=True)
+            (dir_path / 'proteins').mkdir(parents=True, exist_ok=True)
+        print(f"✅ 评分分类文件夹已创建:")
+        print(f"   - 65-70分: {score_category_dirs['65-70']}")
+        print(f"   - 70-80分: {score_category_dirs['70-80']}")
+        print(f"   - 80分以上: {score_category_dirs['80+']}")
+    else:
+        print("ℹ️  已跳过评分分类副产物目录（DIFFDYNAMIC_SKIP_SCORE_CATEGORIES）")
     
     # 解析蛋白路径：自定义模式（无配体）时，protein_filename 为绝对路径，需直接传入对接
     resolved_protein_path = None
@@ -3265,7 +3272,7 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
                             elif comprehensive_score >= 80:
                                 category = '80+'
                             
-                            if category:
+                            if category and category in score_category_dirs:
                                 target_dir = score_category_dirs[category]
                                 
                                 # 复制SDF文件到分类文件夹

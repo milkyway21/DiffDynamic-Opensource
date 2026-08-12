@@ -1,0 +1,161 @@
+from pathlib import Path
+
+from scripts.gspt1_unified_reconstruct import (
+    Candidate,
+    discover_candidates,
+    job_context,
+    migrate_corpus,
+    select_candidates,
+)
+
+
+def test_job_context_handles_extract_and_jobs_layout(tmp_path):
+    data_root = tmp_path / "outputs"
+    extract_path = (
+        data_root
+        / "batch_a"
+        / "rounds"
+        / "no_f"
+        / "run_0000"
+        / "gspt1"
+        / "extract"
+        / "job_0007"
+        / "eval"
+        / "eval_results_foo_final_bar.pt"
+    )
+    extract_path.parent.mkdir(parents=True)
+    extract_path.touch()
+    context = job_context(extract_path, data_root)
+    assert context["job"] == "job_0007"
+    assert context["job_key"].endswith("run_0000/job_0007")
+    assert context["class_name"] == "no_f"
+
+    jobs_path = (
+        data_root
+        / "batch_a"
+        / "rounds"
+        / "no_f"
+        / "run_0000"
+        / "gspt1"
+        / "jobs"
+        / "job_0007"
+        / "run"
+        / "result_custom.pt"
+    )
+    jobs_path.parent.mkdir(parents=True)
+    jobs_path.touch()
+    assert job_context(jobs_path, data_root)["job"] == "job_0007"
+
+
+def test_result_pt_has_priority_over_eval_final(tmp_path):
+    data_root = tmp_path / "outputs"
+    result = (
+        data_root
+        / "batch"
+        / "gspt1"
+        / "jobs"
+        / "job_0000"
+        / "run"
+        / "result_custom.pt"
+    )
+    fallback = (
+        data_root
+        / "batch"
+        / "gspt1"
+        / "extract"
+        / "job_0000"
+        / "eval"
+        / "eval_results_final.pt"
+    )
+    fallback.parent.mkdir(parents=True)
+    result.parent.mkdir(parents=True)
+    result.touch()
+    fallback.touch()
+
+    candidates = discover_candidates(data_root)
+    selected = select_candidates(candidates)
+    assert len(selected) == 1
+    assert selected[0].source_kind == "result"
+    assert selected[0].selection_reason == "preferred_result_pt"
+
+
+def test_chunk_inputs_are_selected_when_result_is_missing(tmp_path):
+    data_root = tmp_path / "outputs"
+    for index in range(2):
+        path = (
+            data_root
+            / "batch"
+            / "gspt1"
+            / "extract"
+            / "job_0000"
+            / ".parallel_chunks"
+            / "run_0000"
+            / f"chunk_{index:04d}"
+            / "input.pt"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    candidates = discover_candidates(data_root)
+    selected = select_candidates(candidates)
+    assert len(selected) == 2
+    assert all(item.source_kind == "chunk_input" for item in selected)
+
+
+def test_eval_final_snapshot_is_not_reconstructible(tmp_path):
+    data_root = tmp_path / "outputs"
+    path = (
+        data_root
+        / "batch"
+        / "gspt1"
+        / "extract"
+        / "job_0000"
+        / "eval"
+        / "eval_results_foo_final_bar.pt"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+
+    candidates = discover_candidates(data_root)
+    selected = select_candidates(candidates)
+    assert len(candidates) == 1
+    assert not selected
+    assert candidates[0].selection_reason == "no_reconstructible_pt"
+
+
+def test_migration_moves_data_and_leaves_symlink_entrypoints(tmp_path):
+    data_root = tmp_path / "outputs"
+    unified_root = data_root / "gspt1_unified"
+    source = (
+        data_root
+        / "batch"
+        / "gspt1"
+        / "jobs"
+        / "job_0000"
+        / "run"
+        / "result_custom.pt"
+    )
+    report = data_root / "batch" / "report.json"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"pt")
+    report.write_text("report", encoding="utf-8")
+
+    candidates = discover_candidates(data_root)
+    selected = select_candidates(candidates)
+    rows = migrate_corpus(data_root, unified_root, candidates, selected)
+
+    assert len(rows) == 1
+    raw_path = Path(rows[0]["raw_path"])
+    assert raw_path.read_bytes() == b"pt"
+    assert (data_root / "batch").is_symlink()
+    assert (unified_root / "legacy" / "batch" / "report.json").exists()
+    assert (
+        unified_root
+        / "legacy"
+        / "batch"
+        / "gspt1"
+        / "jobs"
+        / "job_0000"
+        / "run"
+        / "result_custom.pt"
+    ).is_symlink()
