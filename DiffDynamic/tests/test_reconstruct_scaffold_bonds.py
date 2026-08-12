@@ -83,6 +83,20 @@ def test_scaffold_attachment_bond_keeps_distant_generated_branch():
     assert mol.GetBondBetweenAtoms(0, n_sc) is not None
 
 
+def test_scaffold_distance_mode_does_not_force_distant_generated_bond():
+    xyz, atomic, bonds, n_sc = _benzene_scaffold_with_nearby_extra()
+    xyz[-1] = xyz[0] + np.array([4.0, 0.0, 0.0])
+    mol = reconstruct_from_generated(
+        xyz, atomic, aromatic=[True] * n_sc + [False],
+        basic_mode=False,
+        scaffold_bonds=bonds,
+        n_scaffold=n_sc,
+        covalent_factor=1.3,
+    )
+    assert mol is not None
+    assert mol.GetBondBetweenAtoms(0, n_sc) is None
+
+
 def test_scaffold_component_reconnect_prefers_generated_atoms():
     mol = Chem.MolFromSmiles('c1ccccc1C.C')
     conformer = Chem.Conformer(mol.GetNumAtoms())

@@ -1043,7 +1043,7 @@ def _scaffold_attachment_bonds(record, scaffold_cfg, atom_count):
 
 def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_structure_repair=None,
                          scaffold_bonds=None, n_scaffold=None,
-                         extra_attachment_bonds=None):
+                         extra_attachment_bonds=None, covalent_factor=None):
     """
     使用正确的reconstruct方法重建单个分子
     
@@ -1058,6 +1058,10 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_st
             passed to reconstruct_from_generated to protect scaffold topology.
         n_scaffold: int, number of scaffold atoms at the start of the atom list;
             passed to reconstruct_from_generated to protect scaffold bonds.
+        extra_attachment_bonds: legacy protected site bonds. Strict scaffold
+            evaluation leaves this empty so coordinates determine extra bonds.
+        covalent_factor: optional distance-bonding multiplier. ``None`` keeps
+            the historical reconstruction default.
         
     Returns:
         tuple: (mol, error_info)
@@ -1111,6 +1115,9 @@ def reconstruct_molecule(pos, v, atom_mode='add_aromatic', debug=False, rdkit_st
             scaffold_bonds=scaffold_bonds,
             n_scaffold=n_scaffold,
             extra_attachment_bonds=extra_attachment_bonds,
+            covalent_factor=(
+                2.0 if covalent_factor is None else float(covalent_factor)
+            ),
             rdkit_structure_repair=rdkit_structure_repair,
         )
         
@@ -2841,16 +2848,37 @@ def evaluate_pt_file(pt_path, protein_root, output_dir=None,
             
             # 3.1 重建分子
             try:
-                attachment_bonds = _scaffold_attachment_bonds(
-                    meta_records[idx] if idx < len(meta_records) else None,
-                    scaffold_cfg_meta,
-                    len(pos),
+                # Site allocation is an initialization prior, not a bond
+                # topology constraint. Protect only the locked CRBN scaffold
+                # bonds; all extra bonds must be supported by final geometry.
+                allow_forced_attachment = bool(
+                    scaffold_cfg_meta.get(
+                        'allow_forced_attachment_bonds', False,
+                    )
                 )
+                attachment_bonds = (
+                    _scaffold_attachment_bonds(
+                        meta_records[idx]
+                        if idx < len(meta_records) else None,
+                        scaffold_cfg_meta,
+                        len(pos),
+                    )
+                    if allow_forced_attachment else []
+                )
+                scaffold_factor = None
+                if scaffold_bonds_pt and n_scaffold_pt:
+                    scaffold_factor = float(
+                        scaffold_cfg_meta.get(
+                            'scaffold_reconstruction_covalent_factor',
+                            1.3,
+                        )
+                    )
                 mol, error_info = reconstruct_molecule(
                     pos, v, atom_mode=atom_mode, debug=debug,
                     scaffold_bonds=scaffold_bonds_pt,
                     n_scaffold=n_scaffold_pt,
                     extra_attachment_bonds=attachment_bonds,
+                    covalent_factor=scaffold_factor,
                 )
             except Exception as e:
                 # 捕获重建过程中的异常

@@ -172,6 +172,9 @@ def build_strict_config(
         "scaffold_smarts": spec.scaffold_smarts,
         "fix_scaffold_pos": True,
         "fix_scaffold_type": True,
+        "lock_extra_atom_types": True,
+        "allow_forced_attachment_bonds": False,
+        "scaffold_reconstruction_covalent_factor": 1.3,
         "save_dynamic_before_scaffold": False,
     })
 
@@ -279,6 +282,16 @@ def strict_preflight(
         for index in range(molecule.GetNumAtoms())
     ], dtype=np.float64)
     sites_cfg = dict(config["sample"]["scaffold"]["murcko_sites"])
+    scaffold_cfg = config["sample"]["scaffold"]
+    grow_cfg = scaffold_cfg["grow"]
+    if not bool(scaffold_cfg.get("lock_extra_atom_types", False)):
+        raise ValueError(f"{spec.name}: extra atom types are not explicitly locked")
+    if bool(scaffold_cfg.get("allow_forced_attachment_bonds", True)):
+        raise ValueError(f"{spec.name}: forced attachment bonds must be disabled")
+    if float(grow_cfg.get("extra_anchor_strength", 1.0)) != 0.0:
+        raise ValueError(f"{spec.name}: extra coordinate mask must be zero")
+    if float(grow_cfg.get("extra_type_anchor_strength", 0.0)) != 1.0:
+        raise ValueError(f"{spec.name}: extra type mask must be one")
     sites_cfg["save_json"] = False
     sites = load_or_extract_attachment_sites(
         molecule,
@@ -452,8 +465,11 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "gpu0_unused": True,
             "scaffold_position_locked": True,
             "scaffold_type_locked": True,
+            "extra_atom_types_locked": True,
             "added_position_mask": 0.0,
             "added_type_mask": 1.0,
+            "forced_attachment_bonds": False,
+            "scaffold_reconstruction_covalent_factor": 1.3,
             "added_type_condition": "exact_profile_quota_as_x0_with_forward_q",
             "added_coordinate_condition": (
                 "scaffold_anchor_local_generic_fragment_gaussian"

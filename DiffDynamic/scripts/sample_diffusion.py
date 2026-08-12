@@ -7527,6 +7527,14 @@ def scaffold_dynamic_locked_molecule(
     log_mode_is_log_prob = (getattr(model, 'ligand_v_input', 'onehot') == 'log_prob')
 
     extra_anchor_strength = float(grow_cfg.get('extra_anchor_strength', 0.0))
+    lock_extra_atom_types = bool(
+        sc_cfg.get('lock_extra_atom_types', False)
+    )
+    if lock_extra_atom_types:
+        # This scaffold contract intentionally leaves added coordinates to the
+        # normal DiffDynamic reverse process. Only their element classes are
+        # repainted from the exact x0 type condition.
+        extra_anchor_strength = 0.0
     extra_type_anchor_strength = float(
         grow_cfg.get('extra_type_anchor_strength', 0.0)
     )
@@ -7536,12 +7544,21 @@ def scaffold_dynamic_locked_molecule(
     strict_fragment_gaussian = bool(
         _murcko_sites_cfg.get('strict_fragment_gaussian', False)
     )
-    if strict_anchor_gaussian or strict_fragment_gaussian:
+    if (
+        lock_extra_atom_types
+        or strict_anchor_gaussian
+        or strict_fragment_gaussian
+    ):
         # The profile is an exchangeable element multiset.  RePaint keeps its
         # forward-noised state fixed at every reverse step; it is not a soft
         # class preference and must not be replaced by the model prediction.
         extra_type_anchor_strength = 1.0
     extra_type_anchor_strength = min(max(extra_type_anchor_strength, 0.0), 1.0)
+    extra_types_locked = bool(
+        lock_extra_atom_types
+        or strict_anchor_gaussian
+        or strict_fragment_gaussian
+    )
     forward_noise_init = bool(grow_cfg.get('forward_noise_init', False))
     diffusion_start_t = int(np.clip(
         grow_cfg.get('start_t', model.num_timesteps - 1),
@@ -7673,7 +7690,7 @@ def scaffold_dynamic_locked_molecule(
             else:
                 init_ligand_v_input = log_sample_categorical(uniform_logits)
 
-        # ---- 构建 repaint_cfg：锁定 CRBN scaffold + 软锚定新片段 -------------
+        # ---- 构建 repaint_cfg：锁定 CRBN scaffold，新增坐标不回拉 -----------
         repaint_cfg = None
         if n_locked > 0:
             scaffold_pos_orig = (
@@ -7699,7 +7716,7 @@ def scaffold_dynamic_locked_molecule(
             pos_mask_local = torch.zeros(n_total, device=device)
             if fix_scaffold_pos:
                 pos_mask_local[:n_locked] = 1.0
-            # 额外原子锚定：fractional pos_mask 软约束在 attachment site 初始位置附近
+            # 非严格旧配置可选择坐标软锚定；严格方案始终保持新增坐标 mask=0。
             if extra_anchor_strength > 0.0 and n_extra > 0:
                 pos_mask_local[n_locked:] = extra_anchor_strength
 
@@ -7865,7 +7882,7 @@ def scaffold_dynamic_locked_molecule(
         # guards the final tensor against any model-side class drift while
         # leaving normal scaffold and de novo post-processing unchanged.
         if n_extra > 0:
-            if strict_anchor_gaussian or strict_fragment_gaussian:
+            if extra_types_locked:
                 v_np[n_locked:] = extra_log_v.argmax(dim=-1).detach().cpu().numpy()
             else:
                 # 保留 F/Cl；仅清除不应作为新增重原子节点的 H 类别。
@@ -7914,9 +7931,9 @@ def scaffold_dynamic_locked_molecule(
             'site_allocation': _site_place_meta.get('site_allocation') if _site_place_meta else None,
             'strict_anchor_gaussian': strict_anchor_gaussian,
             'strict_fragment_gaussian': strict_fragment_gaussian,
-            'strict_extra_type_locked': (
-                strict_anchor_gaussian or strict_fragment_gaussian
-            ),
+            'strict_extra_type_locked': extra_types_locked,
+            'extra_atom_types_locked': extra_types_locked,
+            'extra_position_mask': 0.0 if lock_extra_atom_types else extra_anchor_strength,
             'fragment_layout': (
                 _site_place_meta.get('fragment_layout')
                 if strict_fragment_gaussian else None
@@ -7977,6 +7994,17 @@ def scaffold_dynamic_locked_molecule(
                 'scaffold_indices': scaffold_indices,
                 'fix_scaffold_pos': fix_scaffold_pos,
                 'fix_scaffold_type': fix_scaffold_type,
+                'lock_extra_atom_types': lock_extra_atom_types,
+                'extra_position_mask': (
+                    0.0 if lock_extra_atom_types else extra_anchor_strength
+                ),
+                'extra_type_mask': extra_type_anchor_strength,
+                'allow_forced_attachment_bonds': bool(
+                    sc_cfg.get('allow_forced_attachment_bonds', False)
+                ),
+                'scaffold_reconstruction_covalent_factor': float(
+                    sc_cfg.get('scaffold_reconstruction_covalent_factor', 1.3)
+                ),
                 'time_boundary': time_boundary,
                 'skip_refine': skip_refine,
                 'attachment_sites': _attachment_sites,

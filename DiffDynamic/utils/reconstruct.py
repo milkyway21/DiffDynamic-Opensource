@@ -576,6 +576,7 @@ def reconstruct_from_generated(
     scaffold_bonds=None, n_scaffold=None,
     rdkit_structure_repair=None,
     extra_attachment_bonds=None,
+    covalent_factor=2.0,
 ):  # 从生成的坐标和元素重建 RDKit 分子。
     """
     will utilize data.ligand_pos, data.ligand_element, data.ligand_atom_feature_full to reconstruct mol
@@ -585,8 +586,13 @@ def reconstruct_from_generated(
 
     extra_attachment_bonds: optional list of generated-site anchor bonds. Each
         bond uses generated atom indices and is protected during reconstruction;
-        this is used only by scaffold-aware generation to reconnect a site's
-        first generated atom to its locked scaffold anchor.
+        this is a legacy opt-in path. The strict scaffold campaign leaves this
+        empty so generated coordinates, rather than site metadata, determine
+        all scaffold-to-extra bonds.
+
+    covalent_factor: multiplier used by coordinate-based distance bonding.
+        The default preserves the historical de novo behavior. Scaffold-aware
+        evaluation may pass a stricter value without changing de novo paths.
 
     rdkit_structure_repair: optional dict matching sample.rdkit_structure_repair in sampling.yml
         enable / config / on_reject. Applied AFTER postprocess (orthogonal to
@@ -617,8 +623,11 @@ def reconstruct_from_generated(
             for i, j, *_ in _normalize_scaffold_bonds(scaffold_seed_bonds)
         ) + 1
 
+    # Scaffold bonds are the only topology supplied from reference metadata.
+    # Generated atoms are connected solely from their final coordinates unless
+    # a caller explicitly opts into the legacy attachment-bond argument.
     connect_the_dots(
-        mol, atoms, indicators, covalent_factor=2.0,
+        mol, atoms, indicators, covalent_factor=float(covalent_factor),
         protected_pairs=protected, n_scaffold=n_sc,
     )  # 根据距离连接键（骨架内参考键受保护）。
     fixup(atoms, mol, indicators)  # 再次调整原子属性确保一致。
