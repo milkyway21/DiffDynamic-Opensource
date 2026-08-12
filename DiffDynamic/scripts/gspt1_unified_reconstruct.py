@@ -749,10 +749,7 @@ def _reference_records(reference_path: Path, Chem: Any, AllChem: Any) -> list[di
         if smiles in seen:
             continue
         seen.add(smiles)
-        matched_pattern = next(
-            (pattern for pattern in patterns if pattern and molecule.HasSubstructMatch(pattern)),
-            None,
-        )
+        matched_pattern = _matched_scaffold_pattern(molecule, patterns)
         outside = (
             _outside_molecule(molecule, matched_pattern, Chem)
             if matched_pattern is not None
@@ -785,10 +782,26 @@ def _reference_records(reference_path: Path, Chem: Any, AllChem: Any) -> list[di
 def _source_for_molecule(path: Path, unified_root: Path, source_rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
     try:
         relative = path.resolve().relative_to((unified_root / "reconstructed").resolve())
-        source_id = relative.parts[-2]
+        source_id = relative.parts[-3]
     except (ValueError, IndexError):
         source_id = "unknown"
     return source_rows.get(source_id, {"source_id": source_id})
+
+
+def _matched_scaffold_pattern(molecule: Any, patterns: Sequence[Any]) -> Any | None:
+    """Prefer the fluorinated scaffold for fluorinated molecules."""
+    has_fluorine = any(atom.GetAtomicNum() == 9 for atom in molecule.GetAtoms())
+    order = (1, 0) if has_fluorine else (0, 1)
+    return next(
+        (
+            patterns[index]
+            for index in order
+            if index < len(patterns)
+            and patterns[index] is not None
+            and molecule.HasSubstructMatch(patterns[index])
+        ),
+        None,
+    )
 
 
 def _read_sdf_record(path: Path, index: int, Chem: Any) -> Any | None:
@@ -858,14 +871,7 @@ def audit_library(
             )
             exact_reference = reference_by_smiles.get(smiles)
             patterns = [Chem.MolFromSmarts(smarts) for smarts in SCAFFOLD_SMARTS]
-            matched_pattern = next(
-                (
-                    pattern
-                    for pattern in patterns
-                    if pattern and molecule.HasSubstructMatch(pattern)
-                ),
-                None,
-            )
+            matched_pattern = _matched_scaffold_pattern(molecule, patterns)
             outside = (
                 _outside_molecule(molecule, matched_pattern, Chem)
                 if matched_pattern is not None
@@ -942,8 +948,11 @@ def audit_library(
         ):
             unique[smiles] = row
 
+    pure_scaffold_rows = [
+        row for row in unique.values() if row.get("is_pure_scaffold")
+    ]
     ranked = sorted(
-        unique.values(),
+        (row for row in unique.values() if not row.get("is_pure_scaffold")),
         key=lambda row: (
             -float(row.get("full_similarity", 0.0)),
             -float(row.get("side_similarity", 0.0)),
@@ -1036,6 +1045,7 @@ def audit_library(
         "raw_record_count": len(all_records),
         "valid_record_count": sum(bool(row.get("valid")) for row in all_records),
         "unique_record_count": len(unique),
+        "pure_scaffold_unique_count": len(pure_scaffold_rows),
         "exact_count": len(exact_rows),
         "best_full_similarity": ranked[0]["full_similarity"] if ranked else 0.0,
         "best_side_similarity": max(
