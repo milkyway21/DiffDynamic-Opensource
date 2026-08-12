@@ -152,6 +152,7 @@ def build_strict_config(
     *,
     seed: int,
     samples: int,
+    fragment_gaussian: bool = False,
 ) -> dict[str, Any]:
     """Build a strict configuration without changing de novo settings."""
     config = copy.deepcopy(base)
@@ -191,8 +192,12 @@ def build_strict_config(
         "max_active_sites": max(len(profile_slots), 1),
         "overflow_mode": "cap",
         "preserve_zero_allocation_sidechains": False,
-        "strict_anchor_gaussian": True,
-        "jitter_mode": "strict_anchor_gaussian",
+        "strict_anchor_gaussian": not fragment_gaussian,
+        "strict_fragment_gaussian": fragment_gaussian,
+        "jitter_mode": (
+            "strict_fragment_gaussian"
+            if fragment_gaussian else "strict_anchor_gaussian"
+        ),
         "jitter_std": lane.sigma,
         "strict_gaussian_sigma": lane.sigma,
         "strict_gaussian_center_offset": lane.center_offset,
@@ -203,6 +208,12 @@ def build_strict_config(
         "strict_gaussian_slot_binormal_shifts": lane.slot_binormal_shifts,
         "reference_extra_type_prior_strength": 1.0,
         "reference_extra_type_prior_mode": "quota_random",
+        "fragment_prior_profile": str(profile_path),
+        "fragment_geometry_sigma": 0.18,
+        "fragment_ring_radius": 1.38,
+        "fragment_center_spacing": 2.15,
+        "fragment_center_lateral_sigma": 0.42,
+        "strict_fragment_center_offset": lane.center_offset,
         "save_json": True,
     })
 
@@ -312,6 +323,13 @@ def strict_preflight(
     }
     observed_patterns: set[tuple[tuple[int, int], ...]] = set()
     observed_counts: set[int] = set()
+    fragment_mode = bool(
+        config["sample"]["scaffold"]["murcko_sites"].get(
+            "strict_fragment_gaussian", False
+        )
+    )
+    if fragment_mode and not profile.get("fragment_patterns"):
+        raise ValueError(f"{spec.name}: fragment profile is empty")
     rng = np.random.default_rng(919191 + len(indices))
     for n_extra in spec.allowed_n_extra:
         for _ in range(128):
@@ -328,6 +346,20 @@ def strict_preflight(
                 (int(record["profile_slot"]), int(record["count"]))
                 for record in meta["site_allocation"]
             )))
+            if fragment_mode:
+                hints = meta.get("fragment_type_hints") or []
+                layout = meta.get("fragment_layout") or []
+                if len(hints) != int(n_extra):
+                    raise ValueError(
+                        f"{spec.name}: fragment hints {len(hints)} != "
+                        f"n_extra={n_extra}"
+                    )
+                if sum(
+                    int(item.get("atom_count", 0)) for item in layout
+                ) != int(n_extra):
+                    raise ValueError(
+                        f"{spec.name}: fragment layout count mismatch"
+                    )
             if required_patterns <= observed_patterns:
                 break
     if observed_counts != set(spec.allowed_n_extra):
@@ -377,6 +409,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             lane,
             seed=int(args.start_seed) + lane_index,
             samples=int(args.samples),
+            fragment_gaussian=bool(args.fragment_gaussian),
         )
         config_path = root / "configs" / f"{lane.name}.yml"
         _write_yaml(config, config_path)
@@ -393,7 +426,11 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
     if 0 in gpu_mapping.values():
         raise ValueError("strict campaign must leave GPU0 unused")
     manifest = {
-        "campaign": "GSPT1 strict scaffold-local Gaussian five-lane campaign",
+        "campaign": (
+            "GSPT1 scaffold fragment-local Gaussian five-lane campaign"
+            if args.fragment_gaussian
+            else "GSPT1 strict scaffold-local Gaussian five-lane campaign"
+        ),
         "created_at_unix": time.time(),
         "git_sha": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
@@ -418,7 +455,16 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "added_position_mask": 0.0,
             "added_type_mask": 1.0,
             "added_type_condition": "exact_profile_quota_as_x0_with_forward_q",
-            "added_coordinate_condition": "scaffold_anchor_local_iid_gaussian",
+            "added_coordinate_condition": (
+                "scaffold_anchor_local_generic_fragment_gaussian"
+                if args.fragment_gaussian
+                else "scaffold_anchor_local_iid_gaussian"
+            ),
+            "fragment_gaussian": bool(args.fragment_gaussian),
+            "fragment_geometry_condition": (
+                "generic_motif_cloud_with_exact_type_alignment"
+                if args.fragment_gaussian else None
+            ),
             "diffusion_start_t": 999,
             "diffdynamic_refine_max_iterations": 30,
             "targetdiff_baseline_refine": False,
@@ -450,6 +496,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
         "profiles": profiles,
         "configs": configs,
         "manifest": manifest,
+        "fragment_gaussian": bool(args.fragment_gaussian),
     }
 
 
@@ -469,6 +516,7 @@ def _lane_config(
         lane,
         seed=seed,
         samples=samples,
+        fragment_gaussian=bool(prepared.get("fragment_gaussian", False)),
     )
     path = prepared["root"] / "configs" / f"run_{lane.name}_{seed}.yml"
     _write_yaml(config, path)
@@ -634,6 +682,11 @@ def main() -> None:
     parser.add_argument("--protein", default=str(DEFAULT_PROTEIN))
     parser.add_argument("--start-seed", type=int, default=20290000)
     parser.add_argument("--gpus", default="1,2,3,4,5")
+    parser.add_argument(
+        "--fragment-gaussian",
+        action="store_true",
+        help="use scaffold-only generic fragment Gaussian clouds",
+    )
     args = parser.parse_args()
     gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]
     if gpu_ids != [lane.gpu for lane in LANES]:

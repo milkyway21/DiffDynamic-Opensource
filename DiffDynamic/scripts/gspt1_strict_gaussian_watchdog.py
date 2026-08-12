@@ -61,6 +61,7 @@ def _launch(
     start_seed: int,
     hours: float,
     samples: int,
+    fragment_gaussian: bool,
     logger,
 ) -> int:
     root.mkdir(parents=True, exist_ok=True)
@@ -87,6 +88,8 @@ def _launch(
         "--gpus",
         "1,2,3,4,5",
     ]
+    if fragment_gaussian:
+        command.append("--fragment-gaussian")
     process = subprocess.Popen(
         command,
         cwd=REPO_ROOT,
@@ -168,6 +171,7 @@ def run(args: argparse.Namespace) -> int:
             "similarity_threshold": float(args.similarity_threshold),
             "gpu_mapping": {"no_f": [1, 2], "f_main": [3, 4], "f_large": [5]},
             "gpu0_unused": True,
+            "fragment_gaussian": bool(args.fragment_gaussian),
         })
 
         while time.time() < deadline:
@@ -180,6 +184,7 @@ def run(args: argparse.Namespace) -> int:
                     args.start_seed,
                     remaining_hours,
                     args.samples,
+                    bool(args.fragment_gaussian),
                     logger,
                 )
 
@@ -237,6 +242,11 @@ def main() -> None:
         "--interval-seconds", type=int, default=DEFAULT_INTERVAL_SECONDS
     )
     parser.add_argument("--similarity-threshold", type=float, default=0.70)
+    parser.add_argument(
+        "--fragment-gaussian",
+        action="store_true",
+        help="launch the scaffold-only generic fragment Gaussian campaign",
+    )
     args = parser.parse_args()
     if args.samples <= 0:
         parser.error("--samples must be positive")

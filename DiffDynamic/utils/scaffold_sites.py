@@ -605,6 +605,10 @@ def load_or_extract_attachment_sites(
     strict_anchor_gaussian = bool(
         sites_cfg.get('strict_anchor_gaussian', False)
     )
+    strict_fragment_gaussian = bool(
+        sites_cfg.get('strict_fragment_gaussian', False)
+    )
+    strict_geometry_only = strict_anchor_gaussian or strict_fragment_gaussian
     profile_tag = '_profile_exit' if use_profile else ''
     cache_suffix = (f'_ev_{ev_mode}' if include_ev else '') + profile_tag
 
@@ -613,7 +617,7 @@ def load_or_extract_attachment_sites(
         scaffold_dir = Path(output_dir) / 'scaffold'
         scaffold_dir.mkdir(parents=True, exist_ok=True)
         json_path = scaffold_dir / f'{ref_ligand_name}_murcko_sites{cache_suffix}.json'
-        if json_path.exists() and not strict_anchor_gaussian:
+        if json_path.exists() and not strict_geometry_only:
             try:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -637,7 +641,7 @@ def load_or_extract_attachment_sites(
                 if logger:
                     logger.warning(f'[MurckoSites] 读取缓存失败: {e}')
 
-    if strict_anchor_gaussian and use_profile:
+    if strict_geometry_only and use_profile:
         # Do not even construct target-side attachment templates in strict
         # mode.  Profile exits below are derived from scaffold atoms only.
         sites = []
@@ -680,7 +684,7 @@ def load_or_extract_attachment_sites(
                 offset=float(sites_cfg.get('reference_exit_offset', 1.5)),
                 allowed_slots=sites_cfg.get('reference_exit_slots'),
             )
-            if strict_anchor_gaussian:
+            if strict_geometry_only:
                 # Strict mode has a geometry-only contract: profile exits are
                 # rebuilt from the scaffold pose and never merged with native
                 # side-chain sites or their cached target-side coordinates.
@@ -1296,6 +1300,225 @@ def _strict_anchor_gaussian_site_positions(
     ]
 
 
+def _site_frame(site: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return a scaffold-derived exit frame without reading target-side atoms."""
+    anchor = np.asarray(site['anchor_pos'], dtype=np.float64)
+    raw_direction = site.get('exit_direction') or _attachment_direction(site)
+    direction = np.asarray(raw_direction or [1.0, 0.0, 0.0], dtype=np.float64)
+    direction /= max(float(np.linalg.norm(direction)), 1e-8)
+
+    raw_tangent = site.get('tangent_direction') or [0.0, 1.0, 0.0]
+    tangent = np.asarray(raw_tangent, dtype=np.float64)
+    tangent -= np.dot(tangent, direction) * direction
+    if float(np.linalg.norm(tangent)) <= 1e-8:
+        basis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(float(np.dot(basis, direction))) > 0.9:
+            basis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        tangent = basis - np.dot(basis, direction) * direction
+    tangent /= max(float(np.linalg.norm(tangent)), 1e-8)
+
+    raw_binormal = site.get('binormal_direction')
+    binormal = np.asarray(
+        raw_binormal or np.cross(direction, tangent), dtype=np.float64
+    )
+    binormal /= max(float(np.linalg.norm(binormal)), 1e-8)
+    return anchor, direction, tangent, binormal
+
+
+def _fragment_atom_keys(fragment: Dict[str, Any]) -> List[str]:
+    keys: List[str] = []
+    for key, count in sorted((fragment.get('atom_counts') or {}).items()):
+        keys.extend([str(key)] * int(count))
+    return keys
+
+
+def _regular_polygon(
+    n_atoms: int,
+    radius: float,
+    tangent: np.ndarray,
+    binormal: np.ndarray,
+    angle: float,
+) -> np.ndarray:
+    values = []
+    for index in range(int(n_atoms)):
+        theta = angle + 2.0 * np.pi * index / max(int(n_atoms), 1)
+        values.append(
+            radius * (
+                np.cos(theta) * tangent + np.sin(theta) * binormal
+            )
+        )
+    return np.asarray(values, dtype=np.float64)
+
+
+def _generic_fragment_geometry(
+    fragment: Dict[str, Any],
+    center: np.ndarray,
+    direction: np.ndarray,
+    tangent: np.ndarray,
+    binormal: np.ndarray,
+    rng: np.random.Generator,
+    sites_cfg: Dict[str, Any],
+) -> tuple[list[np.ndarray], List[str]]:
+    """Create randomized motif geometry and aligned type hints.
+
+    These are generic motif clouds, not reference graphs: no bond list,
+    reference atom index, or target-side coordinate enters this function.
+    The resulting coordinates are still forward-noised before denoising.
+    """
+    kind = str(fragment.get('kind', 'chain'))
+    atom_keys = _fragment_atom_keys(fragment)
+    if not atom_keys:
+        return [], []
+    jitter = float(sites_cfg.get('fragment_geometry_sigma', 0.16))
+    ring_radius = float(sites_cfg.get('fragment_ring_radius', 1.38))
+    angle = float(rng.uniform(0.0, 2.0 * np.pi))
+    rot_t = np.cos(angle) * tangent + np.sin(angle) * binormal
+    rot_b = -np.sin(angle) * tangent + np.cos(angle) * binormal
+    total = len(atom_keys)
+
+    if kind in ('aromatic_ring', 'aliphatic_ring'):
+        radius = ring_radius if kind == 'aromatic_ring' else ring_radius * 0.92
+        local = _regular_polygon(total, radius, rot_t, rot_b, angle * 0.37)
+    elif kind in ('fused_aromatic', 'fused_ring') and total >= 8:
+        # Generic fused 6+5 motif with two shared positions.  The exact
+        # reference fusion topology is intentionally not retained.
+        first = _regular_polygon(6, ring_radius, rot_t, rot_b, angle)
+        second_center = 1.55 * rot_t
+        second = second_center + _regular_polygon(
+            5, ring_radius * 0.96, rot_t, rot_b, angle + 0.35
+        )
+        local_points = [first[0], first[1]]
+        local_points.extend(first[2:])
+        local_points.extend(second[2:])
+        while len(local_points) < total:
+            extra_index = len(local_points) - 8
+            local_points.append(
+                second_center
+                + (extra_index + 1.0) * 0.95 * rot_t
+                + 0.45 * rot_b
+            )
+        local = np.asarray(local_points[:total], dtype=np.float64)
+    elif kind == 'carbonyl' and total >= 2:
+        carbonyl_axis = np.cos(angle) * rot_t + np.sin(angle) * rot_b
+        local = np.zeros((total, 3), dtype=np.float64)
+        local[0] = -0.615 * carbonyl_axis
+        local[1] = 0.615 * carbonyl_axis
+        for index in range(2, total):
+            local[index] = (
+                (index - 1) * 1.25 * direction
+                + 0.35 * ((-1) ** index) * rot_t
+            )
+    elif kind == 'hetero_atom' or total == 1:
+        local = np.zeros((total, 3), dtype=np.float64)
+        for index in range(1, total):
+            local[index] = 0.45 * index * rot_t
+    else:
+        local = np.zeros((total, 3), dtype=np.float64)
+        for index in range(total):
+            local[index] = (
+                (index - 0.5 * (total - 1)) * 1.48 * direction
+                + 0.42 * ((-1) ** index) * rot_t
+            )
+
+    positions = [
+        center + offset + rng.normal(0.0, jitter, size=3)
+        for offset in local
+    ]
+    if kind not in ('carbonyl', 'hetero_atom'):
+        rng.shuffle(atom_keys)
+    return positions, atom_keys
+
+
+def _strict_fragment_gaussian_site_positions(
+    active_sites: List[Dict[str, Any]],
+    counts: List[int],
+    rng: np.random.Generator,
+    sites_cfg: Dict[str, Any],
+) -> tuple[List[np.ndarray], List[str], List[Dict[str, Any]]]:
+    """Place generic fragment clouds around scaffold exit frames."""
+    profile_path = sites_cfg.get('fragment_prior_profile') or sites_cfg.get(
+        'reference_exit_profile'
+    )
+    if not profile_path:
+        raise ValueError(
+            'strict_fragment_gaussian requires fragment_prior_profile'
+        )
+    profile = load_scaffold_profile(profile_path)
+    n_extra = int(sum(int(value) for value in counts))
+    allocation = {
+        str(site.get('profile_slot')): int(count)
+        for site, count in zip(active_sites, counts)
+        if int(count) > 0
+    }
+    candidates = []
+    for pattern in profile.get('fragment_patterns', []):
+        if int(pattern.get('n_extra', -1)) != n_extra:
+            continue
+        pattern_counts = {}
+        for slot, fragments in (pattern.get('site_fragments') or {}).items():
+            pattern_counts[str(slot)] = sum(
+                sum(int(value) for value in (fragment.get('atom_counts') or {}).values())
+                for fragment in fragments
+            )
+        if pattern_counts == allocation:
+            candidates.append(pattern)
+    if not candidates:
+        raise ValueError(
+            f'no fragment pattern matches n_extra={n_extra} '
+            f'allocation={allocation}'
+        )
+    weights = np.asarray([
+        max(float(pattern.get('weight', 0.0)), 0.0)
+        for pattern in candidates
+    ], dtype=np.float64)
+    selected = candidates[int(rng.choice(
+        len(candidates), p=weights / max(float(weights.sum()), 1e-12)
+    ))]
+
+    positions: List[np.ndarray] = []
+    type_hints: List[str] = []
+    layout: List[Dict[str, Any]] = []
+    fragment_spacing = float(sites_cfg.get('fragment_center_spacing', 2.15))
+    center_offset = float(sites_cfg.get('strict_fragment_center_offset', 1.55))
+    lateral_sigma = float(sites_cfg.get('fragment_center_lateral_sigma', 0.45))
+    for site, count in zip(active_sites, counts):
+        if int(count) <= 0:
+            continue
+        slot = str(site.get('profile_slot'))
+        fragments = list(
+            (selected.get('site_fragments') or {}).get(slot) or []
+        )
+        rng.shuffle(fragments)
+        anchor, direction, tangent, binormal = _site_frame(site)
+        site_center = anchor + center_offset * direction
+        for fragment_index, fragment in enumerate(fragments):
+            lateral = rng.normal(0.0, lateral_sigma, size=2)
+            center = (
+                site_center
+                + fragment_index * fragment_spacing * direction
+                + lateral[0] * tangent
+                + lateral[1] * binormal
+            )
+            fragment_positions, fragment_types = _generic_fragment_geometry(
+                fragment, center, direction, tangent, binormal, rng, sites_cfg
+            )
+            positions.extend(fragment_positions)
+            type_hints.extend(fragment_types)
+            layout.append({
+                'profile_slot': slot,
+                'kind': str(fragment.get('kind', 'chain')),
+                'ring_sizes': [int(v) for v in fragment.get('ring_sizes', [])],
+                'atom_count': len(fragment_types),
+                'atom_types': list(fragment_types),
+            })
+
+    if len(positions) != n_extra or len(type_hints) != n_extra:
+        raise ValueError(
+            f'fragment placement produced {len(positions)} atoms, expected {n_extra}'
+        )
+    return positions, type_hints, layout
+
+
 def _anchor_radial_site_position(
     site: Dict[str, Any],
     jitter_std: float,
@@ -1880,6 +2103,9 @@ def build_extra_atom_positions(
     strict_anchor_gaussian = bool(
         sites_cfg.get('strict_anchor_gaussian', False)
     )
+    strict_fragment_gaussian = bool(
+        sites_cfg.get('strict_fragment_gaussian', False)
+    )
     overflow_mode = str(sites_cfg.get('overflow_mode', 'pocket_fallback'))
     meta: Dict[str, Any] = {
         'placement': 'pocket_fallback',
@@ -1888,6 +2114,9 @@ def build_extra_atom_positions(
         'n_extra_requested': n_extra_requested,
         'n_extra_effective': n_extra_requested,
         'overflow_mode': overflow_mode,
+        'strict_fragment_gaussian': strict_fragment_gaussian,
+        'fragment_type_hints': [],
+        'fragment_layout': [],
     }
 
     if n_extra <= 0 and not uses_site_budget_placement(sites_cfg):
@@ -1898,9 +2127,9 @@ def build_extra_atom_positions(
         )
 
     if not attachment_sites:
-        if strict_anchor_gaussian:
+        if strict_anchor_gaussian or strict_fragment_gaussian:
             raise ValueError(
-                'strict_anchor_gaussian requires scaffold exit anchor sites'
+                'strict scaffold Gaussian modes require scaffold exit anchor sites'
             )
         pos = fallback_center.unsqueeze(0).expand(n_extra, -1) + \
               torch.randn(n_extra, 3, device=device) * fallback_noise_scale
@@ -2038,11 +2267,29 @@ def build_extra_atom_positions(
             protein_np = protein_positions.detach().cpu().numpy().astype(np.float64)
         else:
             protein_np = np.asarray(protein_positions, dtype=np.float64)
-    site_pos = init_extra_positions_at_sites(
-        active, counts, device,
-        jitter_std=jitter_std, jitter_mode=jitter_mode,
-        rng=rng, sites_cfg=sites_cfg, protein_positions=protein_np,
-    )
+    if strict_fragment_gaussian:
+        if overflow > 0:
+            raise ValueError(
+                'strict_fragment_gaussian cannot place overflow atoms'
+            )
+        fragment_positions, fragment_type_hints, fragment_layout = (
+            _strict_fragment_gaussian_site_positions(
+                active, counts, rng, sites_cfg
+            )
+        )
+        site_pos = torch.tensor(
+            np.asarray(fragment_positions, dtype=np.float32),
+            dtype=torch.float32,
+            device=device,
+        )
+        meta['fragment_type_hints'] = fragment_type_hints
+        meta['fragment_layout'] = fragment_layout
+    else:
+        site_pos = init_extra_positions_at_sites(
+            active, counts, device,
+            jitter_std=jitter_std, jitter_mode=jitter_mode,
+            rng=rng, sites_cfg=sites_cfg, protein_positions=protein_np,
+        )
     n_site = site_pos.size(0)
 
     parts = []

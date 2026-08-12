@@ -160,6 +160,7 @@ def _sample_reference_extra_type_quota(
     n_extra: int,
     device,
     rng: np.random.Generator,
+    type_hint_keys=None,
 ):
     """Sample a shuffled element-count multiset for one extra fragment.
 
@@ -167,6 +168,32 @@ def _sample_reference_extra_type_quota(
     coordinates, or reference-side graph. Shuffling makes the assignment an
     exchangeable type prior rather than a copied target fragment.
     """
+    if type_hint_keys is not None:
+        class_indices = []
+        periodic_table = Chem.GetPeriodicTable()
+        for key in type_hint_keys:
+            try:
+                symbol, aromatic_text = str(key).rsplit('|', 1)
+                atomic_number = int(periodic_table.GetAtomicNumber(symbol))
+                aromatic = bool(int(aromatic_text))
+            except (TypeError, ValueError):
+                return None
+            if ligand_atom_mode == 'add_aromatic':
+                class_idx = trans.MAP_ATOM_TYPE_AROMATIC_TO_INDEX.get(
+                    (atomic_number, aromatic)
+                )
+            elif ligand_atom_mode == 'basic':
+                class_idx = trans.MAP_ATOM_TYPE_ONLY_TO_INDEX.get(atomic_number)
+            else:
+                return None
+            if class_idx is None or int(class_idx) >= int(n_classes):
+                return None
+            class_indices.append(int(class_idx))
+        if len(class_indices) != int(n_extra):
+            return None
+        type_indices = torch.tensor(class_indices, dtype=torch.long, device=device)
+        return index_to_log_onehot(type_indices, int(n_classes))
+
     candidates = [
         pattern
         for pattern in profile.get('extra_type_patterns', [])
@@ -7506,7 +7533,10 @@ def scaffold_dynamic_locked_molecule(
     strict_anchor_gaussian = bool(
         _murcko_sites_cfg.get('strict_anchor_gaussian', False)
     )
-    if strict_anchor_gaussian:
+    strict_fragment_gaussian = bool(
+        _murcko_sites_cfg.get('strict_fragment_gaussian', False)
+    )
+    if strict_anchor_gaussian or strict_fragment_gaussian:
         # The profile is an exchangeable element multiset.  RePaint keeps its
         # forward-noised state fixed at every reverse step; it is not a soft
         # class preference and must not be replaced by the model prediction.
@@ -7541,6 +7571,13 @@ def scaffold_dynamic_locked_molecule(
     def _extra_log_v_init(count: int, rng: np.random.Generator):
         if count <= 0:
             return torch.zeros(0, model.num_classes, device=device)
+        type_hint_keys = None
+        if strict_fragment_gaussian:
+            type_hint_keys = _site_place_meta.get('fragment_type_hints')
+            if not type_hint_keys:
+                raise ValueError(
+                    'strict_fragment_gaussian produced no fragment type hints'
+                )
         if extra_type_profile is not None:
             quota_log_v = _sample_reference_extra_type_quota(
                 extra_type_profile,
@@ -7549,12 +7586,13 @@ def scaffold_dynamic_locked_molecule(
                 count,
                 device,
                 rng,
+                type_hint_keys=type_hint_keys,
             )
             if quota_log_v is not None:
                 return quota_log_v
-            if strict_anchor_gaussian:
+            if strict_anchor_gaussian or strict_fragment_gaussian:
                 raise ValueError(
-                    'strict_anchor_gaussian requires an exact supported '
+                    'strict scaffold Gaussian mode requires an exact supported '
                     f'element quota for n_extra={count}'
                 )
         if extra_type_log_prior is not None:
@@ -7827,7 +7865,7 @@ def scaffold_dynamic_locked_molecule(
         # guards the final tensor against any model-side class drift while
         # leaving normal scaffold and de novo post-processing unchanged.
         if n_extra > 0:
-            if strict_anchor_gaussian:
+            if strict_anchor_gaussian or strict_fragment_gaussian:
                 v_np[n_locked:] = extra_log_v.argmax(dim=-1).detach().cpu().numpy()
             else:
                 # 保留 F/Cl；仅清除不应作为新增重原子节点的 H 类别。
@@ -7875,7 +7913,14 @@ def scaffold_dynamic_locked_molecule(
             'extra_placement': _site_place_meta.get('placement') if _site_place_meta else 'unknown',
             'site_allocation': _site_place_meta.get('site_allocation') if _site_place_meta else None,
             'strict_anchor_gaussian': strict_anchor_gaussian,
-            'strict_extra_type_locked': strict_anchor_gaussian,
+            'strict_fragment_gaussian': strict_fragment_gaussian,
+            'strict_extra_type_locked': (
+                strict_anchor_gaussian or strict_fragment_gaussian
+            ),
+            'fragment_layout': (
+                _site_place_meta.get('fragment_layout')
+                if strict_fragment_gaussian else None
+            ),
         })
 
     # ---- 首位插入提取后的骨架（保持下游提取/评估格式兼容）--------------
