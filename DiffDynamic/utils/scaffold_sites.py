@@ -376,7 +376,10 @@ def extract_reference_exit_vector_sites(
     """Create geometry-only virtual exits from a scaffold-local profile.
 
     ``profile`` contains only scaffold-local weights.  Coordinates come from
-    the supplied native ligand and no reference target-side atom is copied.
+    the supplied scaffold pose and no reference target-side atom is copied.
+
+    Exit directions use scaffold neighbors only.  A target-side neighbor must
+    not influence the initialization cloud in strict scaffold mode.
     """
     if mol is None or not scaffold_indices:
         return []
@@ -384,6 +387,7 @@ def extract_reference_exit_vector_sites(
         return []
 
     positions = _atom_positions(mol, ref_pos_np)
+    scaffold_set = set(int(index) for index in scaffold_indices)
     weights = profile.get('exit_site_weights') or {}
     allowed = (
         {int(slot) for slot in allowed_slots}
@@ -399,7 +403,10 @@ def extract_reference_exit_vector_sites(
         atom_idx = int(scaffold_indices[slot])
         atom = mol.GetAtomWithIdx(atom_idx)
         anchor = positions[atom_idx]
-        neighbour_indices = [n.GetIdx() for n in atom.GetNeighbors()]
+        neighbour_indices = [
+            n.GetIdx() for n in atom.GetNeighbors()
+            if n.GetIdx() in scaffold_set
+        ]
         if neighbour_indices:
             neighbour_centroid = positions[neighbour_indices].mean(axis=0)
             direction = anchor - neighbour_centroid
@@ -420,6 +427,7 @@ def extract_reference_exit_vector_sites(
             'site_kind': 'reference_exit_vector',
             'profile_slot': slot,
             'site_selection_weight': max(float(raw_weight), 0.0),
+            'exit_direction': direction.tolist(),
         })
     return sites
 
@@ -594,6 +602,9 @@ def load_or_extract_attachment_sites(
     ev_mode = str(sites_cfg.get('exit_vector_mode', 'aromatic_h'))
     profile_path = sites_cfg.get('reference_exit_profile')
     use_profile = bool(profile_path)
+    strict_anchor_gaussian = bool(
+        sites_cfg.get('strict_anchor_gaussian', False)
+    )
     profile_tag = '_profile_exit' if use_profile else ''
     cache_suffix = (f'_ev_{ev_mode}' if include_ev else '') + profile_tag
 
@@ -602,7 +613,7 @@ def load_or_extract_attachment_sites(
         scaffold_dir = Path(output_dir) / 'scaffold'
         scaffold_dir.mkdir(parents=True, exist_ok=True)
         json_path = scaffold_dir / f'{ref_ligand_name}_murcko_sites{cache_suffix}.json'
-        if json_path.exists():
+        if json_path.exists() and not strict_anchor_gaussian:
             try:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -626,10 +637,15 @@ def load_or_extract_attachment_sites(
                 if logger:
                     logger.warning(f'[MurckoSites] 读取缓存失败: {e}')
 
-    sites = extract_murcko_attachment_sites(
-        mol, scaffold_indices, ref_pos_np,
-        dedup_dist=float(sites_cfg.get('dedup_dist', 0.5)),
-    )
+    if strict_anchor_gaussian and use_profile:
+        # Do not even construct target-side attachment templates in strict
+        # mode.  Profile exits below are derived from scaffold atoms only.
+        sites = []
+    else:
+        sites = extract_murcko_attachment_sites(
+            mol, scaffold_indices, ref_pos_np,
+            dedup_dist=float(sites_cfg.get('dedup_dist', 0.5)),
+        )
     for s in sites:
         s.setdefault('site_kind', 'murcko_sidechain')
 
@@ -664,18 +680,24 @@ def load_or_extract_attachment_sites(
                 offset=float(sites_cfg.get('reference_exit_offset', 1.5)),
                 allowed_slots=sites_cfg.get('reference_exit_slots'),
             )
-            merged_sites = merge_reference_exit_sites(
-                sites,
-                profile_sites,
-                dedup_dist=float(
-                    sites_cfg.get('reference_exit_dedup_dist', 1.2)
-                ),
-                template_atom_order=str(
-                    sites_cfg.get(
-                        'reference_exit_template_order', 'attachment_first'
-                    )
-                ),
-            )
+            if strict_anchor_gaussian:
+                # Strict mode has a geometry-only contract: profile exits are
+                # rebuilt from the scaffold pose and never merged with native
+                # side-chain sites or their cached target-side coordinates.
+                merged_sites = [dict(site) for site in profile_sites]
+            else:
+                merged_sites = merge_reference_exit_sites(
+                    sites,
+                    profile_sites,
+                    dedup_dist=float(
+                        sites_cfg.get('reference_exit_dedup_dist', 1.2)
+                    ),
+                    template_atom_order=str(
+                        sites_cfg.get(
+                            'reference_exit_template_order', 'attachment_first'
+                        )
+                    ),
+                )
             if bool(sites_cfg.get('reference_exit_only', False)):
                 sites = [
                     site for site in merged_sites
@@ -1195,6 +1217,85 @@ def _gaussian_site_position(
     return centroid + rng.normal(0.0, float(jitter_std), size=3)
 
 
+def _strict_anchor_gaussian_site_positions(
+    site: Dict[str, Any],
+    count: int,
+    jitter_std: float,
+    rng: np.random.Generator,
+    sites_cfg: dict,
+) -> List[np.ndarray]:
+    """Sample an iid Gaussian cloud from a scaffold exit anchor.
+
+    Strict scaffold mode deliberately uses only the scaffold anchor and a
+    scaffold-derived exit frame.  It never reads ``removed_atom_positions``
+    and never performs protein-clearance rejection or post-hoc relaxation, so
+    the initial distribution remains the model's usual Gaussian cloud with a
+    scaffold-local mean.
+    """
+    anchor = np.asarray(site['anchor_pos'], dtype=np.float64)
+    raw_direction = site.get('exit_direction')
+    if raw_direction is None:
+        raw_direction = _attachment_direction(site)
+    if raw_direction is None:
+        raw_direction = [1.0, 0.0, 0.0]
+    direction = np.asarray(raw_direction, dtype=np.float64)
+    direction_norm = float(np.linalg.norm(direction))
+    direction = direction / max(direction_norm, 1e-8)
+
+    raw_tangent = site.get('tangent_direction')
+    if raw_tangent is None:
+        raw_tangent = [0.0, 1.0, 0.0]
+    tangent = np.asarray(raw_tangent, dtype=np.float64)
+    tangent -= np.dot(tangent, direction) * direction
+    tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm <= 1e-8:
+        basis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(float(np.dot(basis, direction))) > 0.9:
+            basis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        tangent = basis - np.dot(basis, direction) * direction
+        tangent_norm = float(np.linalg.norm(tangent))
+    tangent /= max(tangent_norm, 1e-8)
+
+    raw_binormal = site.get('binormal_direction')
+    if raw_binormal is None:
+        raw_binormal = np.cross(direction, tangent)
+    binormal = np.asarray(raw_binormal, dtype=np.float64)
+    binormal_norm = float(np.linalg.norm(binormal))
+    binormal = binormal / max(binormal_norm, 1e-8)
+
+    slot = str(site.get('profile_slot', ''))
+    slot_offsets = sites_cfg.get('strict_gaussian_slot_offsets', {}) or {}
+    slot_tangent_shifts = sites_cfg.get(
+        'strict_gaussian_slot_tangent_shifts', {}
+    ) or {}
+    slot_binormal_shifts = sites_cfg.get(
+        'strict_gaussian_slot_binormal_shifts', {}
+    ) or {}
+    offset = float(slot_offsets.get(
+        slot, sites_cfg.get('strict_gaussian_center_offset', 1.5)
+    ))
+    tangent_shift = float(slot_tangent_shifts.get(
+        slot, sites_cfg.get('strict_gaussian_tangent_shift', 0.0)
+    ))
+    binormal_shift = float(slot_binormal_shifts.get(
+        slot, sites_cfg.get('strict_gaussian_binormal_shift', 0.0)
+    ))
+    sigma = float(sites_cfg.get('strict_gaussian_sigma', jitter_std))
+    if sigma <= 0.0:
+        raise ValueError('strict_gaussian_sigma must be positive')
+
+    center = (
+        anchor
+        + offset * direction
+        + tangent_shift * tangent
+        + binormal_shift * binormal
+    )
+    return [
+        center + rng.normal(0.0, sigma, size=3)
+        for _ in range(int(count))
+    ]
+
+
 def _anchor_radial_site_position(
     site: Dict[str, Any],
     jitter_std: float,
@@ -1681,6 +1782,15 @@ def init_extra_positions_at_sites(
     for site, cnt in zip(active_sites, counts):
         if cnt <= 0:
             continue
+        if mode == 'strict_anchor_gaussian':
+            positions.extend(_strict_anchor_gaussian_site_positions(
+                site,
+                cnt,
+                jitter_std,
+                rng,
+                cfg,
+            ))
+            continue
         if mode in ('pocket_aware_template', 'pocket_aware_growth'):
             positions.extend(_pocket_aware_site_positions(
                 site,
@@ -1767,6 +1877,9 @@ def build_extra_atom_positions(
     有位点时按 Murcko 侧链质心分配；不足或失败时回退口袋/蛋白中心随机放置。
     """
     n_extra_requested = n_extra
+    strict_anchor_gaussian = bool(
+        sites_cfg.get('strict_anchor_gaussian', False)
+    )
     overflow_mode = str(sites_cfg.get('overflow_mode', 'pocket_fallback'))
     meta: Dict[str, Any] = {
         'placement': 'pocket_fallback',
@@ -1785,6 +1898,10 @@ def build_extra_atom_positions(
         )
 
     if not attachment_sites:
+        if strict_anchor_gaussian:
+            raise ValueError(
+                'strict_anchor_gaussian requires scaffold exit anchor sites'
+            )
         pos = fallback_center.unsqueeze(0).expand(n_extra, -1) + \
               torch.randn(n_extra, 3, device=device) * fallback_noise_scale
         return pos, _fill_zero_allocation_preserve_meta(meta, [], [])

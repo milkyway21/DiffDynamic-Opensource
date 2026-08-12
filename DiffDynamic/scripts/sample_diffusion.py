@@ -7503,6 +7503,14 @@ def scaffold_dynamic_locked_molecule(
     extra_type_anchor_strength = float(
         grow_cfg.get('extra_type_anchor_strength', 0.0)
     )
+    strict_anchor_gaussian = bool(
+        _murcko_sites_cfg.get('strict_anchor_gaussian', False)
+    )
+    if strict_anchor_gaussian:
+        # The profile is an exchangeable element multiset.  RePaint keeps its
+        # forward-noised state fixed at every reverse step; it is not a soft
+        # class preference and must not be replaced by the model prediction.
+        extra_type_anchor_strength = 1.0
     extra_type_anchor_strength = min(max(extra_type_anchor_strength, 0.0), 1.0)
     forward_noise_init = bool(grow_cfg.get('forward_noise_init', False))
     diffusion_start_t = int(np.clip(
@@ -7544,6 +7552,11 @@ def scaffold_dynamic_locked_molecule(
             )
             if quota_log_v is not None:
                 return quota_log_v
+            if strict_anchor_gaussian:
+                raise ValueError(
+                    'strict_anchor_gaussian requires an exact supported '
+                    f'element quota for n_extra={count}'
+                )
         if extra_type_log_prior is not None:
             return extra_type_log_prior.unsqueeze(0).expand(count, -1)
         return F.log_softmax(
@@ -7810,13 +7823,19 @@ def scaffold_dynamic_locked_molecule(
         pos_np = final_pos_t.detach().cpu().numpy().astype(np.float64)
         v_np = log_v_out.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
 
-        # 保留 F/Cl；仅清除不应作为新增重原子节点的 H 类别。
+        # Strict mode restores the exact exchangeable type quota at x_0.  This
+        # guards the final tensor against any model-side class drift while
+        # leaving normal scaffold and de novo post-processing unchanged.
         if n_extra > 0:
-            extra_v = v_np[n_locked:]
-            to_carbon = (extra_v == 0)    # H
-            if to_carbon.any():
-                extra_v[to_carbon] = 1    # → 非芳香 C
-                v_np[n_locked:] = extra_v
+            if strict_anchor_gaussian:
+                v_np[n_locked:] = extra_log_v.argmax(dim=-1).detach().cpu().numpy()
+            else:
+                # 保留 F/Cl；仅清除不应作为新增重原子节点的 H 类别。
+                extra_v = v_np[n_locked:]
+                to_carbon = (extra_v == 0)    # H
+                if to_carbon.any():
+                    extra_v[to_carbon] = 1    # → 非芳香 C
+                    v_np[n_locked:] = extra_v
 
         # 骨架 RMSD（验证位置锁定效果）
         if n_scaffold > 0:
@@ -7855,6 +7874,8 @@ def scaffold_dynamic_locked_molecule(
             'is_original': False,
             'extra_placement': _site_place_meta.get('placement') if _site_place_meta else 'unknown',
             'site_allocation': _site_place_meta.get('site_allocation') if _site_place_meta else None,
+            'strict_anchor_gaussian': strict_anchor_gaussian,
+            'strict_extra_type_locked': strict_anchor_gaussian,
         })
 
     # ---- 首位插入提取后的骨架（保持下游提取/评估格式兼容）--------------
@@ -10265,7 +10286,7 @@ if __name__ == '__main__':
             model, data, result, config, device=args.device, logger=logger
         )
     elif sampling_mode == 'scaffold_dynamic_locked':
-        # 骨架锁定动态模式：跑完整 dynamic large_step+refine，锁定骨架位置、不锁类型
+        # 骨架锁定动态模式：跑完整 dynamic large_step+refine；严格模式可锁新增元素 quota
         config.sample.setdefault('scaffold', {})
         mol_path = getattr(args, 'molecule_path', None) or opt_cfg.get('molecule_path', None)
         if mol_path is not None:
