@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.gspt1_class_audit import audit_class  # noqa: E402
+from scripts.gspt1_allc_tanimoto_audit import audit as audit_allc  # noqa: E402
 from scripts.gspt1_scaffold_exact_loop import _run_job  # noqa: E402
 from scripts.gspt1_smiles_audit import audit  # noqa: E402
 from utils.gspt1_class_setup import (  # noqa: E402
@@ -153,6 +154,7 @@ def build_strict_config(
     seed: int,
     samples: int,
     fragment_gaussian: bool = False,
+    unlock_extra_types: bool = False,
 ) -> dict[str, Any]:
     """Build a strict configuration without changing de novo settings."""
     config = copy.deepcopy(base)
@@ -172,7 +174,10 @@ def build_strict_config(
         "scaffold_smarts": spec.scaffold_smarts,
         "fix_scaffold_pos": True,
         "fix_scaffold_type": True,
-        "lock_extra_atom_types": True,
+        "lock_extra_atom_types": not unlock_extra_types,
+        "extra_atom_type_mode": (
+            "diffuse" if unlock_extra_types else "locked"
+        ),
         "allow_forced_attachment_bonds": False,
         "scaffold_reconstruction_covalent_factor": 1.3,
         "save_dynamic_before_scaffold": False,
@@ -209,8 +214,12 @@ def build_strict_config(
         "strict_gaussian_slot_offsets": lane.slot_offsets,
         "strict_gaussian_slot_tangent_shifts": lane.slot_tangent_shifts,
         "strict_gaussian_slot_binormal_shifts": lane.slot_binormal_shifts,
-        "reference_extra_type_prior_strength": 1.0,
-        "reference_extra_type_prior_mode": "quota_random",
+        "reference_extra_type_prior_strength": (
+            0.0 if unlock_extra_types else 1.0
+        ),
+        "reference_extra_type_prior_mode": (
+            "uniform" if unlock_extra_types else "quota_random"
+        ),
         "fragment_prior_profile": str(profile_path),
         "fragment_geometry_sigma": 0.18,
         "fragment_ring_radius": 1.38,
@@ -233,7 +242,7 @@ def build_strict_config(
         "start_t": 999,
         "forward_noise_init": True,
         "extra_anchor_strength": 0.0,
-        "extra_type_anchor_strength": 1.0,
+        "extra_type_anchor_strength": 0.0 if unlock_extra_types else 1.0,
     })
 
     dynamic = sample.setdefault("dynamic", {})
@@ -272,6 +281,8 @@ def strict_preflight(
     ligand_path: Path,
     profile: dict[str, Any],
     config: dict[str, Any],
+    *,
+    unlock_extra_types: bool = False,
 ) -> dict[str, Any]:
     """Verify count/allocation coverage and the no-template geometry contract."""
     molecule = _first_molecule(ligand_path)
@@ -284,14 +295,27 @@ def strict_preflight(
     sites_cfg = dict(config["sample"]["scaffold"]["murcko_sites"])
     scaffold_cfg = config["sample"]["scaffold"]
     grow_cfg = scaffold_cfg["grow"]
-    if not bool(scaffold_cfg.get("lock_extra_atom_types", False)):
-        raise ValueError(f"{spec.name}: extra atom types are not explicitly locked")
+    type_mode = str(
+        scaffold_cfg.get("extra_atom_type_mode", "auto")
+    ).strip().lower()
+    if unlock_extra_types:
+        if type_mode not in {"diffuse", "unlocked", "free", "model"}:
+            raise ValueError(
+                f"{spec.name}: extra atom type mode is not diffuse"
+            )
+    elif not bool(scaffold_cfg.get("lock_extra_atom_types", False)):
+        raise ValueError(
+            f"{spec.name}: extra atom types are not explicitly locked"
+        )
     if bool(scaffold_cfg.get("allow_forced_attachment_bonds", True)):
         raise ValueError(f"{spec.name}: forced attachment bonds must be disabled")
     if float(grow_cfg.get("extra_anchor_strength", 1.0)) != 0.0:
         raise ValueError(f"{spec.name}: extra coordinate mask must be zero")
-    if float(grow_cfg.get("extra_type_anchor_strength", 0.0)) != 1.0:
-        raise ValueError(f"{spec.name}: extra type mask must be one")
+    expected_type_mask = 0.0 if unlock_extra_types else 1.0
+    if float(grow_cfg.get("extra_type_anchor_strength", 0.0)) != expected_type_mask:
+        raise ValueError(
+            f"{spec.name}: extra type mask must be {expected_type_mask:g}"
+        )
     sites_cfg["save_json"] = False
     sites = load_or_extract_attachment_sites(
         molecule,
@@ -423,6 +447,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             seed=int(args.start_seed) + lane_index,
             samples=int(args.samples),
             fragment_gaussian=bool(args.fragment_gaussian),
+            unlock_extra_types=bool(args.unlock_extra_types),
         )
         config_path = root / "configs" / f"{lane.name}.yml"
         _write_yaml(config, config_path)
@@ -433,6 +458,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 _ligand_for_spec(spec, native_ligand, f_ligand),
                 profiles[spec.name],
                 config,
+                unlock_extra_types=bool(args.unlock_extra_types),
             )
 
     gpu_mapping = {lane.name: lane.gpu for lane in LANES}
@@ -465,12 +491,19 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "gpu0_unused": True,
             "scaffold_position_locked": True,
             "scaffold_type_locked": True,
-            "extra_atom_types_locked": True,
+            "extra_atom_types_locked": not bool(args.unlock_extra_types),
+            "extra_atom_type_mode": (
+                "diffuse" if args.unlock_extra_types else "locked"
+            ),
             "added_position_mask": 0.0,
-            "added_type_mask": 1.0,
+            "added_type_mask": 0.0 if args.unlock_extra_types else 1.0,
             "forced_attachment_bonds": False,
             "scaffold_reconstruction_covalent_factor": 1.3,
-            "added_type_condition": "exact_profile_quota_as_x0_with_forward_q",
+            "added_type_condition": (
+                "uniform_x0_with_model_categorical_reverse"
+                if args.unlock_extra_types
+                else "exact_profile_quota_as_x0_with_forward_q"
+            ),
             "added_coordinate_condition": (
                 "scaffold_anchor_local_generic_fragment_gaussian"
                 if args.fragment_gaussian
@@ -513,6 +546,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
         "configs": configs,
         "manifest": manifest,
         "fragment_gaussian": bool(args.fragment_gaussian),
+        "unlock_extra_types": bool(args.unlock_extra_types),
     }
 
 
@@ -533,6 +567,7 @@ def _lane_config(
         seed=seed,
         samples=samples,
         fragment_gaussian=bool(prepared.get("fragment_gaussian", False)),
+        unlock_extra_types=bool(prepared.get("unlock_extra_types", False)),
     )
     path = prepared["root"] / "configs" / f"run_{lane.name}_{seed}.yml"
     _write_yaml(config, path)
@@ -564,8 +599,14 @@ def _audit_round(
         exclude_scaffold_smarts=sorted({
             spec.scaffold_smarts for spec in CLASS_SPECS
         }),
+        top_n=None,
     )
-    return summaries, total
+    allc = audit_allc(
+        root / "rounds" / f"run_{round_index:04d}_all_similarity" / "records.csv",
+        prepared["reference_sdf"],
+        root / "rounds" / f"run_{round_index:04d}_allc_similarity",
+    )
+    return summaries, {"original": total, "allc": allc}
 
 
 def _job_is_complete(
@@ -730,8 +771,23 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
             "total_similarity": total_summary,
             "best_side_similarity": max(
                 (row.get("best_side_similarity", 0.0)
-                 for row in lane_summaries.values()),
+                for row in lane_summaries.values()),
                 default=0.0,
+            ),
+            "best_allc_side_similarity": float(
+                total_summary.get("allc", {}).get(
+                    "best_side_similarity", 0.0
+                )
+            ),
+            "best_allc_full_similarity": float(
+                total_summary.get("allc", {}).get(
+                    "best_full_similarity", 0.0
+                )
+            ),
+            "allc_side_exact_count": int(
+                total_summary.get("allc", {}).get(
+                    "allc_side_exact_count", 0
+                )
             ),
             "exact_reachable_count": sum(
                 int(row.get("exact_reachable_count", 0))
@@ -755,7 +811,7 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
         )
         print(json.dumps(final_summary, ensure_ascii=True), flush=True)
         if final_summary["exact_reachable_count"] > 0 or int(
-            total_summary.get("exact_count", 0)
+                total_summary.get("original", {}).get("exact_count", 0)
         ) > 0:
             (root / "EXACT_MATCH_FOUND").write_text(
                 json.dumps(final_summary, indent=2, ensure_ascii=True) + "\n",
@@ -791,6 +847,14 @@ def main() -> None:
         "--fragment-gaussian",
         action="store_true",
         help="use scaffold-only generic fragment Gaussian clouds",
+    )
+    parser.add_argument(
+        "--unlock-extra-types",
+        action="store_true",
+        help=(
+            "scaffold-only ablation: keep reference n_extra values but let "
+            "the model predict added atom types"
+        ),
     )
     args = parser.parse_args()
     gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]

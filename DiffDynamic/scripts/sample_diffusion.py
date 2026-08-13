@@ -7527,6 +7527,15 @@ def scaffold_dynamic_locked_molecule(
     log_mode_is_log_prob = (getattr(model, 'ligand_v_input', 'onehot') == 'log_prob')
 
     extra_anchor_strength = float(grow_cfg.get('extra_anchor_strength', 0.0))
+    extra_atom_type_mode = str(
+        sc_cfg.get('extra_atom_type_mode', 'auto')
+    ).strip().lower()
+    extra_types_explicitly_diffused = extra_atom_type_mode in {
+        'diffuse',
+        'unlocked',
+        'free',
+        'model',
+    }
     lock_extra_atom_types = bool(
         sc_cfg.get('lock_extra_atom_types', False)
     )
@@ -7544,7 +7553,12 @@ def scaffold_dynamic_locked_molecule(
     strict_fragment_gaussian = bool(
         _murcko_sites_cfg.get('strict_fragment_gaussian', False)
     )
-    if (
+    if extra_types_explicitly_diffused:
+        # Type-free scaffold ablation: keep the exact atom count, but let the
+        # normal categorical reverse process predict every added element.
+        # Coordinates remain governed by the ordinary DiffDynamic process.
+        extra_type_anchor_strength = 0.0
+    elif (
         lock_extra_atom_types
         or strict_anchor_gaussian
         or strict_fragment_gaussian
@@ -7555,9 +7569,12 @@ def scaffold_dynamic_locked_molecule(
         extra_type_anchor_strength = 1.0
     extra_type_anchor_strength = min(max(extra_type_anchor_strength, 0.0), 1.0)
     extra_types_locked = bool(
-        lock_extra_atom_types
-        or strict_anchor_gaussian
-        or strict_fragment_gaussian
+        not extra_types_explicitly_diffused
+        and (
+            lock_extra_atom_types
+            or strict_anchor_gaussian
+            or strict_fragment_gaussian
+        )
     )
     forward_noise_init = bool(grow_cfg.get('forward_noise_init', False))
     diffusion_start_t = int(np.clip(
@@ -7933,6 +7950,7 @@ def scaffold_dynamic_locked_molecule(
             'strict_fragment_gaussian': strict_fragment_gaussian,
             'strict_extra_type_locked': extra_types_locked,
             'extra_atom_types_locked': extra_types_locked,
+            'extra_atom_type_mode': extra_atom_type_mode,
             'extra_position_mask': 0.0 if lock_extra_atom_types else extra_anchor_strength,
             'fragment_layout': (
                 _site_place_meta.get('fragment_layout')
@@ -7995,6 +8013,7 @@ def scaffold_dynamic_locked_molecule(
                 'fix_scaffold_pos': fix_scaffold_pos,
                 'fix_scaffold_type': fix_scaffold_type,
                 'lock_extra_atom_types': lock_extra_atom_types,
+                'extra_atom_type_mode': extra_atom_type_mode,
                 'extra_position_mask': (
                     0.0 if lock_extra_atom_types else extra_anchor_strength
                 ),

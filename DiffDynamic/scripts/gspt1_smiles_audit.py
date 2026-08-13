@@ -158,7 +158,7 @@ def audit(
     reference_sdf: Path,
     output_dir: Path,
     scaffold_atoms: int = 18,
-    top_n: int = 500,
+    top_n: int | None = 500,
     exclude_scaffold_smarts: Iterable[str] = (),
 ) -> dict:
     references = load_reference(reference_sdf)
@@ -210,7 +210,8 @@ def audit(
             ],
         )
         writer.writeheader()
-        for rank, record in enumerate(ranked[:top_n], start=1):
+        records_to_write = ranked if top_n is None else ranked[:top_n]
+        for rank, record in enumerate(records_to_write, start=1):
             writer.writerow({
                 "rank": rank,
                 "canonical_smiles": record.canonical_smiles,
