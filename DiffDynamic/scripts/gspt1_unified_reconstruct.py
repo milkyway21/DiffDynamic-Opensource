@@ -1246,6 +1246,63 @@ def _is_canonical_molecule_path(path: Path, unified_root: Path) -> bool:
     )
 
 
+_CANONICAL_CHUNK_NAME = re.compile(
+    r"^chunk(?P<chunk_id>\d{4})_(?P<molecule_index>\d{6})_.+\.sdf$"
+)
+
+
+def _audit_molecule_paths(
+    unified_root: Path,
+    source_rows: dict[str, dict[str, Any]],
+) -> list[Path]:
+    """Select one canonical output for each formally reconstructed molecule."""
+    chunk_manifest = _jsonl_load(
+        unified_root / "manifest" / "chunk_reconstruction_manifest.jsonl"
+    )
+    selected: dict[tuple[str, int, int], Path] = {}
+    chunk_sources: set[str] = set()
+    for row in chunk_manifest:
+        source_id = str(row.get("source_id", ""))
+        chunk_id = int(row.get("chunk_id", -1))
+        if (
+            not source_id
+            or chunk_id < 0
+            or row.get("status") not in {"success", "skipped_existing"}
+        ):
+            continue
+        source = source_rows.get(source_id)
+        if source is None:
+            continue
+        chunk_sources.add(source_id)
+        molecules_root = Path(str(source.get("molecules_dir", "")))
+        expected_count = int(row.get("molecule_file_count", 0) or 0)
+        candidates: dict[int, list[Path]] = defaultdict(list)
+        for path in molecules_root.glob(f"chunk{chunk_id:04d}_*.sdf"):
+            match = _CANONICAL_CHUNK_NAME.match(path.name)
+            if match is None or int(match["chunk_id"]) != chunk_id:
+                continue
+            candidates[int(match["molecule_index"])].append(path)
+        for molecule_index in range(expected_count):
+            choices = candidates.get(molecule_index, [])
+            if not choices:
+                continue
+            selected[(source_id, chunk_id, molecule_index)] = max(
+                choices,
+                key=lambda path: (path.stat().st_mtime_ns, str(path)),
+            )
+
+    # Preserve support for historical full-source reconstructions that predate
+    # chunk manifests, while never mixing them with chunk-managed sources.
+    for source_id, source in source_rows.items():
+        if source_id in chunk_sources:
+            continue
+        molecules_root = Path(str(source.get("molecules_dir", "")))
+        for path in molecules_root.glob("*.sdf"):
+            if _is_canonical_molecule_path(path, unified_root):
+                selected[(source_id, -1, len(selected))] = path
+    return sorted(set(selected.values()))
+
+
 def _matched_scaffold_pattern(molecule: Any, patterns: Sequence[Any]) -> Any | None:
     """Prefer the fluorinated scaffold for fluorinated molecules."""
     has_fluorine = any(atom.GetAtomicNum() == 9 for atom in molecule.GetAtoms())
@@ -1285,11 +1342,7 @@ def audit_library(
     reference_by_smiles = {row["smiles"]: row for row in references}
     reference_fps = [row for row in references if row["fingerprint"] is not None]
 
-    molecule_paths = sorted(
-        path
-        for path in (unified_root / "reconstructed").rglob("*.sdf")
-        if _is_canonical_molecule_path(path, unified_root)
-    )
+    molecule_paths = _audit_molecule_paths(unified_root, source_rows)
     all_records: list[dict[str, Any]] = []
     for path in molecule_paths:
         source = _source_for_molecule(path, unified_root, source_rows)

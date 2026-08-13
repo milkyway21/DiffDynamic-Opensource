@@ -1,8 +1,10 @@
+import os
 from pathlib import Path
 
 from scripts.gspt1_unified_reconstruct import (
     Candidate,
     _is_canonical_molecule_path,
+    _audit_molecule_paths,
     discover_candidates,
     job_context,
     migrate_corpus,
@@ -43,6 +45,40 @@ def test_audit_only_accepts_source_level_molecules_directory(tmp_path):
 
     assert _is_canonical_molecule_path(canonical, unified_root)
     assert not _is_canonical_molecule_path(evaluation, unified_root)
+
+
+def test_audit_manifest_deduplicates_reconstructed_retries(tmp_path):
+    unified_root = tmp_path / "gspt1_unified"
+    molecules_dir = (
+        unified_root
+        / "reconstructed"
+        / "batch"
+        / "campaign"
+        / "job_0000"
+        / "src_0000"
+        / "molecules"
+    )
+    molecules_dir.mkdir(parents=True)
+    old = molecules_dir / "chunk0000_000000_old.sdf"
+    new = molecules_dir / "chunk0000_000000_new.sdf"
+    old.write_text("old", encoding="utf-8")
+    new.write_text("new", encoding="utf-8")
+    os.utime(old, (1, 1))
+    os.utime(new, (2, 2))
+
+    source_rows = {
+        "src_0000": {"molecules_dir": str(molecules_dir)},
+    }
+    manifest = unified_root / "manifest"
+    manifest.mkdir(parents=True)
+    (manifest / "chunk_reconstruction_manifest.jsonl").write_text(
+        '{"source_id":"src_0000","chunk_id":0,"status":"success",'
+        '"molecule_file_count":1}\n',
+        encoding="utf-8",
+    )
+
+    paths = _audit_molecule_paths(unified_root, source_rows)
+    assert paths == [new]
 
 
 def test_job_context_handles_extract_and_jobs_layout(tmp_path):
