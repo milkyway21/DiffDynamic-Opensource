@@ -102,6 +102,12 @@ def _run_chunk(
             "MKL_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
             "NUMEXPR_NUM_THREADS": "1",
+            # A malformed generated geometry must not hold an entire
+            # scaffold lane for the evaluator's historical 3-hour default.
+            # This helper is scaffold-only; de novo evaluation is untouched.
+            "EVAL_SINGLE_MOL_TIMEOUT": os.environ.get(
+                "SCAFFOLD_EVAL_SINGLE_MOL_TIMEOUT", "300"
+            ),
             "EVAL_MOLECULE_ID_SUFFIX": f"chunk{chunk_id:04d}",
             "DIFFDYNAMIC_SKIP_EVAL_RECORDS": "1",
         }
