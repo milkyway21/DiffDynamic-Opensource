@@ -768,7 +768,8 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
             "round": round_index,
             "results": results,
             "lanes": lane_summaries,
-            "total_similarity": total_summary,
+            "total_similarity": total_summary.get("original", {}),
+            "allc_similarity": total_summary.get("allc", {}),
             "best_side_similarity": max(
                 (row.get("best_side_similarity", 0.0)
                 for row in lane_summaries.values()),
@@ -811,7 +812,7 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict[str
         )
         print(json.dumps(final_summary, ensure_ascii=True), flush=True)
         if final_summary["exact_reachable_count"] > 0 or int(
-                total_summary.get("original", {}).get("exact_count", 0)
+            total_summary.get("original", {}).get("exact_count", 0)
         ) > 0:
             (root / "EXACT_MATCH_FOUND").write_text(
                 json.dumps(final_summary, indent=2, ensure_ascii=True) + "\n",
