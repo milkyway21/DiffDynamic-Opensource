@@ -1236,7 +1236,9 @@ def _is_canonical_molecule_path(path: Path, unified_root: Path) -> bool:
         relative = path.resolve().relative_to(reconstructed_root)
     except ValueError:
         return False
-    if len(relative.parts) < 6 or relative.parts[-2] != "molecules":
+    # Canonical output is exactly reconstructed/<batch>/<campaign>/<job>/<source_id>/molecules.
+    # Evaluation attempts can also contain a molecules directory, but are deeper.
+    if len(relative.parts) != 6 or relative.parts[-2] != "molecules":
         return False
     return not any(
         part == "legacy" or part.startswith("legacy_")

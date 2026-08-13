@@ -2,11 +2,47 @@ from pathlib import Path
 
 from scripts.gspt1_unified_reconstruct import (
     Candidate,
+    _is_canonical_molecule_path,
     discover_candidates,
     job_context,
     migrate_corpus,
     select_candidates,
 )
+
+
+def test_audit_only_accepts_source_level_molecules_directory(tmp_path):
+    unified_root = tmp_path / "gspt1_unified"
+    canonical = (
+        unified_root
+        / "reconstructed"
+        / "batch"
+        / "campaign"
+        / "job_0000"
+        / "src_0000"
+        / "molecules"
+        / "molecule.sdf"
+    )
+    evaluation = (
+        unified_root
+        / "reconstructed"
+        / "batch"
+        / "campaign"
+        / "job_0000"
+        / "src_0000"
+        / "chunks"
+        / "chunk_0000"
+        / "attempt"
+        / "evaluation"
+        / "molecules"
+        / "molecule.sdf"
+    )
+    canonical.parent.mkdir(parents=True)
+    evaluation.parent.mkdir(parents=True)
+    canonical.touch()
+    evaluation.touch()
+
+    assert _is_canonical_molecule_path(canonical, unified_root)
+    assert not _is_canonical_molecule_path(evaluation, unified_root)
 
 
 def test_job_context_handles_extract_and_jobs_layout(tmp_path):
