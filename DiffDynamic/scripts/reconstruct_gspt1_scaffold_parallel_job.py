@@ -14,6 +14,7 @@ import copy
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -112,6 +113,10 @@ def _run_chunk(
             "DIFFDYNAMIC_SKIP_EVAL_RECORDS": "1",
         }
     )
+    chunk_timeout = max(
+        60,
+        int(os.environ.get("SCAFFOLD_CHUNK_TIMEOUT", "600")),
+    )
     command = [
         sys.executable,
         str(EVALUATOR),
@@ -133,17 +138,37 @@ def _run_chunk(
     ]
     started = time.time()
     with log_path.open("w", encoding="utf-8") as log_handle:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=REPO_ROOT,
             env=env,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
-            check=False,
+            start_new_session=True,
         )
+        try:
+            returncode = process.wait(timeout=chunk_timeout)
+        except subprocess.TimeoutExpired:
+            # A malformed geometry can block inside native code. Terminate
+            # the whole scaffold-only process group so one chunk cannot hold
+            # the lane indefinitely.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            log_handle.write(
+                f"\nSCAFFOLD_CHUNK_TIMEOUT after {chunk_timeout}s; "
+                "terminated evaluator process group.\n"
+            )
+            returncode = 124
     return {
         "chunk_id": chunk_id,
-        "returncode": result.returncode,
+        "returncode": returncode,
         "elapsed_seconds": time.time() - started,
         "chunk_pt": str(chunk_pt),
         "chunk_output": str(chunk_output),
