@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a scaffold-only GSPT1 count and placement ablation.
+"""Run a scaffold-only GSPT1 fragment-Gaussian placement campaign.
 
 This campaign derives a new coarse prior from the existing GSPT1 class
 profiles by adding exactly one exchangeable aliphatic carbon to every
@@ -7,9 +7,10 @@ allowed extra-atom count and to its scaffold-exit allocation.  It does not
 copy target-side bonds, atom order, or target-side coordinates.
 
 The three class lanes are intentionally limited to GPUs 3, 4, and 5:
-no-F, F-main, and F-large.  Added coordinates are initialized from a narrow,
-scaffold-only Gaussian farther along the scaffold exit direction, then passed
-through the normal t=999 DiffDynamic reverse process with no coordinate mask.
+no-F, F-main, and F-large.  Added coordinates are initialized from generic
+fragment geometries around scaffold exit frames, then passed through the
+normal t=999 DiffDynamic reverse process with no coordinate mask.  The
+fragment prior contains no target-side graph, atom order, or coordinates.
 Vina and TargetDiff baseline refinement are disabled.
 """
 
@@ -72,44 +73,44 @@ DEFAULT_PROTEIN = Path(
 DEFAULT_ROOT = Path(
     "/data/zhang/Ye/DiffDynamic_outputs/hsvpol/"
     "molglue_ikzf2_gspt1/diffdynamic/"
-    "gspt1_scaffold_far_concentrated_plus_c_v1"
+    "gspt1_scaffold_fragment_gaussian_plus_c_v1"
 )
 
 
 LANES = (
     LaneSpec(
-        "no_f_far_plus_c",
+        "no_f_fragment_plus_c",
         "no_f",
         3,
-        0.42,
-        3.15,
+        0.20,
+        2.65,
         0.00,
         0.00,
-        {"0": 3.15, "10": 3.15},
+        {"0": 2.65, "10": 2.65},
         {"0": 0.00, "10": 0.00},
         {"0": 0.00, "10": 0.00},
     ),
     LaneSpec(
-        "f_main_far_plus_c",
+        "f_main_fragment_plus_c",
         "f_main",
         4,
-        0.40,
-        3.05,
+        0.20,
+        2.55,
         -0.10,
         0.15,
-        {"1": 3.05},
+        {"1": 2.55},
         {"1": -0.10},
         {"1": 0.15},
     ),
     LaneSpec(
-        "f_large_far_plus_c",
+        "f_large_fragment_plus_c",
         "f_large",
         5,
-        0.45,
-        3.25,
+        0.20,
+        2.75,
         0.15,
         0.00,
-        {"1": 3.25, "7": 3.25},
+        {"1": 2.75, "7": 2.75},
         {"1": 0.15, "7": 0.15},
         {"1": 0.00, "7": 0.00},
     ),
@@ -128,6 +129,34 @@ def _add_carbon_type(class_counts: dict[str, Any]) -> dict[str, int]:
     counts = {str(key): int(value) for key, value in class_counts.items()}
     counts["C|0"] = counts.get("C|0", 0) + 1
     return counts
+
+
+def _add_carbon_to_fragment_slot(
+    fragments: list[dict[str, Any]],
+) -> str:
+    """Add C|0 to a generic chain, never to a ring or carbonyl core."""
+    chain_candidates = [
+        (index, fragment)
+        for index, fragment in enumerate(fragments)
+        if str(fragment.get("kind", "")) == "chain"
+    ]
+    if chain_candidates:
+        index, fragment = max(
+            chain_candidates,
+            key=lambda item: int(
+                item[1].get("atom_counts", {}).get("C|0", 0)
+            ),
+        )
+        atom_counts = fragment.setdefault("atom_counts", {})
+        atom_counts["C|0"] = int(atom_counts.get("C|0", 0)) + 1
+        return f"extend_existing_chain:{index}"
+
+    fragments.append({
+        "kind": "chain",
+        "ring_sizes": [],
+        "atom_counts": {"C|0": 1},
+    })
+    return "append_generic_chain"
 
 
 def _write_json(payload: dict[str, Any], path: Path) -> None:
@@ -149,6 +178,9 @@ def derive_plus_one_carbon_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "n_extra_delta": 1,
         "added_element_class": "C|0",
         "allocation_slot_rule": "add_to_primary_exit_slot",
+        "fragment_rule": (
+            "extend_existing_chain_else_append_generic_chain"
+        ),
         "target_side_graph_used": False,
         "target_side_coordinates_used": False,
     }
@@ -186,6 +218,7 @@ def derive_plus_one_carbon_profile(profile: dict[str, Any]) -> dict[str, Any]:
     derived["extra_type_patterns"] = type_patterns
 
     fragments = []
+    fragment_rules = []
     for pattern in profile.get("fragment_patterns", []):
         transformed = copy.deepcopy(pattern)
         transformed["n_extra"] = int(pattern.get("n_extra", 0)) + 1
@@ -201,11 +234,12 @@ def derive_plus_one_carbon_profile(profile: dict[str, Any]) -> dict[str, Any]:
             })
             slot_fragments = site_fragments[slot]
             if slot_fragments:
-                first = slot_fragments[0]
-                atom_counts = first.setdefault("atom_counts", {})
-                atom_counts["C|0"] = int(atom_counts.get("C|0", 0)) + 1
+                fragment_rules.append(
+                    _add_carbon_to_fragment_slot(slot_fragments)
+                )
         fragments.append(transformed)
     derived["fragment_patterns"] = fragments
+    derived["derived_transform"]["fragment_rules"] = fragment_rules
 
     element_counts = dict(profile.get("reference_extra_element_counts", {}))
     element_counts["C"] = float(element_counts.get("C", 0.0)) + 1.0
@@ -311,7 +345,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             lane,
             seed=int(args.start_seed) + lane_index,
             samples=int(args.samples),
-            fragment_gaussian=False,
+            fragment_gaussian=True,
             unlock_extra_types=False,
         )
         config_path = root / "configs" / f"{lane.name}.yml"
@@ -331,7 +365,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             )
 
     manifest = {
-        "campaign": "GSPT1 scaffold far concentrated plus one carbon",
+        "campaign": "GSPT1 scaffold fragment Gaussian plus one carbon",
         "created_at_unix": time.time(),
         "git_sha": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
@@ -365,6 +399,10 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "added_position_mask": 0.0,
             "added_type_mask": 1.0,
             "scaffold_only_exit_direction": True,
+            "fragment_gaussian": True,
+            "fragment_attachment_distance_angstrom": 1.55,
+            "fragment_attachment_spacing_angstrom": 1.85,
+            "fragment_center_lateral_sigma_angstrom": 0.25,
             "center_offsets_angstrom": {
                 lane.name: lane.center_offset for lane in LANES
             },
@@ -423,7 +461,7 @@ def _lane_config(
         lane,
         seed=seed,
         samples=samples,
-        fragment_gaussian=False,
+        fragment_gaussian=True,
         unlock_extra_types=False,
     )
     path = prepared["root"] / "configs" / f"run_{lane.name}_{seed}.yml"

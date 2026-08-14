@@ -1350,6 +1350,52 @@ def _regular_polygon(
     return np.asarray(values, dtype=np.float64)
 
 
+def _fragment_ring_atom_count(
+    fragment: Dict[str, Any],
+    total: int,
+    kind: str,
+) -> int:
+    ring_sizes = [
+        int(value) for value in fragment.get('ring_sizes', [])
+        if int(value) >= 3
+    ]
+    if kind in ('aromatic_ring', 'aliphatic_ring'):
+        size = ring_sizes[0] if ring_sizes else total
+        return max(3, min(int(total), int(size)))
+    if kind in ('fused_aromatic', 'fused_ring'):
+        ring_sizes = ring_sizes or [6, 5]
+        # Two fused rings share two generic positions.  This is a geometric
+        # motif summary, not a copied bond graph.
+        estimate = sum(ring_sizes) - 2 * max(len(ring_sizes) - 1, 1)
+        return max(3, min(int(total), int(estimate)))
+    return 0
+
+
+def _split_fragment_ring_keys(
+    atom_keys: List[str],
+    ring_count: int,
+    rng: np.random.Generator,
+) -> tuple[List[str], List[str]]:
+    """Choose generic ring versus substituent atom classes.
+
+    The profile only gives element/aromatic counts.  This ordering keeps
+    obvious substituents such as O/F/Cl out of a generic carbon ring when the
+    marginal counts make that possible; it does not encode a reference graph.
+    """
+    aromatic = [key for key in atom_keys if key.endswith('|1')]
+    non_aromatic = [key for key in atom_keys if not key.endswith('|1')]
+    priority = {'C': 0, 'N': 1, 'S': 2, 'P': 3, 'O': 4, 'F': 5, 'Cl': 6}
+    non_aromatic.sort(
+        key=lambda key: priority.get(str(key).rsplit('|', 1)[0], 99)
+    )
+    ordered = aromatic + non_aromatic
+    ring_keys = ordered[:int(ring_count)]
+    extra_keys = ordered[int(ring_count):]
+    rng.shuffle(ring_keys)
+    rng.shuffle(extra_keys)
+    return ring_keys, extra_keys
+
+
 def _generic_fragment_geometry(
     fragment: Dict[str, Any],
     center: np.ndarray,
@@ -1378,26 +1424,61 @@ def _generic_fragment_geometry(
 
     if kind in ('aromatic_ring', 'aliphatic_ring'):
         radius = ring_radius if kind == 'aromatic_ring' else ring_radius * 0.92
-        local = _regular_polygon(total, radius, rot_t, rot_b, angle * 0.37)
+        ring_count = _fragment_ring_atom_count(fragment, total, kind)
+        ring_keys, extra_keys = _split_fragment_ring_keys(
+            atom_keys, ring_count, rng
+        )
+        local_ring = _regular_polygon(
+            ring_count, radius, direction, rot_t, angle * 0.37
+        )
+        local_points = [point for point in local_ring]
+        for index, point in enumerate(extra_keys):
+            local_points.append(
+                local_ring[index % ring_count]
+                + (1.35 + 0.20 * (index // ring_count)) * direction
+                + 0.25 * ((-1) ** index) * rot_t
+            )
+        local = np.asarray(local_points, dtype=np.float64)
+        atom_keys = ring_keys + extra_keys
     elif kind in ('fused_aromatic', 'fused_ring') and total >= 8:
-        # Generic fused 6+5 motif with two shared positions.  The exact
-        # reference fusion topology is intentionally not retained.
-        first = _regular_polygon(6, ring_radius, rot_t, rot_b, angle)
+        # Generic fused rings with shared positions.  The exact reference
+        # fusion topology is intentionally not retained.
+        ring_sizes = [
+            int(value) for value in fragment.get('ring_sizes', [])
+            if int(value) >= 3
+        ] or [6, 5]
+        first_size = ring_sizes[0]
+        second_size = ring_sizes[1] if len(ring_sizes) > 1 else 5
+        first = _regular_polygon(
+            first_size, ring_radius, direction, rot_t, angle
+        )
         second_center = 1.55 * rot_t
         second = second_center + _regular_polygon(
-            5, ring_radius * 0.96, rot_t, rot_b, angle + 0.35
+            second_size, ring_radius * 0.96, direction, rot_t, angle + 0.35
+        )
+        ring_count = _fragment_ring_atom_count(fragment, total, kind)
+        ring_keys, extra_keys = _split_fragment_ring_keys(
+            atom_keys, ring_count, rng
         )
         local_points = [first[0], first[1]]
         local_points.extend(first[2:])
         local_points.extend(second[2:])
-        while len(local_points) < total:
-            extra_index = len(local_points) - 8
+        local_points = local_points[:ring_count]
+        while len(local_points) < ring_count:
+            extra_index = len(local_points)
             local_points.append(
                 second_center
-                + (extra_index + 1.0) * 0.95 * rot_t
-                + 0.45 * rot_b
+                + (extra_index + 1.0) * 0.75 * rot_t
+                + 0.35 * direction
+            )
+        for index, point in enumerate(extra_keys):
+            local_points.append(
+                local_points[index % ring_count]
+                + (1.30 + 0.20 * (index // ring_count)) * direction
+                + 0.25 * ((-1) ** index) * rot_t
             )
         local = np.asarray(local_points[:total], dtype=np.float64)
+        atom_keys = ring_keys + extra_keys
     elif kind == 'carbonyl' and total >= 2:
         carbonyl_axis = np.cos(angle) * rot_t + np.sin(angle) * rot_b
         local = np.zeros((total, 3), dtype=np.float64)
@@ -1424,9 +1505,32 @@ def _generic_fragment_geometry(
         center + offset + rng.normal(0.0, jitter, size=3)
         for offset in local
     ]
-    if kind not in ('carbonyl', 'hetero_atom'):
+    if kind == 'chain':
         rng.shuffle(atom_keys)
     return positions, atom_keys
+
+
+def _align_fragment_to_anchor(
+    positions: List[np.ndarray],
+    atom_types: List[str],
+    anchor: np.ndarray,
+    direction: np.ndarray,
+    target_distance: float,
+) -> tuple[List[np.ndarray], List[str], float]:
+    """Put the nearest generic fragment atom at a scaffold-facing distance."""
+    if not positions:
+        return [], [], 0.0
+    array = np.asarray(positions, dtype=np.float64)
+    projections = np.asarray(
+        [float(np.dot(point - anchor, direction)) for point in array],
+        dtype=np.float64,
+    )
+    shift = float(target_distance) - float(projections.min())
+    array = array + shift * direction
+    order = np.argsort(projections, kind='stable')
+    aligned_positions = [array[int(index)] for index in order]
+    aligned_types = [atom_types[int(index)] for index in order]
+    return aligned_positions, aligned_types, float(target_distance)
 
 
 def _strict_fragment_gaussian_site_positions(
@@ -1481,6 +1585,12 @@ def _strict_fragment_gaussian_site_positions(
     fragment_spacing = float(sites_cfg.get('fragment_center_spacing', 2.15))
     center_offset = float(sites_cfg.get('strict_fragment_center_offset', 1.55))
     lateral_sigma = float(sites_cfg.get('fragment_center_lateral_sigma', 0.45))
+    attachment_distance = float(
+        sites_cfg.get('fragment_attachment_distance', 1.55)
+    )
+    attachment_spacing = float(
+        sites_cfg.get('fragment_attachment_spacing', fragment_spacing)
+    )
     for site, count in zip(active_sites, counts):
         if int(count) <= 0:
             continue
@@ -1502,6 +1612,15 @@ def _strict_fragment_gaussian_site_positions(
             fragment_positions, fragment_types = _generic_fragment_geometry(
                 fragment, center, direction, tangent, binormal, rng, sites_cfg
             )
+            fragment_positions, fragment_types, projected_distance = (
+                _align_fragment_to_anchor(
+                    fragment_positions,
+                    fragment_types,
+                    anchor,
+                    direction,
+                    attachment_distance + fragment_index * attachment_spacing,
+                )
+            )
             positions.extend(fragment_positions)
             type_hints.extend(fragment_types)
             layout.append({
@@ -1510,6 +1629,7 @@ def _strict_fragment_gaussian_site_positions(
                 'ring_sizes': [int(v) for v in fragment.get('ring_sizes', [])],
                 'atom_count': len(fragment_types),
                 'atom_types': list(fragment_types),
+                'anchor_projection_distance': projected_distance,
             })
 
     if len(positions) != n_extra or len(type_hints) != n_extra:

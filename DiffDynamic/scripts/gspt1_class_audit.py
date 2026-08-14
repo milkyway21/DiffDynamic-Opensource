@@ -61,6 +61,65 @@ def _outside_molecule(
     return outside
 
 
+def _attachment_metrics(
+    molecule: Chem.Mol,
+    scaffold_match: tuple[int, ...],
+) -> dict[str, object]:
+    """Report reconstructed scaffold/extra connectivity without editing it."""
+    scaffold_set = {int(index) for index in scaffold_match}
+    extra_set = {
+        int(atom.GetIdx())
+        for atom in molecule.GetAtoms()
+        if int(atom.GetIdx()) not in scaffold_set
+        and atom.GetAtomicNum() > 1
+    }
+    cross_bonds = []
+    bond_lengths = []
+    conformer = None
+    try:
+        conformer = molecule.GetConformer()
+    except Exception:
+        pass
+    for bond in molecule.GetBonds():
+        begin = int(bond.GetBeginAtomIdx())
+        end = int(bond.GetEndAtomIdx())
+        crosses = (begin in scaffold_set) != (end in scaffold_set)
+        if not crosses:
+            continue
+        cross_bonds.append((begin, end))
+        if conformer is not None:
+            begin_pos = conformer.GetAtomPosition(begin)
+            end_pos = conformer.GetAtomPosition(end)
+            distance = (
+                (begin_pos.x - end_pos.x) ** 2
+                + (begin_pos.y - end_pos.y) ** 2
+                + (begin_pos.z - end_pos.z) ** 2
+            ) ** 0.5
+            bond_lengths.append(float(distance))
+
+    components = 0
+    unseen = set(extra_set)
+    while unseen:
+        components += 1
+        stack = [unseen.pop()]
+        while stack:
+            atom_idx = stack.pop()
+            for neighbour in molecule.GetAtomWithIdx(atom_idx).GetNeighbors():
+                neighbour_idx = int(neighbour.GetIdx())
+                if neighbour_idx in unseen:
+                    unseen.remove(neighbour_idx)
+                    stack.append(neighbour_idx)
+
+    return {
+        "scaffold_extra_cross_bonds": len(cross_bonds),
+        "extra_components": components,
+        "cross_bond_lengths": [round(value, 4) for value in bond_lengths],
+        "cross_bond_lengths_valid": bool(
+            bond_lengths and all(0.9 <= value <= 2.1 for value in bond_lengths)
+        ),
+    }
+
+
 def _selected_references(
     reference_sdf: Path,
     reference_indices: Iterable[int],
@@ -169,6 +228,7 @@ def audit_class(
         outside = _outside_molecule(molecule, pattern)
         if outside is None:
             continue
+        attachment = _attachment_metrics(molecule, tuple(int(i) for i in match))
         fingerprint = _fingerprint(molecule)
         outside_fingerprint = _fingerprint(outside)
         full_reference = max(
@@ -198,6 +258,7 @@ def audit_class(
             "side_reference_index": int(side_reference["index"]),
             "exact": smiles in reference_smiles,
             "exact_reachable": smiles in reachable_smiles,
+            **attachment,
         })
     ranked.sort(
         key=lambda record: (
@@ -235,6 +296,15 @@ def audit_class(
         "best_side_similarity": max(
             (record["side_similarity"] for record in ranked), default=0.0
         ),
+        "cross_bond_count_distribution": dict(Counter(
+            record["scaffold_extra_cross_bonds"] for record in ranked
+        )),
+        "extra_component_distribution": dict(Counter(
+            record["extra_components"] for record in ranked
+        )),
+        "valid_cross_bond_rate": sum(
+            record["cross_bond_lengths_valid"] for record in ranked
+        ) / max(len(ranked), 1),
         "side_threshold_counts": {
             str(threshold): sum(
                 record["side_similarity"] >= threshold for record in ranked
@@ -255,7 +325,8 @@ def audit_class(
             "rank", "canonical_smiles", "side_similarity",
             "full_similarity", "n_extra", "count_allowed", "exact",
             "exact_reachable", "reference_index", "side_reference_index",
-            "source_path",
+            "scaffold_extra_cross_bonds", "extra_components",
+            "cross_bond_lengths", "cross_bond_lengths_valid", "source_path",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
