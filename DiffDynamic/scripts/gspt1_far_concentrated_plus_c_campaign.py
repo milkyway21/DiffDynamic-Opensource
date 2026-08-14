@@ -401,7 +401,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "scaffold_only_exit_direction": True,
             "fragment_gaussian": True,
             "fragment_attachment_distance_angstrom": 1.55,
-            "fragment_attachment_spacing_angstrom": 1.85,
+            "fragment_attachment_spacing_angstrom": 0.85,
             "fragment_center_lateral_sigma_angstrom": 0.25,
             "center_offsets_angstrom": {
                 lane.name: lane.center_offset for lane in LANES

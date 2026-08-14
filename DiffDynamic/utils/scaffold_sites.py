@@ -1429,7 +1429,7 @@ def _generic_fragment_geometry(
             atom_keys, ring_count, rng
         )
         local_ring = _regular_polygon(
-            ring_count, radius, direction, rot_t, angle * 0.37
+            ring_count, radius, direction, rot_t, np.pi
         )
         local_points = [point for point in local_ring]
         for index, point in enumerate(extra_keys):
@@ -1450,11 +1450,11 @@ def _generic_fragment_geometry(
         first_size = ring_sizes[0]
         second_size = ring_sizes[1] if len(ring_sizes) > 1 else 5
         first = _regular_polygon(
-            first_size, ring_radius, direction, rot_t, angle
+            first_size, ring_radius, direction, rot_t, np.pi
         )
         second_center = 1.55 * rot_t
         second = second_center + _regular_polygon(
-            second_size, ring_radius * 0.96, direction, rot_t, angle + 0.35
+            second_size, ring_radius * 0.96, direction, rot_t, np.pi + 0.35
         )
         ring_count = _fragment_ring_atom_count(fragment, total, kind)
         ring_keys, extra_keys = _split_fragment_ring_keys(

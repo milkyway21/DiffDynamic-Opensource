@@ -223,10 +223,10 @@ def build_strict_config(
         "fragment_prior_profile": str(profile_path),
         "fragment_geometry_sigma": 0.16,
         "fragment_ring_radius": 1.38,
-        "fragment_center_spacing": 1.85,
+        "fragment_center_spacing": 0.85,
         "fragment_center_lateral_sigma": 0.25,
         "fragment_attachment_distance": 1.55,
-        "fragment_attachment_spacing": 1.85,
+        "fragment_attachment_spacing": 0.85,
         "strict_fragment_center_offset": lane.center_offset,
         "save_json": True,
     })
