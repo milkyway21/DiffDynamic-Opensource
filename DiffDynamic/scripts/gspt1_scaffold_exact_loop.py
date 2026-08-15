@@ -167,7 +167,11 @@ def _variant_config(
     targetdiff_lock_prefix: Optional[str] = None,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base)
-    scaffold = config.setdefault("sample", {}).setdefault("scaffold", {})
+    sample = config.setdefault("sample", {})
+    # This loop is scaffold-only.  Keep the complete DiffDynamic
+    # large-step -> refine path even if a caller supplies a de novo base YAML.
+    sample.setdefault("dynamic", {})["skip_refine"] = False
+    scaffold = sample.setdefault("scaffold", {})
     sites = scaffold.setdefault("murcko_sites", {})
     sites["reference_exit_profile"] = str(profile_path) if use_profile else None
     if site_selection_mode == "legacy":

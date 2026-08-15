@@ -1,6 +1,11 @@
 from pathlib import Path
 
 from scripts.gspt1_scaffold_exact_loop import _variant_config
+from scripts.gspt1_strict_gaussian_campaign import (
+    LaneSpec,
+    build_strict_config,
+)
+from utils.gspt1_class_setup import CLASS_SPECS
 
 
 def _base_config():
@@ -24,6 +29,33 @@ def _profile():
     }
 
 
+def test_strict_builder_overrides_de_novo_skip_refine_default():
+    base = _base_config()
+    base["sample"]["dynamic"] = {"skip_refine": True}
+    profile = {
+        "n_extra_values": [13],
+        "n_extra_weights": [1],
+        "allocation_patterns": [
+            {"n_extra": 13, "site_counts": {"0": 13}, "weight": 1},
+        ],
+    }
+    lane = LaneSpec(
+        "test", "no_f", 1, 0.2, 2.0, 0.0, 0.0,
+        {"0": 2.0}, {"0": 0.0}, {"0": 0.0},
+    )
+    config = build_strict_config(
+        base,
+        CLASS_SPECS[0],
+        Path("profile.json"),
+        profile,
+        lane,
+        seed=123,
+        samples=2,
+        fragment_gaussian=True,
+    )
+    assert config["sample"]["dynamic"]["skip_refine"] is False
+
+
 def test_weighted_single_disables_sequential_site_split():
     config = _variant_config(
         _base_config(),
@@ -40,6 +72,7 @@ def test_weighted_single_disables_sequential_site_split():
     sites = config["sample"]["scaffold"]["murcko_sites"]
     assert sites["site_selection_mode"] == "weighted_single"
     assert sites["per_site_count_mode"] == "split"
+    assert config["sample"]["dynamic"]["skip_refine"] is False
 
 
 def test_legacy_site_mode_preserves_sequential_allocation():

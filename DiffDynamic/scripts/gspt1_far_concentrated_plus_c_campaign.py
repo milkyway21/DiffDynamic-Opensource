@@ -410,6 +410,8 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 lane.name: lane.sigma for lane in LANES
             },
             "diffusion_start_t": 999,
+            "skip_refine": False,
+            "diffdynamic_large_step_then_refine": True,
             "normal_coordinate_reverse_process": True,
             "targetdiff_baseline_refine": False,
             "forced_attachment_bonds": False,

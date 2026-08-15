@@ -449,6 +449,8 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "fragment_attachment_spacing_angstrom": 0.85,
             "fragment_center_lateral_sigma_angstrom": 0.25,
             "diffusion_start_t": 999,
+            "skip_refine": False,
+            "diffdynamic_large_step_then_refine": True,
             "normal_coordinate_reverse_process": True,
             "targetdiff_baseline_refine": False,
             "forced_attachment_bonds": False,

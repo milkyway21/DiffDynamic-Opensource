@@ -248,6 +248,10 @@ def build_strict_config(
     })
 
     dynamic = sample.setdefault("dynamic", {})
+    # Scaffold dynamic_locked is a full large-step -> refine path.  Keep this
+    # explicit so a de novo base config with skip_refine=true cannot silently
+    # change the scaffold campaign.
+    dynamic["skip_refine"] = False
     dynamic.setdefault("large_step", {})["max_grad_fusion_iterations"] = 30
     dynamic.setdefault("large_step", {})["preserve_schedule_endpoint"] = True
     dynamic.setdefault("refine", {})["max_grad_fusion_iterations"] = 30
@@ -297,6 +301,10 @@ def strict_preflight(
     sites_cfg = dict(config["sample"]["scaffold"]["murcko_sites"])
     scaffold_cfg = config["sample"]["scaffold"]
     grow_cfg = scaffold_cfg["grow"]
+    if bool(config["sample"].get("dynamic", {}).get("skip_refine", True)):
+        raise ValueError(
+            f"{spec.name}: scaffold dynamic refine must be enabled"
+        )
     type_mode = str(
         scaffold_cfg.get("extra_atom_type_mode", "auto")
     ).strip().lower()
@@ -517,6 +525,8 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 if args.fragment_gaussian else None
             ),
             "diffusion_start_t": 999,
+            "skip_refine": False,
+            "diffdynamic_large_step_then_refine": True,
             "diffdynamic_refine_max_iterations": 30,
             "targetdiff_baseline_refine": False,
             "reference_target_side_graph_used": False,
