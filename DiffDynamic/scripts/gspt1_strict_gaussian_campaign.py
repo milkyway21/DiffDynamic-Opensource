@@ -257,10 +257,12 @@ def build_strict_config(
     dynamic.setdefault("refine", {})["max_grad_fusion_iterations"] = 30
     dynamic.setdefault("refine", {})["preserve_schedule_endpoint"] = True
 
-    # TargetDiff baseline can change the newly generated atoms after the
-    # DiffDynamic chain, so strict mode excludes it entirely.
+    # Keep the CRBN prefix exact while allowing the baseline reverse process
+    # to repair the generated target-side geometry and atom classes.
     sample.setdefault("targetdiff_baseline_refine", {}).update({
-        "enable": False,
+        "enable": True,
+        "start_t": 29,
+        "lock_prefix": "types_and_pos",
         "after_scaffold_init_only": False,
     })
     sample.setdefault("optimization", {})["enable"] = False
@@ -528,7 +530,9 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "skip_refine": False,
             "diffdynamic_large_step_then_refine": True,
             "diffdynamic_refine_max_iterations": 30,
-            "targetdiff_baseline_refine": False,
+            "targetdiff_baseline_refine": True,
+            "targetdiff_baseline_start_t": 29,
+            "targetdiff_baseline_lock_prefix": "types_and_pos",
             "reference_target_side_graph_used": False,
             "reference_target_side_coordinates_used": False,
             "post_generation_graph_editing": False,

@@ -56,6 +56,36 @@ def test_strict_builder_overrides_de_novo_skip_refine_default():
     assert config["sample"]["dynamic"]["skip_refine"] is False
 
 
+def test_strict_builder_enables_locked_baseline_refine():
+    profile = {
+        "n_extra_values": [13],
+        "n_extra_weights": [1],
+        "allocation_patterns": [
+            {"n_extra": 13, "site_counts": {"0": 13}, "weight": 1},
+        ],
+    }
+    lane = LaneSpec(
+        "test", "no_f", 1, 0.2, 2.0, 0.0, 0.0,
+        {"0": 2.0}, {"0": 0.0}, {"0": 0.0},
+    )
+
+    config = build_strict_config(
+        _base_config(),
+        CLASS_SPECS[0],
+        Path("profile.json"),
+        profile,
+        lane,
+        seed=123,
+        samples=2,
+        fragment_gaussian=True,
+    )
+
+    baseline = config["sample"]["targetdiff_baseline_refine"]
+    assert baseline["enable"] is True
+    assert baseline["start_t"] == 29
+    assert baseline["lock_prefix"] == "types_and_pos"
+
+
 def test_weighted_single_disables_sequential_site_split():
     config = _variant_config(
         _base_config(),

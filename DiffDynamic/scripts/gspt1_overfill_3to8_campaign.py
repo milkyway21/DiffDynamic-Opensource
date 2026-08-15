@@ -9,9 +9,11 @@ aliphatic carbons.  The added atom classes are locked, but their coordinates
 are still initialized as generic fragment Gaussian clouds and then passed
 through the normal t=999 reverse process with coordinate mask zero.
 
-No target-side atom order, graph, coordinates, forced attachment bond, Vina,
-or TargetDiff refinement is used.  The output root is independent from the
-GPU3/4/5 campaign so the two experiments can run concurrently.
+No target-side atom order, graph, coordinates, forced attachment bond, or
+Vina is used.  A 30-step TargetDiff baseline refinement follows the
+DiffDynamic chain while restoring the CRBN prefix types and positions.  The
+output root is independent from the GPU3/4/5 campaign so the two experiments
+can run concurrently.
 """
 
 from __future__ import annotations
@@ -452,7 +454,9 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "skip_refine": False,
             "diffdynamic_large_step_then_refine": True,
             "normal_coordinate_reverse_process": True,
-            "targetdiff_baseline_refine": False,
+            "targetdiff_baseline_refine": True,
+            "targetdiff_baseline_start_t": 29,
+            "targetdiff_baseline_lock_prefix": "types_and_pos",
             "forced_attachment_bonds": False,
             "reference_target_side_graph_used": False,
             "reference_target_side_coordinates_used": False,
