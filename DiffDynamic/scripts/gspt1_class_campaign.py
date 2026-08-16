@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,13 @@ DEFAULT_ROOT = Path(
     "molglue_ikzf2_gspt1/diffdynamic/gspt1_scaffold_repaint_v3"
 )
 
+GEOMETRY_MODES = (
+    "pocket_aware_template",
+    "strict_anchor_gaussian",
+    "strict_fragment_gaussian",
+    "fragment_gaussian",
+)
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -76,6 +84,144 @@ def _write_yaml(payload: dict[str, Any], path: Path) -> None:
         yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=True)
 
 
+def _restrict_profile_to_counts(
+    profile: dict[str, Any],
+    allowed_counts: tuple[int, ...],
+) -> dict[str, Any]:
+    """Keep only complete coarse-prior records for selected atom counts."""
+    allowed = {int(value) for value in allowed_counts}
+    available = {int(value) for value in profile.get("n_extra_values", [])}
+    if not allowed or not allowed <= available:
+        raise ValueError(
+            f"count focus {sorted(allowed)} is not a subset of "
+            f"profile sizes {sorted(available)}"
+        )
+
+    restricted = copy.deepcopy(profile)
+    values = [
+        int(value)
+        for value in profile.get("n_extra_values", [])
+        if int(value) in allowed
+    ]
+    weights = [
+        float(weight)
+        for value, weight in zip(
+            profile.get("n_extra_values", []),
+            profile.get("n_extra_weights", []),
+        )
+        if int(value) in allowed
+    ]
+    restricted["n_extra_values"] = values
+    restricted["n_extra_weights"] = weights
+
+    for key in ("allocation_patterns", "extra_type_patterns", "fragment_patterns"):
+        restricted[key] = [
+            record
+            for record in profile.get(key, [])
+            if int(record.get("n_extra", -1)) in allowed
+        ]
+
+    # Keep the aggregate prior consistent with the selected size branch.  The
+    # sampler uses these fields for the weak element/aromatic initialization.
+    element_counts: dict[str, float] = {}
+    aromatic_counts: dict[str, float] = {}
+    exit_counts: dict[str, float] = {}
+    for record in restricted["extra_type_patterns"]:
+        weight = float(record.get("weight", 1.0))
+        for raw_key, count in record.get("class_counts", {}).items():
+            symbol, aromatic = str(raw_key).rsplit("|", 1)
+            weighted_count = float(count) * weight
+            element_counts[symbol] = (
+                element_counts.get(symbol, 0.0) + weighted_count
+            )
+            if int(aromatic):
+                aromatic_counts[raw_key] = (
+                    aromatic_counts.get(raw_key, 0.0) + weighted_count
+                )
+    for record in restricted["allocation_patterns"]:
+        weight = float(record.get("weight", 1.0))
+        for slot, count in record.get("site_counts", {}).items():
+            slot_key = str(int(slot))
+            exit_counts[slot_key] = (
+                exit_counts.get(slot_key, 0.0) + float(count) * weight
+            )
+    restricted["reference_extra_element_counts"] = element_counts
+    restricted["reference_extra_aromatic_element_counts"] = aromatic_counts
+    restricted["exit_site_weights"] = exit_counts
+    restricted["count_focus"] = sorted(allowed)
+    return restricted
+
+
+def _effective_class_specs(
+    no_f_count_values: tuple[int, ...],
+) -> tuple[Gspt1ClassSpec, ...]:
+    """Return class specs with an optional no-F size-focused branch."""
+    if not no_f_count_values:
+        return CLASS_SPECS
+    return tuple(
+        replace(spec, allowed_n_extra=no_f_count_values)
+        if spec.name == "no_f"
+        else spec
+        for spec in CLASS_SPECS
+    )
+
+
+def _parse_count_values(value: str) -> tuple[int, ...]:
+    """Parse a comma-separated positive integer count override."""
+    if not value.strip():
+        return ()
+    try:
+        parsed = tuple(sorted({int(item.strip()) for item in value.split(",")}))
+    except ValueError as exc:
+        raise ValueError(f"invalid count list: {value!r}") from exc
+    if not parsed or any(item <= 0 for item in parsed):
+        raise ValueError(f"count list must contain positive integers: {value!r}")
+    return parsed
+
+
+def _parse_geometry_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in GEOMETRY_MODES:
+        raise ValueError(
+            f"invalid geometry mode {value!r}; choose from "
+            f"{', '.join(GEOMETRY_MODES)}"
+        )
+    return mode
+
+
+def _parse_geometry_modes(
+    value: str,
+    default_mode: str,
+) -> dict[str, str]:
+    """Parse optional per-class geometry overrides.
+
+    The legacy single-mode flag remains the default for every class.  An
+    override string such as ``no_f=pocket_aware_template,f_main=strict_fragment_gaussian``
+    only changes the named classes, which keeps old manifests reproducible.
+    """
+    modes = {
+        spec.name: _parse_geometry_mode(default_mode)
+        for spec in CLASS_SPECS
+    }
+    if not str(value).strip():
+        return modes
+    valid_names = {spec.name for spec in CLASS_SPECS}
+    seen: set[str] = set()
+    for item in str(value).split(","):
+        name, separator, raw_mode = item.partition("=")
+        name = name.strip()
+        if not separator or name not in valid_names:
+            raise ValueError(
+                f"invalid geometry override {item!r}; use class=mode for "
+                f"classes {sorted(valid_names)}"
+            )
+        if name in seen:
+            raise ValueError(f"duplicate geometry override for class {name!r}")
+        seen.add(name)
+        modes[name] = _parse_geometry_mode(raw_mode)
+    return modes
+
+
 def build_class_config(
     base: dict[str, Any],
     spec: Gspt1ClassSpec,
@@ -84,8 +230,10 @@ def build_class_config(
     *,
     seed: int,
     samples: int,
+    geometry_mode: str = "pocket_aware_template",
 ) -> dict[str, Any]:
     """Create one fully pinned class config without changing de novo modes."""
+    geometry_mode = _parse_geometry_mode(geometry_mode)
     config = copy.deepcopy(base)
     sample = config.setdefault("sample", {})
     sample["seed"] = int(seed)
@@ -117,8 +265,29 @@ def build_class_config(
         "max_active_sites": max(len(profile_slots), 1),
         "overflow_mode": "cap",
         "preserve_zero_allocation_sidechains": False,
-        "jitter_mode": spec.jitter_mode,
+        "jitter_mode": geometry_mode,
         "jitter_std": 0.08,
+        # These are opt-in scaffold geometry modes. They are consumed only by
+        # build_extra_atom_positions and do not alter de novo sampling.
+        "strict_anchor_gaussian": geometry_mode == "strict_anchor_gaussian",
+        "strict_fragment_gaussian": geometry_mode == "strict_fragment_gaussian",
+        # Soft fragment mode reuses the fragment-shaped initial cloud, while
+        # leaving both its coordinates and element classes to diffusion.
+        "fragment_gaussian": geometry_mode == "fragment_gaussian",
+        "fragment_prior_profile": (
+            str(profile_path)
+            if geometry_mode in {
+                "strict_fragment_gaussian",
+                "fragment_gaussian",
+            } else None
+        ),
+        "strict_fragment_center_offset": 1.55,
+        "fragment_center_spacing": 2.15,
+        "fragment_center_lateral_sigma": 0.45,
+        "fragment_attachment_distance": 1.55,
+        "fragment_attachment_spacing": 2.15,
+        "fragment_geometry_sigma": 0.16,
+        "fragment_ring_radius": 1.38,
         "original_min_dist": 1.2,
         "original_max_dist": 10.0,
         "pocket_min_protein_dist": 1.5,
@@ -151,6 +320,12 @@ def build_class_config(
         # Weakly condition the element multiset without hard-locking identities.
         "extra_type_anchor_strength": 0.2,
     })
+    if geometry_mode == "fragment_gaussian":
+        # This is a scaffold-only ablation: retain the exact atom count but
+        # let the normal categorical reverse process choose added elements.
+        scaffold["extra_atom_type_mode"] = "diffuse"
+        scaffold["lock_extra_atom_types"] = False
+        grow["extra_type_anchor_strength"] = 0.0
     dynamic_refine = sample.setdefault("dynamic", {}).setdefault("refine", {})
     dynamic_refine.update({
         "max_grad_fusion_iterations": 30,
@@ -221,6 +396,11 @@ def geometry_preflight(
     sites_cfg = config["sample"]["scaffold"]["murcko_sites"]
     sites_cfg = dict(sites_cfg)
     sites_cfg["save_json"] = False
+    strict_geometry_only = bool(
+        sites_cfg.get("strict_anchor_gaussian", False)
+        or sites_cfg.get("strict_fragment_gaussian", False)
+        or sites_cfg.get("fragment_gaussian", False)
+    )
     sites = load_or_extract_attachment_sites(
         molecule,
         scaffold_indices,
@@ -291,7 +471,7 @@ def geometry_preflight(
             f"{sorted(required_patterns - observed_patterns)}"
         )
     threshold = float(sites_cfg["pocket_min_protein_dist"])
-    if minimum_clearance + 1e-5 < threshold:
+    if minimum_clearance + 1e-5 < threshold and not strict_geometry_only:
         raise ValueError(
             f"{spec.name}: minimum clearance {minimum_clearance:.3f} < "
             f"{threshold:.3f} A"
@@ -305,6 +485,7 @@ def geometry_preflight(
             for pattern_record in sorted(observed_patterns)
         ],
         "minimum_protein_clearance": minimum_clearance,
+        "protein_clearance_constraint_enforced": not strict_geometry_only,
         "attempts_by_size": attempts_by_size,
     }
 
@@ -314,14 +495,26 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
     reference_sdf = Path(args.reference_sdf)
     native_ligand = Path(args.native_ligand)
     protein = Path(args.protein)
+    class_specs = _effective_class_specs(args.no_f_count_values)
+    geometry_modes = dict(args.geometry_modes)
     base_config = _load_yaml(Path(args.config))
     f_ligand, profile_paths, profiles = prepare_class_profiles(
         reference_sdf, native_ligand, root
     )
     configs: dict[str, Path] = {}
     preflight = {}
-    for offset, spec in enumerate(CLASS_SPECS):
+    for offset, spec in enumerate(class_specs):
         profile = profiles[spec.name]
+        if spec.name == "no_f" and args.no_f_count_values:
+            profile = _restrict_profile_to_counts(
+                profile, args.no_f_count_values
+            )
+            profiles[spec.name] = profile
+            write_path = profile_paths[spec.name]
+            write_path.write_text(
+                json.dumps(profile, indent=2, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
         config = build_class_config(
             base_config,
             spec,
@@ -329,6 +522,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             profile,
             seed=int(args.start_seed) + offset,
             samples=int(args.samples),
+            geometry_mode=geometry_modes[spec.name],
         )
         # Private preflight-only payload; never serialized into sampling YAML.
         preflight_config = copy.deepcopy(config)
@@ -363,8 +557,17 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
         "excluded_reference_indices": list(EXCLUDED_REFERENCE_INDICES),
         "gpu_mapping": {
             str(gpu): spec.name
-            for gpu, spec in zip(args.gpus, CLASS_SPECS)
+            for gpu, spec in zip(args.gpus, class_specs)
         },
+        "allowed_n_extra": {
+            spec.name: list(spec.allowed_n_extra)
+            for spec in class_specs
+        },
+        "count_focus": {
+            "no_f": list(args.no_f_count_values),
+        },
+        "geometry_mode": args.geometry_mode,
+        "geometry_modes": geometry_modes,
         "profiles": {name: str(path) for name, path in profile_paths.items()},
         "configs": {name: str(path) for name, path in configs.items()},
         "preflight": preflight,
@@ -372,8 +575,46 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
             "original_scaffold_position_locked": True,
             "original_scaffold_type_locked": True,
             "added_position_locked": False,
-            "added_type_locked": False,
-            "added_type_soft_anchor_strength": 0.2,
+            "added_type_locked": all(
+                mode in {
+                    "strict_anchor_gaussian",
+                    "strict_fragment_gaussian",
+                }
+                for mode in geometry_modes.values()
+            ),
+            "added_type_soft_anchor_strength": (
+                1.0
+                if all(
+                    mode in {
+                        "strict_anchor_gaussian",
+                        "strict_fragment_gaussian",
+                    }
+                    for mode in geometry_modes.values()
+                )
+                else 0.0
+                if all(
+                    mode == "fragment_gaussian"
+                    for mode in geometry_modes.values()
+                )
+                else None
+            ),
+            "added_type_locked_by_class": {
+                name: mode in {
+                    "strict_anchor_gaussian",
+                    "strict_fragment_gaussian",
+                }
+                for name, mode in geometry_modes.items()
+            },
+            "added_type_soft_anchor_strength_by_class": {
+                name: (
+                    1.0 if mode in {
+                        "strict_anchor_gaussian",
+                        "strict_fragment_gaussian",
+                    }
+                    else 0.0 if mode == "fragment_gaussian" else 0.2
+                )
+                for name, mode in geometry_modes.items()
+            },
             "diffusion_start_t": 999,
             "diffdynamic_refine_max_iterations": 30,
             "targetdiff_reverse_steps": 30,
@@ -396,6 +637,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
         "base_config": base_config,
         "profile_paths": profile_paths,
         "profiles": profiles,
+        "class_specs": class_specs,
         "configs": configs,
         "manifest": manifest,
     }
@@ -403,6 +645,7 @@ def prepare_campaign(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict:
     root = prepared["root"]
+    class_specs = prepared["class_specs"]
     state_path = root / "state.json"
     state = {}
     if args.resume and state_path.exists():
@@ -416,7 +659,7 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict:
         if args.max_rounds and round_index >= args.max_rounds:
             break
         jobs = []
-        for gpu, spec in zip(args.gpus, CLASS_SPECS):
+        for gpu, spec in zip(args.gpus, class_specs):
             job_id = next_job_id
             next_job_id += 1
             seed = int(args.start_seed) + job_id
@@ -428,6 +671,7 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict:
                 prepared["profiles"][spec.name],
                 seed=seed,
                 samples=int(args.samples),
+                geometry_mode=args.geometry_modes[spec.name],
             )
             config_path = variant_root / "config.yml"
             _write_yaml(config, config_path)
@@ -473,7 +717,7 @@ def run_campaign(args: argparse.Namespace, prepared: dict[str, Any]) -> dict:
                 handle.write(json.dumps(result, ensure_ascii=True) + "\n")
 
         class_summaries = {}
-        for spec in CLASS_SPECS:
+        for spec in class_specs:
             class_root = root / "rounds" / spec.name / f"run_{round_index:04d}"
             class_summaries[spec.name] = audit_class(
                 [class_root],
@@ -527,6 +771,29 @@ def main() -> None:
     parser.add_argument("--protein", default=str(DEFAULT_PROTEIN))
     parser.add_argument("--start-seed", type=int, default=20280000)
     parser.add_argument("--gpus", default="3,4,5")
+    parser.add_argument(
+        "--no-f-count-values",
+        default="",
+        help="optional comma-separated no-F atom counts, e.g. 14",
+    )
+    parser.add_argument(
+        "--geometry-mode",
+        default="pocket_aware_template",
+        choices=GEOMETRY_MODES,
+        help=(
+            "scaffold-only initial cloud mode; strict_fragment_gaussian "
+            "uses coarse fragment/ring priors without target-side coordinates; "
+            "fragment_gaussian uses the same cloud with free added elements"
+        ),
+    )
+    parser.add_argument(
+        "--geometry-modes",
+        default="",
+        help=(
+            "optional comma-separated per-class overrides, for example "
+            "no_f=pocket_aware_template,f_main=strict_fragment_gaussian"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     args.gpus = [
@@ -534,6 +801,17 @@ def main() -> None:
     ]
     if len(args.gpus) != len(CLASS_SPECS):
         parser.error("--gpus must contain exactly three GPU ids")
+    try:
+        args.no_f_count_values = _parse_count_values(
+            args.no_f_count_values
+        )
+        args.geometry_mode = _parse_geometry_mode(args.geometry_mode)
+        args.geometry_modes = _parse_geometry_modes(
+            args.geometry_modes,
+            args.geometry_mode,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     prepared = prepare_campaign(args)
     print(json.dumps(prepared["manifest"], indent=2, ensure_ascii=True))
     if not args.run:

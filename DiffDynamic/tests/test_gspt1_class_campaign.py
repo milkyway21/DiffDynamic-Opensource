@@ -11,7 +11,13 @@ import torch
 from rdkit import Chem
 
 from models.molopt_score_model import ScorePosNet3D
-from scripts.gspt1_class_campaign import build_class_config, geometry_preflight
+from scripts.gspt1_class_campaign import (
+    _parse_count_values,
+    _parse_geometry_modes,
+    _restrict_profile_to_counts,
+    build_class_config,
+    geometry_preflight,
+)
 from scripts.sample_diffusion import _sample_reference_extra_type_quota
 from utils.gspt1_class_setup import (
     CLASS_SPECS,
@@ -168,6 +174,119 @@ def test_class_config_locks_only_original_scaffold():
     refine = config["sample"]["targetdiff_baseline_refine"]
     assert refine["start_t"] == 29
     assert refine["lock_prefix"] == "types_and_pos"
+
+
+def test_strict_fragment_geometry_is_opt_in_and_scaffold_only():
+    spec = CLASS_SPECS[0]
+    profile = {
+        "n_extra_values": [14],
+        "n_extra_weights": [1],
+        "allocation_patterns": [{
+            "n_extra": 14,
+            "site_counts": {"0": 14},
+            "weight": 1,
+        }],
+    }
+    config = build_class_config(
+        _base_config(), spec, Path("profile.json"), profile,
+        seed=123, samples=20, geometry_mode="strict_fragment_gaussian",
+    )
+    sites = config["sample"]["scaffold"]["murcko_sites"]
+    assert sites["strict_fragment_gaussian"] is True
+    assert sites["strict_anchor_gaussian"] is False
+    assert sites["fragment_prior_profile"] == "profile.json"
+    assert config["sample"]["scaffold"]["fix_scaffold_pos"] is True
+
+    default = build_class_config(
+        _base_config(), spec, Path("profile.json"), profile,
+        seed=123, samples=20,
+    )
+    default_sites = default["sample"]["scaffold"]["murcko_sites"]
+    assert default_sites["strict_fragment_gaussian"] is False
+
+
+def test_soft_fragment_geometry_keeps_added_types_free():
+    spec = CLASS_SPECS[0]
+    profile = {
+        "n_extra_values": [14],
+        "n_extra_weights": [1],
+        "allocation_patterns": [{
+            "n_extra": 14,
+            "site_counts": {"0": 14},
+            "weight": 1,
+        }],
+    }
+    config = build_class_config(
+        _base_config(), spec, Path("profile.json"), profile,
+        seed=123, samples=20, geometry_mode="fragment_gaussian",
+    )
+    scaffold = config["sample"]["scaffold"]
+    sites = scaffold["murcko_sites"]
+    assert sites["fragment_gaussian"] is True
+    assert sites["strict_fragment_gaussian"] is False
+    assert sites["fragment_prior_profile"] == "profile.json"
+    assert scaffold["extra_atom_type_mode"] == "diffuse"
+    assert scaffold["lock_extra_atom_types"] is False
+    assert scaffold["grow"]["extra_type_anchor_strength"] == 0.0
+
+
+def test_geometry_modes_support_per_class_overrides():
+    modes = _parse_geometry_modes(
+        "no_f=pocket_aware_template,f_main=strict_fragment_gaussian",
+        "strict_anchor_gaussian",
+    )
+    assert modes == {
+        "no_f": "pocket_aware_template",
+        "f_main": "strict_fragment_gaussian",
+        "f_large": "strict_anchor_gaussian",
+    }
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _parse_geometry_modes(
+            "no_f=pocket_aware_template,no_f=strict_anchor_gaussian",
+            "pocket_aware_template",
+        )
+
+
+def test_count_focus_filters_all_size_specific_priors():
+    profile = {
+        "n_extra_values": [13, 14],
+        "n_extra_weights": [4, 7],
+        "exit_site_weights": {"0": 11.0, "10": 1.0},
+        "allocation_patterns": [
+            {"n_extra": 13, "site_counts": {"0": 13}, "weight": 4},
+            {
+                "n_extra": 14,
+                "site_counts": {"0": 13, "10": 1},
+                "weight": 1,
+            },
+        ],
+        "extra_type_patterns": [
+            {
+                "n_extra": 13,
+                "class_counts": {"C|0": 2, "N|0": 1},
+                "weight": 4,
+            },
+            {
+                "n_extra": 14,
+                "class_counts": {"C|0": 3, "O|0": 1},
+                "weight": 7,
+            },
+        ],
+        "fragment_patterns": [
+            {"n_extra": 13, "site_fragments": {}, "weight": 4},
+            {"n_extra": 14, "site_fragments": {}, "weight": 7},
+        ],
+    }
+    focused = _restrict_profile_to_counts(profile, (14,))
+    assert focused["n_extra_values"] == [14]
+    assert focused["n_extra_weights"] == [7.0]
+    assert [item["n_extra"] for item in focused["allocation_patterns"]] == [14]
+    assert [item["n_extra"] for item in focused["extra_type_patterns"]] == [14]
+    assert [item["n_extra"] for item in focused["fragment_patterns"]] == [14]
+    assert focused["reference_extra_element_counts"] == {"C": 21.0, "O": 7.0}
+    assert focused["exit_site_weights"] == {"0": 13.0, "10": 1.0}
+    assert _parse_count_values("14, 14") == (14,)
 
 
 @pytest.mark.skipif(

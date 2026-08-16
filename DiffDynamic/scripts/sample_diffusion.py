@@ -39,6 +39,10 @@ import utils.transforms as trans  # 导入特征转换工具。
 from datasets import get_dataset  # 导入数据集工厂函数。
 from datasets.pl_data import FOLLOW_BATCH, ProteinLigandData, torchify_dict  # 导入 PyG follow_batch 配置。
 from utils.data import PDBProtein, parse_sdf_file, rdmol_to_ligand_dict  # 导入蛋白/配体解析工具。
+from utils.denovo_template_init import (
+    build_template_initialization_batch,
+    load_template_geometry,
+)
 from models.molopt_score_model import (  # 导入模型及辅助函数。
     ScorePosNet3D,
     DiffDynamic,
@@ -4122,6 +4126,27 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
     large_cfg = dynamic_cfg.get('large_step', {})  # 大步探索阶段配置。
     refine_cfg = dynamic_cfg.get('refine', {})  # 精炼阶段配置。
     selector_cfg = dynamic_cfg.get('selector', {})  # 候选筛选配置。
+    template_init_cfg = dict(dynamic_cfg.get('template_init', {}) or {})
+    template_geometry = None
+    if bool(template_init_cfg.get('enable', False)):
+        template_path = template_init_cfg.get('ligand_path')
+        scaffold_smarts = template_init_cfg.get('scaffold_smarts')
+        if not template_path or not scaffold_smarts:
+            raise ValueError(
+                'dynamic.template_init requires ligand_path and scaffold_smarts'
+            )
+        template_geometry = load_template_geometry(
+            template_path,
+            scaffold_smarts,
+            require_3d=bool(template_init_cfg.get('require_3d', True)),
+        )
+        if logger:
+            logger.info(
+                '[DynamicTemplateInit] enabled | '
+                f'template={template_geometry.source} | '
+                f'scaffold={template_geometry.scaffold_atom_count} | '
+                f'target={template_geometry.target_atom_count}'
+            )
 
     # 读取时间节点配置：time_boundary 保留原有功能，selection_time 用于中间筛选
     time_boundary = get_time_boundary(dynamic_cfg, 750)  # time_boundary 用于划分 large_step 和 refine
@@ -4148,6 +4173,11 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
     # 确保 batch_size 和 n_repeat 都是非负整数
     large_batch_size = max(1, int(large_batch_size))  # 确保至少为1
     n_repeat = max(0, int(n_repeat))  # 确保非负（0表示不执行，但不会报错）
+    if template_geometry is not None and n_repeat != 1:
+        raise ValueError(
+            'dynamic.template_init currently requires large_step.n_repeat=1 '
+            'so its per-batch scaffold RePaint state cannot be mixed across repeats'
+        )
     
     if logger:
         logger.info(f'[Dynamic] Large-step batch size: {large_batch_size} | repeats: {n_repeat}')
@@ -4158,6 +4188,7 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
     range_offset = 0  # 范围模式的原子偏移。
     time_records = {'large_step': [], 'refine': [], 'baseline_refine': []}  # 记录各阶段耗时。
     largestep_smiles_list = []  # 实验3：largestep 完成时强制重建的 SMILES（不中断采样）
+    template_repaint_cfg = None
     
     profiler.checkpoint('before_large_step')
 
@@ -4169,7 +4200,31 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
         _validate_batch_indices(batch_protein, n_data, 'batch_protein',
                                 logger=logger, context='legacy_large_step')
 
-        if sample_num_atoms_mode == 'prior':  # 根据 pocket 尺寸采样原子数。
+        template_batch = None
+        if template_geometry is not None:
+            atom_count_values = template_init_cfg.get(
+                'atom_count_values', [29, 30, 31, 32, 33]
+            )
+            base_seed = int(config.sample.get('seed', 42))
+            template_batch = build_template_initialization_batch(
+                template_geometry,
+                batch_size=n_data,
+                atom_count_values=atom_count_values,
+                seed=base_seed + repeat_idx * 1_000_003,
+                coordinate_jitter_std=float(
+                    template_init_cfg.get('coordinate_jitter_std', 0.20)
+                ),
+                extra_point_jitter_std=float(
+                    template_init_cfg.get('extra_point_jitter_std', 0.35)
+                ),
+            )
+            ligand_num_atoms = template_batch.atom_counts
+            batch_ligand = safe_repeat_interleave(
+                torch.arange(n_data, dtype=torch.long),
+                ligand_num_atoms,
+                device=device,
+            )
+        elif sample_num_atoms_mode == 'prior':  # 根据 pocket 尺寸采样原子数。
             pocket_size = atom_num.get_space_size(data.protein_pos.detach().cpu().numpy())
             # 验证 pocket_size 的有效性
             if np.isnan(pocket_size) or np.isinf(pocket_size) or pocket_size <= 0:
@@ -4422,9 +4477,16 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
         )
 
         center = scatter_mean(batch.protein_pos, batch_protein, dim=0)  # 计算蛋白中心。
-        init_ligand_pos = center[batch_ligand] + torch.randn_like(center[batch_ligand])  # 初始化配体位置。
-        # 与终态 pred_ligand_pos 同坐标系（蛋白原始帧；模型内 center_pos 后再加回 offset）
-        init_ligand_pos_np = init_ligand_pos.detach().cpu().numpy().astype(np.float64)
+        if template_batch is None:
+            init_ligand_pos = center[batch_ligand] + torch.randn_like(
+                center[batch_ligand]
+            )
+        else:
+            init_ligand_pos = torch.tensor(
+                template_batch.flattened_positions(),
+                dtype=torch.float32,
+                device=device,
+            )
 
         # 验证初始化后的配体位置
         if init_ligand_pos.numel() == 0:
@@ -4446,6 +4508,94 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
         else:
             init_ligand_v_input = log_sample_categorical(uniform_logits)
             log_mode = 'auto'  # 自动模式：根据模型配置自动选择输入格式。
+
+        if template_batch is not None:
+            # Convert the real-ligand coordinate cloud into a legal x_t state.
+            # Atom classes start from a uniform categorical x0 and therefore
+            # do not expose the template's target-side elements to the model.
+            template_log_v = F.log_softmax(uniform_logits, dim=-1)
+            _, template_pos_centered, template_offset = center_pos(
+                batch.protein_pos,
+                init_ligand_pos,
+                batch_protein,
+                batch_ligand,
+                mode=center_pos_mode,
+            )
+            diffusion_start_t = min(
+                int(template_init_cfg.get('diffusion_start_t', 999)),
+                int(model.num_timesteps) - 1,
+            )
+            noised_pos, noised_log_v = _forward_diffuse_molecule(
+                model,
+                template_pos_centered,
+                template_log_v,
+                batch_ligand,
+                diffusion_start_t,
+                device,
+            )
+            init_ligand_pos = noised_pos + template_offset[batch_ligand]
+            init_ligand_v_input = noised_log_v
+            log_mode = 'log_prob'
+            if bool(template_init_cfg.get('repaint_scaffold', True)):
+                reference_v = getattr(data, 'ligand_atom_feature_full', None)
+                if reference_v is None:
+                    raise ValueError(
+                        'dynamic.template_init repaint requires the template '
+                        'ligand atom features'
+                    )
+                reference_v = reference_v.to(device=device, dtype=torch.long)
+                if int(reference_v.shape[0]) != int(template_geometry.total_atom_count):
+                    raise ValueError(
+                        'template atom order/count differs from the loaded '
+                        f'ligand data ({reference_v.shape[0]} vs '
+                        f'{template_geometry.total_atom_count})'
+                    )
+                scaffold_indices = torch.tensor(
+                    template_geometry.scaffold_atom_indices,
+                    dtype=torch.long,
+                    device=device,
+                )
+                scaffold_log_v = index_to_log_onehot(
+                    reference_v[scaffold_indices], model.num_classes
+                )
+                repaint_log_v = template_log_v.clone()
+                repaint_pos_mask = torch.zeros(
+                    total_atoms, dtype=torch.float32, device=device
+                )
+                cursor = 0
+                n_scaffold = int(template_geometry.scaffold_atom_count)
+                for count in ligand_num_atoms:
+                    repaint_log_v[cursor:cursor + n_scaffold] = scaffold_log_v
+                    repaint_pos_mask[cursor:cursor + n_scaffold] = 1.0
+                    cursor += int(count)
+                repaint_type_mask = (
+                    repaint_pos_mask.clone()
+                    if bool(template_init_cfg.get('repaint_scaffold_types', True))
+                    else None
+                )
+                template_repaint_cfg = {
+                    'x0_pos': template_pos_centered,
+                    'x0_log_v': repaint_log_v,
+                    'pos_mask': (
+                        repaint_pos_mask
+                        if bool(template_init_cfg.get('repaint_scaffold_positions', True))
+                        else torch.zeros_like(repaint_pos_mask)
+                    ),
+                    'type_mask': repaint_type_mask,
+                    'use_mean_for_discrete': True,
+                    '_use_dual_mask': True,
+                }
+            if logger:
+                logger.info(
+                    '[DynamicTemplateInit] q(x_t|x0) initialization | '
+                    f't={diffusion_start_t} | counts={ligand_num_atoms} | '
+                    f'repaint_scaffold={template_repaint_cfg is not None}'
+                )
+
+        # Same world coordinate frame as the final pred_ligand_pos.
+        init_ligand_pos_np = (
+            init_ligand_pos.detach().cpu().numpy().astype(np.float64)
+        )
 
         # 验证初始化后的配体类别输入
         if init_ligand_v_input.numel() == 0:
@@ -4516,6 +4666,7 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
                 pos_clip=large_cfg.get('pos_clip'),
                 v_clip=large_cfg.get('v_clip'),
                 log_ligand_input_mode='log_prob' if log_mode == 'log_prob' else 'auto',
+                repaint_cfg=template_repaint_cfg,
                 **_dynamic_subcfg_grad_cap_kwargs(large_cfg),
             )
         t_end = time.time()  # 记录大步采样结束时间。
@@ -4587,6 +4738,10 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
                 'log_v_traj': log_v_traj_mol,
                 'v_traj': v_traj_mol,
                 'init_pos': init_ligand_pos_np[start:end].copy(),
+                'template_init': (
+                    dict(template_batch.records[idx])
+                    if template_batch is not None else None
+                ),
             }
             # large_step阶段不进行筛选，只收集候选
             total_candidates.append(candidate)  # 收集候选。
@@ -4663,6 +4818,7 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
                 'repeat_index': 0,
                 'time_indices': cand.get('time_indices'),
                 'init_pos': cand.get('init_pos'),
+                'template_init': cand.get('template_init'),
                 **metric_info
             })
 
@@ -4693,6 +4849,7 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
                     refine_cfg=refine_cfg,
                     refinement_grad_kwargs=_dynamic_subcfg_grad_cap_kwargs(refine_cfg),
                     error_prefix='[Dynamic] refine stage1 batch',
+                    repaint_cfg=template_repaint_cfg,
                 )
             else:
                 raw_stage1 = []
@@ -4710,6 +4867,7 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
                     'source_cand_idx': cand_idx,
                     'refine_idx': refine_idx,
                     'init_pos': _src_cand.get('init_pos'),
+                    'template_init': _src_cand.get('template_init'),
                     'pos_traj': _src_cand.get('pos_traj') or [],
                     'v_traj': _src_cand.get('v_traj') or [],
                     'log_v_traj': _src_cand.get('log_v_traj') or [],
@@ -4794,6 +4952,7 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
                     refine_cfg=refine_cfg,
                     refinement_grad_kwargs=_dynamic_subcfg_grad_cap_kwargs(refine_cfg),
                     error_prefix='[Dynamic] refine stage2 batch',
+                    repaint_cfg=template_repaint_cfg,
                 )
             t_end = time.time()
             time_records['refine'].append(t_end - t_start)
@@ -4843,10 +5002,14 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
 
             metric_info = evaluate_candidate(pos_final, v_final, ligand_atom_mode, selector_cfg)
             _init_pos = cand.get('init_pos')
+            _template_init = cand.get('template_init')
             if _init_pos is None:
                 _src = cand.get('source_cand_idx', cand_idx)
                 if isinstance(_src, int) and 0 <= _src < len(total_candidates):
                     _init_pos = total_candidates[_src].get('init_pos')
+                    _template_init = total_candidates[_src].get(
+                        'template_init'
+                    )
             refined_records.append({
                 'pos': pos_final,
                 'v': v_final,
@@ -4859,6 +5022,7 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
                 'repeat_index': refine_idx,
                 'time_indices': merged_time_indices if merged_time_indices else rti,
                 'init_pos': _init_pos,
+                'template_init': _template_init,
                 **metric_info
             })
 
@@ -4912,6 +5076,31 @@ def _run_legacy_dynamic(model, data, config, ligand_atom_mode, device='cuda:0', 
             'max_grad_fusion_iterations', large_cfg.get('max_gradient_steps')
         ),
     }
+    if template_geometry is not None:
+        meta_dict['template_init'] = {
+            'enabled': True,
+            'schema_version': 1,
+            'template_source': template_geometry.source,
+            'scaffold_smarts': template_geometry.scaffold_smarts,
+            'template_total_atom_count': template_geometry.total_atom_count,
+            'scaffold_atom_count': template_geometry.scaffold_atom_count,
+            'target_atom_count': template_geometry.target_atom_count,
+            'diffusion_start_t': int(
+                template_init_cfg.get('diffusion_start_t', 999)
+            ),
+            'target_side_elements_used': False,
+            'target_side_bonds_used': False,
+            'repaint_scaffold': template_repaint_cfg is not None,
+            'repaint_scaffold_positions': bool(
+                template_init_cfg.get('repaint_scaffold_positions', True)
+            ),
+            'repaint_scaffold_types': bool(
+                template_init_cfg.get('repaint_scaffold_types', True)
+            ),
+        }
+        meta_dict['template_init_records'] = [
+            rec.get('template_init') for rec in refined_records
+        ]
     if dynamic_cfg.get('capture_largestep_smiles', False) and largestep_smiles_list:
         meta_dict['largestep_smiles'] = largestep_smiles_list  # 实验3 专表用
     if meta_baseline_refine_ti is not None:
@@ -7553,6 +7742,14 @@ def scaffold_dynamic_locked_molecule(
     strict_fragment_gaussian = bool(
         _murcko_sites_cfg.get('strict_fragment_gaussian', False)
     )
+    fragment_gaussian = bool(
+        _murcko_sites_cfg.get('fragment_gaussian', False)
+    )
+    if fragment_gaussian:
+        # Soft fragment geometry is scaffold-only.  The initial x0 type quota
+        # may seed q(x_t|x_0), but no added element is RePaint-locked.
+        extra_atom_type_mode = 'diffuse'
+        extra_types_explicitly_diffused = True
     if extra_types_explicitly_diffused:
         # Type-free scaffold ablation: keep the exact atom count, but let the
         # normal categorical reverse process predict every added element.
@@ -7948,13 +8145,14 @@ def scaffold_dynamic_locked_molecule(
             'site_allocation': _site_place_meta.get('site_allocation') if _site_place_meta else None,
             'strict_anchor_gaussian': strict_anchor_gaussian,
             'strict_fragment_gaussian': strict_fragment_gaussian,
+            'fragment_gaussian': fragment_gaussian,
             'strict_extra_type_locked': extra_types_locked,
             'extra_atom_types_locked': extra_types_locked,
             'extra_atom_type_mode': extra_atom_type_mode,
             'extra_position_mask': 0.0 if lock_extra_atom_types else extra_anchor_strength,
             'fragment_layout': (
                 _site_place_meta.get('fragment_layout')
-                if strict_fragment_gaussian else None
+                if strict_fragment_gaussian or fragment_gaussian else None
             ),
         })
 

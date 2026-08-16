@@ -608,7 +608,10 @@ def load_or_extract_attachment_sites(
     strict_fragment_gaussian = bool(
         sites_cfg.get('strict_fragment_gaussian', False)
     )
-    strict_geometry_only = strict_anchor_gaussian or strict_fragment_gaussian
+    fragment_gaussian = bool(sites_cfg.get('fragment_gaussian', False))
+    strict_geometry_only = (
+        strict_anchor_gaussian or strict_fragment_gaussian or fragment_gaussian
+    )
     profile_tag = '_profile_exit' if use_profile else ''
     cache_suffix = (f'_ev_{ev_mode}' if include_ev else '') + profile_tag
 
@@ -1545,7 +1548,7 @@ def _strict_fragment_gaussian_site_positions(
     )
     if not profile_path:
         raise ValueError(
-            'strict_fragment_gaussian requires fragment_prior_profile'
+            'fragment_gaussian requires fragment_prior_profile'
         )
     profile = load_scaffold_profile(profile_path)
     n_extra = int(sum(int(value) for value in counts))
@@ -2226,6 +2229,8 @@ def build_extra_atom_positions(
     strict_fragment_gaussian = bool(
         sites_cfg.get('strict_fragment_gaussian', False)
     )
+    fragment_gaussian = bool(sites_cfg.get('fragment_gaussian', False))
+    fragment_geometry = strict_fragment_gaussian or fragment_gaussian
     overflow_mode = str(sites_cfg.get('overflow_mode', 'pocket_fallback'))
     meta: Dict[str, Any] = {
         'placement': 'pocket_fallback',
@@ -2235,6 +2240,7 @@ def build_extra_atom_positions(
         'n_extra_effective': n_extra_requested,
         'overflow_mode': overflow_mode,
         'strict_fragment_gaussian': strict_fragment_gaussian,
+        'fragment_gaussian': fragment_gaussian,
         'fragment_type_hints': [],
         'fragment_layout': [],
     }
@@ -2247,7 +2253,7 @@ def build_extra_atom_positions(
         )
 
     if not attachment_sites:
-        if strict_anchor_gaussian or strict_fragment_gaussian:
+        if strict_anchor_gaussian or fragment_geometry:
             raise ValueError(
                 'strict scaffold Gaussian modes require scaffold exit anchor sites'
             )
@@ -2387,11 +2393,12 @@ def build_extra_atom_positions(
             protein_np = protein_positions.detach().cpu().numpy().astype(np.float64)
         else:
             protein_np = np.asarray(protein_positions, dtype=np.float64)
-    if strict_fragment_gaussian:
+    if fragment_geometry:
         if overflow > 0:
-            raise ValueError(
-                'strict_fragment_gaussian cannot place overflow atoms'
-            )
+            if strict_fragment_gaussian:
+                raise ValueError(
+                    'strict_fragment_gaussian cannot place overflow atoms'
+                )
         fragment_positions, fragment_type_hints, fragment_layout = (
             _strict_fragment_gaussian_site_positions(
                 active, counts, rng, sites_cfg
