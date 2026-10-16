@@ -1,0 +1,38 @@
+tier: T0
+description: 芳构化、中环缩成苯/杂芳、超大环拆键
+policy:
+  c6_carbocycle:
+    enabled: true
+    min_ring_double_bonds: 0
+    max_ring_double_bonds: 3
+    require_planar_below_double_bonds: 3
+    max_ring_h_count: 10
+    cost: 1.0
+  c5_heterocycle:
+    enabled: true
+    min_ring_double_bonds: 0
+    max_ring_double_bonds: 2
+    require_planar_below_double_bonds: 2
+    max_ring_h_count: 8
+    allowed_heteroatoms:
+    - 7
+    - 8
+    - 16
+    cost: 1.5
+  fused_to_aromatic_relaxation:
+    enabled: true
+    extra_ring_h_allowance: 2
+    waive_planarity: true
+  macrocycle:
+    enabled: true
+    min_size: 10
+  medium_ring:
+    enabled: true
+    sizes:
+    - 7
+    - 8
+    - 9
+    prefer_contract: true
+    prefer_break: true
+    contract_offer_aza: true
+transforms: []

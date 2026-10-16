@@ -1,0 +1,68 @@
+mode: standard
+
+repair:
+  max_iterations: 10
+  maximum_edit_cost: 20
+  minimum_improvement: 80
+  minimum_winner_margin: 40
+  reject_repeated_state: true
+
+aromaticity:
+  repair_c6_carbon_rings: true
+  repair_c5_heteroaromatic_rings: true
+  require_unique_kekule_candidate: true
+  use_3d_planarity_as_optional_evidence: true
+
+cumulene:
+  allow_known_legal_patterns: true
+  repair_ring_cumulenes: true
+  reject_ambiguous_linear_cumulenes: true
+
+connectivity_repair:
+  allow_bond_deletion: true
+  allow_bond_addition: false
+  maximum_deleted_bonds: 2
+  maximum_added_bonds: 0
+
+charge:
+  allowed_total_charges: [-2, -1, 0, 1, 2]
+  preserve_permanent_ions: true
+  preserve_zwitterions: true
+  allow_local_charge_repair: true
+  force_neutral: false
+
+stereo:
+  preserve_tetrahedral_centers: true
+  preserve_double_bond_stereo: true
+  reject_if_changed: true
+
+radicals:
+  allow: false
+
+identity:
+  preserve_elements: true
+  preserve_heavy_atom_count: true
+  allow_local_bond_order_changes: true
+  allow_documented_bond_deletion: true
+
+scoring:
+  parse_failure: 10000
+  sanitize_failure: 8000
+  invalid_valence_count: 3000
+  kekulization_failure_count: 2000
+  unexpected_radical_count: 1500
+  aromaticity_conflict_count: 1000
+  impossible_bond_order_count: 800
+  implausible_charge_count: 500
+  ring_conflict_count: 300
+  disconnected_fragment_penalty: 100
+  edit_costs:
+    bond_order_change: 1
+    formal_charge_change: 1
+    implicit_h_change: 1
+    aromatic_flag_change: 0.5
+    bond_deletion: 8
+    bond_addition: 10
+    stereo_change: 1000
+    heavy_atom_deletion: 10000
+    element_change: 10000

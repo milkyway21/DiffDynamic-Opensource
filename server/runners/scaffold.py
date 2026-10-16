@@ -26,16 +26,18 @@ def _build_sample_cmd(cfg, patched_config: str, params: dict) -> list:
         "--device", f"cuda:{params['gpu_id']}",
     ]
     data_id = params.get("data_id")
-    if data_id is not None:
-        cmd += ["-i", str(data_id)]
-    elif params.get("protein_path"):
+    if params.get("protein_path"):
         cmd += ["--protein_path", params["protein_path"]]
         if params.get("ligand_path"):
             cmd += ["--ligand_path", params["ligand_path"]]
+    elif data_id is not None:
+        cmd += ["-i", str(data_id)]
     elif params.get("use_test_set"):
         cmd += ["--use_test_set"]
     if params.get("molecule_path"):
         cmd += ["--molecule_path", params["molecule_path"]]
+    if params.get("result_path"):
+        cmd += ["--result_path", params["result_path"]]
     return cmd
 
 

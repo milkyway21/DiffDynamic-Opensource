@@ -1,0 +1,30 @@
+.sc-placement-panel { grid-column: 1 / -1; border: 1px solid var(--border, #294057); border-radius: 12px; padding: 16px; min-width: 0; }
+.sc-diag-item { font-family: inherit; text-align: left; }
+.sc-diag-item:focus-visible, #sc-placement-viewer canvas:focus-visible, .molecular-structure-viewer canvas:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sc-placement-layout { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(230px, 1fr); gap: 16px; }
+#sc-placement-viewer, .molecular-structure-viewer { position: relative; width: 100%; height: 380px; background: #0a1628; border-radius: 8px; overflow: hidden; }
+#sc-placement-viewer canvas, .molecular-structure-viewer canvas { display: block; touch-action: none; }
+.gen-structure-heading { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.gen-structure-heading h4 { margin: 0 0 6px; }
+.gen-structure-heading .form-hint { margin: 0; max-width: 42rem; }
+.structure-placeholder { display: grid; place-content: center; height: 100%; margin: 0; padding: 24px; box-sizing: border-box; color: #a8becf; font-size: 13px; text-align: center; }
+.structure-legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px; font-size: 12px; color: var(--text-secondary); }
+.structure-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+.structure-legend i { display: inline-block; width: 20px; height: 5px; border-radius: 3px; }
+.legend-protein { background: #79b5dc; }
+.legend-ligand { background: #a9b8c7; }
+#gen-structure-message { margin: 8px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+#gen-preview-dataid-group { max-width: 36rem; margin: 12px 0; }
+.sc-view-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+.sc-region { border: 1px solid #40526a; border-radius: 8px; padding: 12px; margin: 0 0 12px; min-width: 0; }
+.sc-region.active { border-color: #ff9d4d; }
+.sc-region label { display: block; font-size: 12px; margin-bottom: 8px; }
+.sc-region input, .sc-region select { display: block; width: 100%; min-width: 0; box-sizing: border-box; }
+.sc-region button { padding: 6px 10px; background: #172b40; color: #dce8f4; border: 1px solid #597089; border-radius: 5px; cursor: pointer; }
+.sc-region button[aria-pressed=true] { border-color: #ff9d4d; color: #ffbe89; }
+.sc-region button:focus-visible { outline: 2px solid #ff9d4d; outline-offset: 2px; }
+.sc-xyz { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+#sc-regions { max-height: 460px; overflow-y: auto; }
+#sc-placement-message { font-size: 13px; overflow-wrap: anywhere; }
+[hidden] { display: none !important; }
+@media (max-width: 768px) { .sc-placement-layout { grid-template-columns: minmax(0, 1fr); } #sc-placement-viewer, .molecular-structure-viewer { height: 300px; } .sc-placement-panel { padding: 10px; } }

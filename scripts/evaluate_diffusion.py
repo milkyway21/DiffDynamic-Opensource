@@ -98,7 +98,10 @@ if __name__ == '__main__':
             # reconstruction
             try:
                 pred_aromatic = transforms.is_aromatic_from_index(pred_v, mode=args.atom_enc_mode)  # 识别芳香性。
-                mol = reconstruct.reconstruct_from_generated(pred_pos, pred_atom_type, pred_aromatic)  # RDKit 重建。
+                mol = reconstruct.reconstruct_from_generated(
+                    pred_pos, pred_atom_type, pred_aromatic,
+                    basic_mode=(str(args.atom_enc_mode) == 'basic'),
+                )
                 smiles = Chem.MolToSmiles(mol)  # 转为 SMILES。
             except reconstruct.MolReconsError:
                 if args.verbose:

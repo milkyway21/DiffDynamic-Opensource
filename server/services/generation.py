@@ -1,4 +1,8 @@
-"""Generation / evaluation / history service facades."""
+"""Historical service imports kept for integrations.
+
+New HTTP behavior belongs in server.routes; submission behavior belongs in
+server.submissions. These adapters retain the previous external import paths.
+"""
 
 from typing import Optional
 

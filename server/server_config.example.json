@@ -1,0 +1,16 @@
+{
+  "gpu_ids": [0],
+  "default_gpu_id": 0,
+  "host": "127.0.0.1",
+  "port": 7860,
+  "max_concurrent_jobs": 2,
+  "job_timeout": 10800,
+  "max_jobs_per_user": 2,
+  "max_pending_jobs": 16,
+  "max_submit_per_min": 12,
+  "max_upload_per_min": 10,
+  "max_upload_bytes": 52428800,
+  "max_generate_per_day": 1,
+  "max_eval_per_day": 1,
+  "conda_env": "diffdynamic"
+}

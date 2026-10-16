@@ -4,25 +4,89 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DiffDynamic</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="/static/css/style.css">
+<link rel="stylesheet" href="/static/css/style.css?v=security20261010-20261009i18n2">
+<link rel="stylesheet" href="/static/css/scaffold-placement.css?v=20261010-ribbon">
+<link rel="stylesheet" href="/static/css/medchem.css?v=20261014-medchem">
+<script defer src="/static/vendor/alpinejs.min.js"></script>
+<script src="/static/vendor/3Dmol-min.js"></script>
 </head>
 <body>
+
+<!-- Global job monitor bar (Alpine component) -->
+<div x-data="globalJobs" x-init="start()" @dd:language.window="language = $event.detail.language" x-cloak class="global-job-bar" :class="{'has-active': activeCount > 0}">
+  <button type="button" class="job-bar-toggle" @click="open = !open" :title="label(open ? 'global.collapse' : 'global.expand')">
+    <span class="job-bar-dot" :class="{pulse: activeCount > 0}"></span>
+    <span class="job-bar-text" x-text="activeCount > 0 ? counts : label('global.monitor')"></span>
+    <span class="job-bar-badge" x-show="activeCount > 0" x-text="activeCount"></span>
+  </button>
+  <div class="job-bar-panel" x-show="open" x-transition.opacity.duration.200ms @click.outside="open = false">
+    <div class="job-panel-header">
+      <strong x-text="label('global.tasks')"></strong>
+      <span class="job-panel-count" x-text="counts"></span>
+    </div>
+    <div class="job-panel-list" x-show="jobs.length > 0">
+      <template x-for="j in jobs" :key="j.job_id">
+        <div class="job-panel-item" :data-status="j.status">
+          <div class="job-item-main">
+            <span class="job-item-type" x-text="j.job_type"></span>
+            <span class="job-item-id" x-text="j.job_id.substring(0, 24)"></span>
+          </div>
+          <div class="job-item-meta">
+            <span class="job-item-gpu" data-admin-only hidden :hidden="!$store.account.isAdmin" x-show="j.gpu_id >= 0" x-text="`GPU ${j.gpu_id}`"></span>
+            <span class="job-item-progress" x-text="Math.round((j.progress||0)*100)+'%'"></span>
+          </div>
+          <div class="job-item-bar-bg"><div class="job-item-bar-fill" :style="`transform:scaleX(${Math.min(1, Math.max(0, j.progress || 0))})`"></div></div>
+          <div class="job-item-actions">
+            <button type="button" class="job-item-cancel" @click="cancelJob(j.job_id)" x-show="j.status === 'running' || j.status === 'pending'" x-text="label('common.cancel')">取消</button>
+          </div>
+        </div>
+      </template>
+    </div>
+    <div class="job-panel-empty" x-show="jobs.length === 0">
+      <p x-text="label('global.no_tasks')"></p>
+    </div>
+  </div>
+</div>
+
+<!-- Toast notifications (Alpine component) -->
+<div x-data="toasts" x-init="init()" class="toast-container" x-cloak>
+  <template x-for="t in list" :key="t.id">
+    <div class="toast" :class="t.type" x-transition.duration.300ms>
+      <span class="toast-icon" x-html="t.icon"></span>
+      <div class="toast-body">
+        <div class="toast-msg" x-text="t.message"></div>
+        <div class="toast-sub" x-show="t.subtitle" x-text="t.subtitle"></div>
+      </div>
+      <button type="button" class="toast-close" @click="remove(t.id)">&times;</button>
+    </div>
+  </template>
+</div>
 
 <header>
   <canvas id="diffusion-field" aria-hidden="true"></canvas>
   <div class="header-inner">
     <div class="header-brand">
-      <div class="header-icon">DD</div>
+      <div class="dd-orbit-icon" aria-hidden="true">
+        <span class="dd-orbit-sphere"></span>
+        <span class="dd-orbit-pulse p1"></span>
+        <span class="dd-orbit-pulse p2"></span>
+        <span class="dd-orbit-pulse p3"></span>
+        <span class="dd-orbit-glow"></span>
+      </div>
       <div>
         <h1 class="brand-title">DiffDynamic</h1>
         <p class="subtitle">Diffusion-based 3D Structure-based Drug Design</p>
       </div>
     </div>
     <div class="header-right">
+      <a href="__DD_PLATFORM_HOME__" class="header-back-link" title="返回 BianLab 首页" data-i18n-title="common.home_title" data-i18n="common.home">&larr; BianLab 首页</a>
+      <div class="header-user" id="header-user" style="display:none">
+        <span class="header-user-name" id="header-user-name"></span>
+        <span class="header-quota" id="header-quota" style="display:none"></span>
+        <span class="header-admin-badge" id="header-admin-badge" style="display:none" data-i18n="common.admin">管理员 · 全库可见</span>
+      </div>
       <div class="header-badge">Paper Demo</div>
-      <button id="lang-toggle" class="lang-btn" onclick="toggleLang()" title="Switch language">EN</button>
+      <button id="lang-toggle" class="lang-btn" onclick="toggleLang()" title="Switch language" data-i18n-title="common.language" data-i18n-aria-label="common.language">EN</button>
     </div>
   </div>
 </header>
@@ -30,161 +94,318 @@
 <nav id="main-nav">
   <button class="nav-btn active" data-tab="dashboard" data-i18n="nav.project"></button>
   <button class="nav-btn" data-tab="generate" data-i18n="nav.generate"></button>
-  <button class="nav-btn" data-tab="optimization" data-i18n="nav.optimization"></button>
   <button class="nav-btn" data-tab="scaffold" data-i18n="nav.scaffold"></button>
-  <button class="nav-btn" data-tab="cascade" data-i18n="nav.cascade"></button>
+  <button class="nav-btn" data-tab="medchem" data-i18n="mc.title"></button>
   <button class="nav-btn" data-tab="evaluate" data-i18n="nav.evaluate"></button>
   <button class="nav-btn" data-tab="pocket-eval" data-i18n="nav.pocket_eval"></button>
   <button class="nav-btn" data-tab="molecules" data-i18n="nav.molecules"></button>
   <button class="nav-btn" data-tab="history" data-i18n="nav.history"></button>
-  <button class="nav-btn" data-tab="config" data-i18n="nav.config"></button>
+  <button class="nav-btn" data-admin-only hidden data-tab="config" data-i18n="nav.config"></button>
 </nav>
 
 <main>
   <!-- Dashboard -->
   <section id="tab-dashboard" class="tab-panel active">
-    <div class="readme-hero">
-      <div class="hero-layout">
-        <div class="hero-eyebrow" data-i18n="hero.eyebrow"></div>
-        <h1>DiffDynamic</h1>
-        <p class="hero-desc" data-i18n="hero.desc"></p>
-        <div class="hero-actions">
+    <div class="dash-hero">
+      <div class="dash-hero-glow" aria-hidden="true"></div>
+      <div class="hero-layout dash-hero-layout">
+        <p class="dash-system-status"><span class="dash-live-dot" aria-hidden="true"></span><span id="dash-status-text" data-i18n="dash.status_idle"></span></p>
+        <h1 class="dash-hero-title" data-i18n="dash.hero_title"></h1>
+        <div class="hero-actions dash-hero-actions">
           <button type="button" class="hero-cta" id="hero-cta-generate" data-i18n="hero.cta"></button>
-          <div class="hero-live" id="dashboard-stats" aria-live="polite"></div>
+        </div>
+        <div class="dash-hero-stats" id="dashboard-stats" aria-live="polite"></div>
+      </div>
+      <div class="dash-hero-metrics">
+        <div class="dash-metric-tag" aria-hidden="true">
+          <span class="dash-metric-label">Skip-step · Gradient Fusion · Prudent</span>
+          <span class="dash-metric-arrow">&rarr;</span>
         </div>
       </div>
     </div>
-    <div class="readme-card">
-      <div id="readme-content" data-i18n-placeholder="common.loading"></div>
+
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <h2 class="dash-section-title" data-i18n="dash.section_innovation"></h2>
+        <span class="dash-section-line" aria-hidden="true"></span>
+      </div>
+      <div class="dash-grid dash-grid-innov">
+        <article class="dash-card dash-card-feature" data-goto="generate">
+          <h3 class="dash-card-title" data-i18n="dash.inn1_title"></h3>
+          <p class="dash-card-desc" data-i18n="dash.inn1_desc"></p>
+          <span class="dash-card-link" data-i18n="common.goto"></span>
+        </article>
+        <article class="dash-card" data-goto="generate">
+          <h3 class="dash-card-title" data-i18n="dash.inn2_title"></h3>
+          <p class="dash-card-desc" data-i18n="dash.inn2_desc"></p>
+          <span class="dash-card-link" data-i18n="common.goto"></span>
+        </article>
+        <article class="dash-card" data-goto="generate">
+          <h3 class="dash-card-title" data-i18n="dash.inn3_title"></h3>
+          <p class="dash-card-desc" data-i18n="dash.inn3_desc"></p>
+          <span class="dash-card-link" data-i18n="common.goto"></span>
+        </article>
+        <article class="dash-card" data-goto="scaffold">
+          <h3 class="dash-card-title" data-i18n="dash.inn4_title"></h3>
+          <p class="dash-card-desc" data-i18n="dash.inn4_desc"></p>
+          <span class="dash-card-link" data-i18n="common.goto"></span>
+        </article>
+      </div>
+    </div>
+
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <h2 class="dash-section-title" data-i18n="dash.section_cap"></h2>
+        <span class="dash-section-line" aria-hidden="true"></span>
+      </div>
+      <div class="dash-cap-list">
+        <button type="button" class="dash-cap-row" data-goto="generate">
+          <span class="dash-cap-label" data-i18n="dash.cap_gen_title"></span>
+          <span class="dash-cap-desc" data-i18n="dash.cap_gen_desc"></span>
+          <span class="dash-cap-arrow" aria-hidden="true">&rarr;</span>
+        </button>
+        <button type="button" class="dash-cap-row" data-goto="scaffold">
+          <span class="dash-cap-label" data-i18n="dash.cap_sc_title"></span>
+          <span class="dash-cap-desc" data-i18n="dash.cap_sc_desc"></span>
+          <span class="dash-cap-arrow" aria-hidden="true">&rarr;</span>
+        </button>
+        <button type="button" class="dash-cap-row" data-goto="evaluate">
+          <span class="dash-cap-label" data-i18n="dash.cap_eval_title"></span>
+          <span class="dash-cap-desc" data-i18n="dash.cap_eval_desc"></span>
+          <span class="dash-cap-arrow" aria-hidden="true">&rarr;</span>
+        </button>
+        <button type="button" class="dash-cap-row" data-goto="pocket-eval">
+          <span class="dash-cap-label" data-i18n="dash.cap_pe_title"></span>
+          <span class="dash-cap-desc" data-i18n="dash.cap_pe_desc"></span>
+          <span class="dash-cap-arrow" aria-hidden="true">&rarr;</span>
+        </button>
+        <button type="button" class="dash-cap-row" data-goto="history">
+          <span class="dash-cap-label" data-i18n="dash.cap_hist_title"></span>
+          <span class="dash-cap-desc" data-i18n="dash.cap_hist_desc"></span>
+          <span class="dash-cap-arrow" aria-hidden="true">&rarr;</span>
+        </button>
+        <button type="button" class="dash-cap-row" data-admin-only hidden data-goto="config">
+          <span class="dash-cap-label" data-i18n="dash.cap_cfg_title"></span>
+          <span class="dash-cap-desc" data-i18n="dash.cap_cfg_desc"></span>
+          <span class="dash-cap-arrow" aria-hidden="true">&rarr;</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <h2 class="dash-section-title" data-i18n="dash.section_score"></h2>
+        <span class="dash-section-line" aria-hidden="true"></span>
+      </div>
+      <div class="dash-score-banner">
+        <p class="dash-score-lead" data-i18n="dash.score_lead"></p>
+        <div class="dash-score-dims" id="dash-score-dims" aria-label="Eight dimension score labels"></div>
+      </div>
     </div>
   </section>
 
   <!-- Generation -->
   <section id="tab-generate" class="tab-panel">
     <div class="card">
-      <h3 data-i18n="gen.title"></h3>
+      <h3 data-i18n="gen.unified_title"></h3>
+      <p class="form-hint" data-i18n="gen.unified_hint"></p>
       <form id="gen-form" class="form-grid">
         <div class="form-group">
-          <label data-i18n="gen.mode"></label>
-          <select id="gen-mode">
-            <option value="dynamic" data-i18n="gen.mode_dynamic"></option>
-            <option value="prudent" data-i18n="gen.mode_prudent"></option>
+          <label data-i18n="gen.source"></label>
+          <select id="gen-source" onchange="toggleGenSource()">
+            <option value="custom" selected data-i18n="gen.src_custom"></option>
+            <option value="testset" data-i18n="gen.src_testset"></option>
+            <option value="batch" data-i18n="gen.src_batch"></option>
           </select>
         </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label data-i18n="gen.dataid"></label>
-            <input type="number" id="gen-dataid" value="0" min="0">
+
+        <!-- 自定义口袋 -->
+        <div id="gen-section-custom">
+          <p class="form-hint" data-i18n="gen.custom_hint"></p>
+          <div class="form-row">
+            <div class="form-group">
+              <label data-i18n="gen.protein"></label>
+              <div class="file-input-combo">
+                <input type="text" id="custom-protein" placeholder="/path/to/protein.pdb">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('custom-protein', ['pdb'])" data-i18n="common.browse">浏览</button>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('custom-protein', '.pdb')" data-i18n="common.upload">上传</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label data-i18n="gen.ligand"></label>
+              <div class="file-input-combo">
+                <input type="text" id="custom-ligand" placeholder="/path/to/ligand.sdf">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('custom-ligand', ['sdf','mol','mol2'])" data-i18n="common.browse">浏览</button>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('custom-ligand', '.sdf,.mol,.mol2')" data-i18n="common.upload">上传</button>
+              </div>
+            </div>
           </div>
-          <div class="form-group">
-            <label>GPU ID</label>
-            <input type="number" id="gen-gpu" data-i18n-placeholder="gen.gpu_ph">
+          <div class="form-row">
+            <div class="form-group" data-admin-only hidden>
+              <label>GPU ID</label>
+              <input type="number" id="custom-gpu" data-i18n-placeholder="gen.gpu_auto">
+            </div>
+            <div class="form-group">
+              <label data-i18n="gen.radius"></label>
+              <input type="number" id="custom-radius" value="10.0" step="0.5">
+            </div>
+            <div class="form-group">
+              <label data-i18n="gen.samples"></label>
+              <input type="number" id="custom-samples" value="5" min="1">
+            </div>
           </div>
+
           <div class="form-group">
-            <label data-i18n="gen.batch"></label>
-            <input type="number" id="gen-batch" value="5" min="1" data-i18n-placeholder="gen.batch_ph">
+            <label data-i18n="gen.auto"></label>
+            <div class="checkbox-group">
+              <label><input type="checkbox" id="custom-auto-eval" checked> <span data-i18n="gen.auto_eval_short"></span></label>
+              <label><input type="checkbox" id="custom-auto-extract" checked> <span data-i18n="gen.auto_extract_short"></span></label>
+              <label><input type="checkbox" id="custom-remove-fragments"> <span data-i18n="gen.remove_fragments"></span></label>
+            </div>
           </div>
         </div>
-        <div class="form-row">
+
+        <!-- 测试集 data_id -->
+        <div id="gen-section-testset" style="display:none">
           <div class="form-group">
-            <label data-i18n="gen.max_samples"></label>
-            <input type="number" id="gen-max-samples" value="5" min="1">
+            <label data-i18n="gen.sampling_mode"></label>
+            <input type="hidden" id="gen-mode" value="dynamic"><span data-i18n="gen.mode_dynamic">Dynamic</span>
           </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label data-i18n="gen.dataid"></label>
+              <input type="number" id="gen-dataid" value="0" min="0">
+            </div>
+            <div class="form-group" data-admin-only hidden>
+              <label>GPU ID</label>
+              <input type="number" id="gen-gpu" data-i18n-placeholder="gen.gpu_ph">
+            </div>
+            <div class="form-group">
+              <label data-i18n="gen.batch"></label>
+              <input type="number" id="gen-batch" value="5" min="1" data-i18n-placeholder="gen.batch_ph">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label data-i18n="gen.max_samples"></label>
+              <input type="number" id="gen-max-samples" value="5" min="1">
+            </div>
+            <div class="form-group">
+              <label data-i18n="gen.vina_timeout"></label>
+              <input type="number" id="gen-vina-timeout" value="20" min="1">
+            </div>
+          </div>
+
+
+
           <div class="form-group">
-            <label data-i18n="gen.vina_timeout"></label>
-            <input type="number" id="gen-vina-timeout" value="20" min="1">
+            <label data-i18n="gen.auto"></label>
+            <div class="checkbox-group">
+              <label><input type="checkbox" id="gen-auto-eval" checked> <span data-i18n="gen.auto_eval"></span></label>
+              <label><input type="checkbox" id="gen-auto-extract" checked> <span data-i18n="gen.auto_extract"></span></label>
+              <label><input type="checkbox" id="gen-remove-fragments"> <span data-i18n="gen.remove_fragments"></span></label>
+            </div>
           </div>
         </div>
-        <div class="form-group">
-          <label data-i18n="gen.config"></label>
-          <input type="text" id="gen-config" data-i18n-placeholder="gen.config_ph">
-        </div>
-        <div class="form-group">
-          <label data-i18n="gen.auto"></label>
-          <div class="checkbox-group">
-            <label><input type="checkbox" id="gen-auto-eval" checked> <span data-i18n="gen.auto_eval"></span></label>
-            <label><input type="checkbox" id="gen-auto-extract" checked> <span data-i18n="gen.auto_extract"></span></label>
-            <label><input type="checkbox" id="gen-remove-fragments"> <span data-i18n="gen.remove_fragments"></span></label>
+
+        <!-- 批量范围 -->
+        <div id="gen-section-batch" style="display:none">
+          <div class="form-row">
+            <div class="form-group"><label data-i18n="batch.start"></label><input type="number" id="batch-start" value="0" min="0"></div>
+            <div class="form-group"><label data-i18n="batch.end"></label><input type="number" id="batch-end" value="0" min="0"></div>
+            <div class="form-group"><label data-i18n="batch.size"></label><input type="number" id="batch-size" value="5" min="1"></div>
+            <div class="form-group" data-admin-only hidden><label data-i18n="batch.gpus"></label><input type="text" id="batch-gpus" placeholder="0,1,2"></div>
           </div>
+          <div class="form-group">
+            <label><input type="checkbox" id="batch-auto-eval" checked> <span data-i18n="batch.auto_eval"></span></label>
+          </div>
+        </div>
+
+        <fieldset class="mc-generation">
+          <legend><label for="gen-medchem-enable"><input type="checkbox" id="gen-medchem-enable"> <span data-i18n="mc.gen_enable"></span></label></legend>
+          <p class="form-hint" data-i18n="mc.gen_hint"></p>
+          <div id="gen-medchem-options" hidden></div>
+        </fieldset>
+        <div class="sc-placement-panel" id="gen-structure-panel">
+          <div class="gen-structure-heading">
+            <div>
+              <h4 data-i18n="gen.structure_title">配体分子与口袋预览</h4>
+              <p class="form-hint" data-i18n="gen.structure_hint">蛋白以条带显示，参考配体用于定位口袋；从头生成不锁定配体骨架。</p>
+            </div>
+            <div class="sc-view-actions">
+              <button type="button" id="gen-load-context" class="btn btn-secondary" data-i18n="gen.load_ligand">预览配体分子</button>
+              <button type="button" id="gen-fit-context" class="btn btn-secondary" disabled data-i18n="gen.fit_view">重置视角</button>
+            </div>
+          </div>
+          <div class="form-group" id="gen-preview-dataid-group" hidden>
+            <label for="gen-preview-dataid" data-i18n="gen.preview_dataid">预览 data_id</label>
+            <input type="number" id="gen-preview-dataid" value="0" min="0" step="1">
+            <p class="form-hint" data-i18n="gen.batch_preview_hint">每次预览批量范围内的一个口袋，不改变任务的批量范围。</p>
+          </div>
+          <div id="gen-structure-viewer" class="molecular-structure-viewer" role="img" aria-label="蛋白条带和参考配体三维视图" data-i18n-aria-label="gen.viewer_label">
+            <p class="structure-placeholder" data-i18n="gen.structure_empty">选择输入后，点击「预览配体分子」查看配体及蛋白口袋。</p>
+          </div>
+          <div class="structure-legend">
+            <span><i class="legend-protein" aria-hidden="true"></i><span data-i18n="gen.protein_ribbon">蛋白条带</span></span>
+            <span><i class="legend-ligand" aria-hidden="true"></i><span data-i18n="gen.reference_ligand">参考配体（可选）</span></span>
+          </div>
+          <p id="gen-structure-message" role="status" aria-live="polite" data-i18n="gen.structure_empty">选择输入后，点击「预览配体分子」查看配体及蛋白口袋。</p>
         </div>
         <div class="form-actions">
-          <button type="submit" class="btn btn-primary" data-i18n="gen.start"></button>
+          <button type="submit" class="btn btn-primary js-needs-gen" data-i18n="gen.start"></button>
           <button type="button" class="btn btn-danger" id="gen-cancel-btn" disabled data-i18n="gen.cancel"></button>
         </div>
-      </form>
-    </div>
-    <div class="card">
-      <h3 data-i18n="batch.title"></h3>
-      <form id="batch-form" class="form-grid">
-        <div class="form-row">
-          <div class="form-group"><label data-i18n="batch.start"></label><input type="number" id="batch-start" value="0" min="0"></div>
-          <div class="form-group"><label data-i18n="batch.end"></label><input type="number" id="batch-end" value="0" min="0"></div>
-          <div class="form-group"><label data-i18n="batch.size"></label><input type="number" id="batch-size" value="5" min="1"></div>
-          <div class="form-group"><label data-i18n="batch.gpus"></label><input type="text" id="batch-gpus" placeholder="0,1,2"></div>
-        </div>
-        <div class="form-group">
-          <label><input type="checkbox" id="batch-auto-eval" checked> <span data-i18n="batch.auto_eval"></span></label>
-        </div>
-        <div class="form-actions"><button type="submit" class="btn btn-primary" data-i18n="batch.start_btn"></button></div>
+        <p class="quota-hint" data-quota="generate"></p>
       </form>
     </div>
     <div class="card">
       <h3 data-i18n="gen.progress"></h3>
       <div id="gen-status" data-i18n-placeholder="gen.idle"></div>
+      <div id="gen-medchem-link" class="mc-actions" hidden></div>
       <div class="progress-bar-container" id="gen-progress-bar" style="display:none">
         <div class="progress-bar" id="gen-progress-fill"></div>
       </div>
-      <pre id="gen-log" class="log-output"></pre>
-    </div>
-    <div class="card">
-      <h3 data-i18n="gen.custom_title"></h3>
-      <p class="form-hint" data-i18n="gen.custom_hint"></p>
-      <form id="custom-form" class="form-grid">
-        <div class="form-row">
-          <div class="form-group">
-            <label data-i18n="gen.protein"></label>
-            <input type="text" id="custom-protein" placeholder="/path/to/protein.pdb" required>
-          </div>
-          <div class="form-group">
-            <label data-i18n="gen.ligand"></label>
-            <input type="text" id="custom-ligand" placeholder="/path/to/ligand.sdf">
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>GPU ID</label>
-            <input type="number" id="custom-gpu" data-i18n-placeholder="gen.gpu_auto">
-          </div>
-          <div class="form-group">
-            <label data-i18n="gen.radius"></label>
-            <input type="number" id="custom-radius" value="10.0" step="0.5">
-          </div>
-          <div class="form-group">
-            <label data-i18n="gen.samples"></label>
-            <input type="number" id="custom-samples" value="5" min="1">
-          </div>
-        </div>
-        <div class="form-group">
-          <label data-i18n="gen.config"></label>
-          <input type="text" id="custom-config" data-i18n-placeholder="gen.config_ph">
-        </div>
-        <div class="form-group">
-          <label data-i18n="gen.auto"></label>
-          <div class="checkbox-group">
-            <label><input type="checkbox" id="custom-auto-eval" checked> <span data-i18n="gen.auto_eval_short"></span></label>
-            <label><input type="checkbox" id="custom-auto-extract" checked> <span data-i18n="gen.auto_extract_short"></span></label>
-            <label><input type="checkbox" id="custom-remove-fragments"> <span data-i18n="gen.remove_fragments"></span></label>
-          </div>
-        </div>
-        <div class="form-actions">
-          <button type="submit" class="btn btn-primary" data-i18n="gen.start"></button>
-        </div>
-      </form>
+      <pre id="gen-log" class="log-output" data-admin-only hidden></pre>
     </div>
   </section>
 
-  <!-- Optimization -->
-  <section id="tab-optimization" class="tab-panel">
+  <section id="tab-medchem" class="tab-panel">
+    <div class="card">
+      <div class="mc-heading"><div><h2 data-i18n="mc.title"></h2><p class="form-hint" data-i18n="mc.intro"></p></div><span class="mc-provenance" data-i18n="mc.traceable"></span></div>
+      <form id="medchem-form">
+        <div class="form-group"><label for="mc-source" data-i18n="mc.source"></label><select id="mc-source"><option value="file" data-i18n="mc.file"></option><option value="smiles" data-i18n="mc.smiles"></option><option value="run" data-i18n="mc.run"></option></select></div>
+        <div id="mc-input-file" class="form-group"><label for="mc-input-path" data-i18n="mc.file"></label><div class="file-input-combo"><input id="mc-input-path" type="text" placeholder="molecules.sdf"><button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('mc-input-path', ['sdf','mol'])" data-i18n="common.browse"></button><button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('mc-input-path', '.sdf,.mol')" data-i18n="common.upload"></button></div></div>
+        <div id="mc-input-smiles" class="form-group" hidden><label for="mc-smiles" data-i18n="mc.smiles"></label><textarea id="mc-smiles" rows="5" maxlength="200000" spellcheck="false" placeholder="CC(=O)Oc1ccccc1C(=O)O" aria-describedby="mc-smiles-hint"></textarea><p id="mc-smiles-hint" class="form-hint" data-i18n="mc.smiles_hint"></p></div>
+        <div id="mc-input-run" class="form-row" hidden><div class="form-group"><label for="mc-source-run" data-i18n="mc.run_id"></label><input id="mc-source-run" type="number" min="1" step="1"></div><div class="form-group"><label for="mc-run-select" data-i18n="mc.recent_runs"></label><select id="mc-run-select"><option value="" data-i18n="mc.select_run"></option></select></div><button type="button" class="btn btn-secondary" id="mc-refresh-runs" data-i18n="common.refresh"></button></div>
+        <div id="mc-options"></div>
+        <details id="mc-pocket-section" class="mc-pocket"><summary data-i18n="mc.pocket"></summary>
+          <p class="form-hint" data-i18n="mc.pocket_hint"></p>
+          <div class="form-row"><div class="form-group"><label for="mc-protein" data-i18n="gen.protein"></label><div class="file-input-combo"><input id="mc-protein" type="text" placeholder="protein.pdb"><button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('mc-protein', '.pdb')" data-i18n="common.upload"></button><button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('mc-protein', ['pdb'])" data-i18n="common.browse"></button></div></div><div class="form-group"><label for="mc-reference" data-i18n="mc.reference"></label><div class="file-input-combo"><input id="mc-reference" type="text" placeholder="bound_ligand.sdf"><button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('mc-reference', '.sdf,.mol')" data-i18n="common.upload"></button><button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('mc-reference', ['sdf','mol'])" data-i18n="common.browse"></button></div></div></div>
+          <label class="mc-aligned"><input type="checkbox" id="mc-aligned"> <span data-i18n="mc.aligned"></span></label>
+          <p class="form-hint" id="mc-coordinate-hint" data-i18n="mc.coordinate_hint"></p>
+          <button type="button" id="mc-preview-pocket" class="btn btn-secondary" data-i18n="gen.load_ligand"></button>
+          <div id="mc-pocket-viewer" class="molecular-structure-viewer mc-pocket-viewer" hidden role="img" data-i18n-aria-label="gen.viewer_label"></div>
+          <p id="mc-pocket-message" role="status" aria-live="polite"></p>
+        </details>
+        <div class="form-actions"><button id="mc-submit" type="submit" class="btn btn-primary" data-i18n="mc.start"></button><button id="mc-cancel" type="button" class="btn btn-danger" disabled data-i18n="gen.cancel"></button></div>
+      </form>
+    </div>
+    <div class="card"><h3 data-i18n="gen.progress"></h3><div id="mc-status" role="status" aria-live="polite" data-i18n="gen.idle"></div><div class="progress-bar-container" id="mc-progress-bar" hidden><div class="progress-bar" id="mc-progress-fill"></div></div></div>
+    <div id="mc-report" class="card" hidden aria-live="polite"></div>
+  </section>
+
+  <!-- Scaffold Optimization (merged: SDEdit / Scaffold / Cascade) -->
+  <section id="tab-scaffold" class="tab-panel">
+    <div class="card so-func-card">
+      <h3 data-i18n="so.title"></h3>
+      <p class="form-hint" data-i18n="so.hint"></p>
+      <div class="mode-toggle-bar so-func-bar" id="optfunc-bar">
+        <button type="button" class="mode-toggle-btn" data-func="optimization" id="optfunc-btn-optimization" onclick="selectOptFunc('optimization')" data-i18n="so.func_opt"></button>
+        <button type="button" class="mode-toggle-btn active" data-func="scaffold" id="optfunc-btn-scaffold" onclick="selectOptFunc('scaffold')" data-i18n="so.func_sc"></button>
+        <button type="button" class="mode-toggle-btn" data-func="cascade" id="optfunc-btn-cascade" onclick="selectOptFunc('cascade')" data-i18n="so.func_cascade"></button>
+      </div>
+    </div>
+    <div id="optfunc-optimization" style="display:none">
     <div class="card">
       <h3 data-i18n="opt.title"></h3>
       <p class="form-hint" data-i18n="opt.hint"></p>
@@ -194,14 +415,18 @@
             <label data-i18n="opt.dataid"></label>
             <input type="number" id="opt-dataid" value="0" min="0">
           </div>
-          <div class="form-group">
+          <div class="form-group" data-admin-only hidden>
             <label>GPU ID</label>
             <input type="number" id="opt-gpu" data-i18n-placeholder="gen.gpu_ph">
           </div>
         </div>
         <div class="form-group">
           <label data-i18n="opt.molecule_path"></label>
-          <input type="text" id="opt-molecule" data-i18n-placeholder="opt.molecule_ph">
+          <div class="file-input-combo">
+            <input type="text" id="opt-molecule" data-i18n-placeholder="opt.molecule_ph">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('opt-molecule', ['sdf','mol','mol2'])" data-i18n="common.browse">浏览</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('opt-molecule', '.sdf,.mol,.mol2')" data-i18n="common.upload">上传</button>
+          </div>
         </div>
         <details class="config-section">
           <summary data-i18n="opt.advanced"></summary>
@@ -263,9 +488,10 @@
           </div>
         </div>
         <div class="form-actions">
-          <button type="submit" class="btn btn-primary" data-i18n="opt.start"></button>
+          <button type="submit" class="btn btn-primary js-needs-gen" data-i18n="opt.start"></button>
           <button type="button" class="btn btn-danger" id="opt-cancel-btn" disabled data-i18n="gen.cancel"></button>
         </div>
+        <p class="quota-hint" data-quota="generate"></p>
       </form>
     </div>
     <div class="card">
@@ -274,19 +500,40 @@
       <div class="progress-bar-container" id="opt-progress-bar" style="display:none">
         <div class="progress-bar" id="opt-progress-fill"></div>
       </div>
-      <pre id="opt-log" class="log-output"></pre>
+      <pre id="opt-log" class="log-output" data-admin-only hidden></pre>
     </div>
-  </section>
+    </div>
 
-  <!-- Scaffold -->
-  <section id="tab-scaffold" class="tab-panel">
+    <div id="optfunc-scaffold">
     <div class="card">
       <h3 data-i18n="sc.title"></h3>
       <p class="form-hint" data-i18n="sc.hint"></p>
       <form id="sc-form" class="form-grid">
-        <div class="form-group">
+        <div class="form-group" style="grid-column: 1 / -1">
           <label data-i18n="sc.mode"></label>
-          <select id="sc-scaffold-mode" onchange="toggleScaffoldMode()">
+          <div class="sc-mode-diagram">
+            <button type="button" class="sc-diag-item active" data-mode="grow" onclick="selectScMode('grow')">
+              <span class="sc-diag-icon">&#128300;</span>
+              <div class="sc-diag-label" data-i18n="sc.mode_grow"></div>
+              <div class="sc-diag-desc" data-i18n="sc.desc_grow">从固定骨架生长侧链</div>
+            </button>
+            <button type="button" class="sc-diag-item" data-mode="evolve" onclick="selectScMode('evolve')">
+              <span class="sc-diag-icon">&#128260;</span>
+              <div class="sc-diag-label" data-i18n="sc.mode_evolve"></div>
+              <div class="sc-diag-desc" data-i18n="sc.desc_evolve">逐步进化整个分子</div>
+            </button>
+            <button type="button" class="sc-diag-item" data-mode="dynamic_locked" onclick="selectScMode('dynamic_locked')">
+              <span class="sc-diag-icon">&#128274;</span>
+              <div class="sc-diag-label" data-i18n="sc.mode_dynamic_locked"></div>
+              <div class="sc-diag-desc" data-i18n="sc.desc_dynamic">完整 dynamic 与骨架约束</div>
+            </button>
+            <button type="button" class="sc-diag-item" data-mode="prudent" onclick="selectScMode('prudent')">
+              <span class="sc-diag-icon">&#127890;</span>
+              <div class="sc-diag-label" data-i18n="sc.mode_prudent"></div>
+              <div class="sc-diag-desc" data-i18n="sc.desc_prudent">多轮谨慎生成筛选</div>
+            </button>
+          </div>
+          <select id="sc-scaffold-mode" onchange="toggleScaffoldMode()" style="display:none">
             <option value="grow" data-i18n="sc.mode_grow"></option>
             <option value="evolve" data-i18n="sc.mode_evolve"></option>
             <option value="dynamic_locked" data-i18n="sc.mode_dynamic_locked"></option>
@@ -295,77 +542,137 @@
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label data-i18n="opt.dataid"></label>
+            <label for="sc-input-mode" data-i18n="sc.input">输入来源 / Input</label>
+            <select id="sc-input-mode"><option value="dataset" data-i18n="sc.input_dataset">测试集 / Test set</option><option value="custom" data-i18n="sc.input_custom">自定义蛋白与配体 / Custom pocket</option></select>
+          </div>
+          <div class="form-group" id="sc-dataid-group">
+            <label for="sc-dataid" data-i18n="opt.dataid"></label>
             <input type="number" id="sc-dataid" value="0" min="0">
           </div>
-          <div class="form-group">
+          <div class="form-group" data-admin-only hidden>
             <label>GPU ID</label>
             <input type="number" id="sc-gpu" data-i18n-placeholder="gen.gpu_ph">
           </div>
         </div>
+        <div class="form-group" id="sc-protein-group" hidden>
+          <label for="sc-protein" data-i18n="sc.protein">蛋白 PDB / Protein PDB</label>
+          <div class="file-input-combo">
+            <input type="text" id="sc-protein" placeholder="pocket.pdb">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('sc-protein', ['pdb'])" data-i18n="common.browse">浏览</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('sc-protein', '.pdb')" data-i18n="common.upload">上传</button>
+          </div>
+        </div>
         <div class="form-group">
-          <label data-i18n="opt.molecule_path"></label>
-          <input type="text" id="sc-molecule" data-i18n-placeholder="sc.molecule_ph">
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label data-i18n="sc.source"></label>
-            <select id="sc-source">
-              <option value="auto_murcko" data-i18n="sc.source_murcko"></option>
-              <option value="auto_murcko_generic" data-i18n="sc.source_generic"></option>
-              <option value="atom_indices" data-i18n="sc.source_atoms"></option>
-              <option value="smarts" data-i18n="sc.source_smarts"></option>
-              <option value="none" data-i18n="sc.source_none"></option>
-            </select>
-          </div>
-          <div class="form-group" id="sc-atom-indices-group" style="display:none">
-            <label data-i18n="sc.atom_indices"></label>
-            <input type="text" id="sc-atom-indices" placeholder="0,1,2,5">
-          </div>
-          <div class="form-group" id="sc-smarts-group" style="display:none">
-            <label data-i18n="sc.smarts"></label>
-            <input type="text" id="sc-smarts" placeholder="c1ccccc1">
+          <label for="sc-molecule" data-i18n="opt.molecule_path"></label>
+          <div class="file-input-combo">
+            <input type="text" id="sc-molecule" data-i18n-placeholder="sc.molecule_ph">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('sc-molecule', ['sdf','mol','mol2'])" data-i18n="common.browse">浏览</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('sc-molecule', '.sdf,.mol,.mol2')" data-i18n="common.upload">上传</button>
           </div>
         </div>
-        <details class="config-section">
-          <summary data-i18n="sc.weights_title"></summary>
-          <div class="config-body">
-            <div class="form-row">
-              <div class="form-group">
-                <label data-i18n="sc.qed_weight"></label>
-                <input type="number" id="sc-qed-w" value="1.0" step="0.1">
-              </div>
-              <div class="form-group">
-                <label data-i18n="sc.sa_weight"></label>
-                <input type="number" id="sc-sa-w" value="1.0" step="0.1">
-              </div>
-              <div class="form-group">
-                <label data-i18n="sc.diversity_weight"></label>
-                <input type="number" id="sc-div-w" value="0.5" step="0.1">
-              </div>
+        <div class="sc-placement-panel" id="sc-placement-panel">
+          <div class="form-row">
+            <div class="form-group">
+              <label for="sc-workflow" data-i18n="sc.workflow">采样流程 / Workflow</label>
+              <select id="sc-workflow"><option value="legacy" data-i18n="sc.workflow_legacy">现有流程 / Existing</option><option value="repaint" data-i18n="sc.workflow_repaint">最新 RePaint / Latest RePaint</option></select>
             </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label data-i18n="opt.min_qed"></label>
-                <input type="number" id="sc-min-qed" value="0.15" step="0.05">
-              </div>
-              <div class="form-group">
-                <label data-i18n="opt.min_sa"></label>
-                <input type="number" id="sc-min-sa" value="0.15" step="0.05">
-              </div>
-              <div class="form-group">
-                <label data-i18n="sc.max_tanimoto"></label>
-                <input type="number" id="sc-max-tanimoto" value="0.9" step="0.05">
-              </div>
+            <div class="form-group">
+              <label for="sc-seed" data-i18n="sc.seed">随机种子 / Seed</label>
+              <input id="sc-seed" type="number" min="0" max="4294967295" value="42">
             </div>
-            <div class="checkbox-group">
-              <label><input type="checkbox" id="sc-fix-pos" checked> <span data-i18n="sc.fix_pos"></span></label>
-              <label><input type="checkbox" id="sc-fix-type" checked> <span data-i18n="sc.fix_type"></span></label>
-              <label><input type="checkbox" id="sc-div-filter" checked> <span data-i18n="sc.div_filter"></span></label>
-              <label><input type="checkbox" id="sc-enable-refine" checked> <span data-i18n="sc.enable_refine"></span></label>
+            <div class="form-group">
+              <label for="sc-placement-mode" data-i18n="sc.placement">原子投放 / Atom placement</label>
+              <select id="sc-placement-mode"><option value="auto" data-i18n="sc.placement_auto">自动位点 / Automatic sites</option><option value="custom" data-i18n="sc.placement_custom">自定义区域 / Custom regions</option></select>
             </div>
           </div>
-        </details>
+          <p class="form-hint" id="sc-workflow-hint" data-i18n="sc.repaint_hint">RePaint：锁定骨架位置和类型，t=999 加噪，refine 最多 30 次；投放只决定扩散前位置。</p>
+          <div class="form-group" id="sc-atom-count-group">
+            <label for="sc-n-extra-fixed" data-i18n="sc.atom_count">新增原子数</label>
+            <input type="number" id="sc-n-extra-fixed" min="1" max="50" step="1" aria-describedby="sc-atom-count-hint" data-i18n-placeholder="sc.atom_count_placeholder">
+            <p class="form-hint" id="sc-atom-count-hint" data-i18n="sc.atom_count_hint">先填写 1–50 个新增原子再预览，生成时使用同一数量。</p>
+          </div>
+          <div class="sc-view-actions">
+            <button type="button" id="sc-load-context" class="btn btn-secondary" data-i18n="sc.load_3d">加载三维结构 / Load 3D</button>
+            <button type="button" id="sc-add-region" class="btn btn-secondary" disabled data-i18n="sc.add_region">添加投放区域 / Add region</button>
+            <button type="button" id="sc-preview-placement" class="btn btn-secondary" disabled data-i18n="sc.preview">预览初始投放 / Preview</button>
+          </div>
+          <div class="sc-placement-layout">
+            <div>
+              <div id="sc-placement-viewer" role="img" aria-label="蛋白、参考分子与投放区域三维视图" data-i18n-aria-label="sc.viewer_label"></div>
+              <p class="form-hint" data-i18n="sc.pick_hint">选择区域后点击骨架原子设锚点，点击蛋白或配体原子设中心参考，再编辑 XYZ（Å）精调。</p>
+            </div>
+            <div id="sc-regions" aria-label="投放区域列表" data-i18n-aria-label="sc.regions_label"></div>
+          </div>
+          <p id="sc-placement-message" role="status" aria-live="polite">请先加载结构。预览显示扩散前投放，后续扩散会优化新增原子。</p>
+        </div>
+        <div class="mode-toggle-bar">
+          <button type="button" class="mode-toggle-btn active" id="sc-basic-btn" onclick="toggleScAdvanced(false)" data-i18n="common.basic">基本</button>
+          <button type="button" class="mode-toggle-btn" id="sc-advanced-btn" onclick="toggleScAdvanced(true)" data-i18n="common.advanced">高级</button>
+        </div>
+        <div class="sc-advanced-only" style="display:none;grid-column: 1 / -1">
+          <div class="form-row">
+            <div class="form-group">
+              <label data-i18n="sc.source"></label>
+              <select id="sc-source" onchange="toggleScaffoldSource()">
+                <option value="auto_murcko" data-i18n="sc.source_murcko"></option>
+                <option value="auto_murcko_generic" data-i18n="sc.source_generic"></option>
+                <option value="atom_indices" data-i18n="sc.source_atoms"></option>
+                <option value="smarts" data-i18n="sc.source_smarts"></option>
+                <option value="none" data-i18n="sc.source_none"></option>
+              </select>
+            </div>
+            <div class="form-group" id="sc-atom-indices-group" style="display:none">
+              <label data-i18n="sc.atom_indices"></label>
+              <input type="text" id="sc-atom-indices" placeholder="0,1,2,5">
+            </div>
+            <div class="form-group" id="sc-smarts-group" style="display:none">
+              <label data-i18n="sc.smarts"></label>
+              <input type="text" id="sc-smarts" placeholder="c1ccccc1">
+            </div>
+          </div>
+        </div>
+        <div class="sc-advanced-only" style="display:none;grid-column: 1 / -1">
+          <details class="config-section" open>
+            <summary data-i18n="sc.weights_title"></summary>
+            <div class="config-body">
+              <div class="form-row">
+                <div class="form-group">
+                  <label data-i18n="sc.qed_weight"></label>
+                  <input type="number" id="sc-qed-w" value="1.0" step="0.1">
+                </div>
+                <div class="form-group">
+                  <label data-i18n="sc.sa_weight"></label>
+                  <input type="number" id="sc-sa-w" value="1.0" step="0.1">
+                </div>
+                <div class="form-group">
+                  <label data-i18n="sc.diversity_weight"></label>
+                  <input type="number" id="sc-div-w" value="0.5" step="0.1">
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label data-i18n="opt.min_qed"></label>
+                  <input type="number" id="sc-min-qed" value="0.15" step="0.05">
+                </div>
+                <div class="form-group">
+                  <label data-i18n="opt.min_sa"></label>
+                  <input type="number" id="sc-min-sa" value="0.15" step="0.05">
+                </div>
+                <div class="form-group">
+                  <label data-i18n="sc.max_tanimoto"></label>
+                  <input type="number" id="sc-max-tanimoto" value="0.9" step="0.05">
+                </div>
+              </div>
+              <div class="checkbox-group">
+                <label><input type="checkbox" id="sc-fix-pos" checked> <span data-i18n="sc.fix_pos"></span></label>
+                <label><input type="checkbox" id="sc-fix-type" checked> <span data-i18n="sc.fix_type"></span></label>
+                <label><input type="checkbox" id="sc-div-filter" checked> <span data-i18n="sc.div_filter"></span></label>
+                <label><input type="checkbox" id="sc-enable-refine" checked> <span data-i18n="sc.enable_refine"></span></label>
+              </div>
+            </div>
+          </details>
+        </div>
+        <div class="sc-advanced-only" style="display:none;grid-column: 1 / -1">
         <details class="config-section" id="sc-grow-section">
           <summary id="sc-grow-summary" data-i18n="sc.grow_title"></summary>
           <div class="config-body">
@@ -380,7 +687,7 @@
             <div class="form-row">
               <div class="form-group">
                 <label data-i18n="opt.start_t"></label>
-                <input type="number" id="sc-grow-start-t" value="450" min="1">
+                <input type="number" id="sc-grow-start-t" value="357" min="1">
               </div>
               <div class="form-group">
                 <label data-i18n="opt.stride"></label>
@@ -390,15 +697,15 @@
             <div class="form-row">
               <div class="form-group">
                 <label data-i18n="opt.step_size"></label>
-                <input type="number" id="sc-grow-step" value="0.33" step="0.01">
+                <input type="number" id="sc-grow-step" value="0.3262" step="0.0001">
               </div>
               <div class="form-group">
                 <label data-i18n="sc.lambda_a"></label>
-                <input type="number" id="sc-grow-lambda-a" value="40">
+                <input type="number" id="sc-grow-lambda-a" value="47">
               </div>
               <div class="form-group">
                 <label data-i18n="sc.lambda_b"></label>
-                <input type="number" id="sc-grow-lambda-b" value="5">
+                <input type="number" id="sc-grow-lambda-b" value="11">
               </div>
             </div>
             </div>
@@ -407,14 +714,10 @@
                 <label data-i18n="sc.n_extra_mode"></label>
                 <select id="sc-n-extra-mode">
                   <option value="prior_minus_scaffold" data-i18n="sc.n_extra_prior_minus"></option>
-                  <option value="pocket_prior" data-i18n="sc.n_extra_pocket"></option>
+                  <option value="pocket_prior" selected data-i18n="sc.n_extra_pocket"></option>
                   <option value="fixed" data-i18n="sc.n_extra_fixed"></option>
                   <option value="range" data-i18n="sc.n_extra_range"></option>
                 </select>
-              </div>
-              <div class="form-group">
-                <label data-i18n="sc.n_extra_fixed"></label>
-                <input type="number" id="sc-n-extra-fixed" value="8" min="1">
               </div>
               <div class="form-group">
                 <label data-i18n="sc.n_extra_min"></label>
@@ -490,7 +793,7 @@
               <div class="form-row">
                 <div class="form-group" style="flex:1">
                   <button type="button" class="btn-secondary" id="sc-adaptive-preview-btn" data-i18n="sc.adaptive_preview" onclick="previewAdaptiveGates()"></button>
-                  <pre id="sc-adaptive-preview" style="font-size:12px;white-space:pre-wrap;margin-top:6px"></pre>
+                  <pre id="sc-adaptive-preview" class="sc-preview-pre"></pre>
                 </div>
               </div>
             </div>
@@ -566,6 +869,7 @@
             </div>
           </div>
         </details>
+        </div>
         <div class="form-group">
           <label data-i18n="gen.auto"></label>
           <div class="checkbox-group">
@@ -575,9 +879,10 @@
           </div>
         </div>
         <div class="form-actions">
-          <button type="submit" class="btn btn-primary" data-i18n="opt.start"></button>
+          <button type="submit" class="btn btn-primary js-needs-gen" data-i18n="opt.start"></button>
           <button type="button" class="btn btn-danger" id="sc-cancel-btn" disabled data-i18n="gen.cancel"></button>
         </div>
+        <p class="quota-hint" data-quota="generate"></p>
       </form>
     </div>
     <div class="card">
@@ -586,12 +891,11 @@
       <div class="progress-bar-container" id="sc-progress-bar" style="display:none">
         <div class="progress-bar" id="sc-progress-fill"></div>
       </div>
-      <pre id="sc-log" class="log-output"></pre>
+      <pre id="sc-log" class="log-output" data-admin-only hidden></pre>
     </div>
-  </section>
+    </div>
 
-  <!-- Scaffold Cascade (Innovation) -->
-  <section id="tab-cascade" class="tab-panel">
+    <div id="optfunc-cascade" style="display:none">
     <div class="card">
       <h3 data-i18n="cascade.title"></h3>
       <p class="form-hint" data-i18n="cascade.hint"></p>
@@ -601,7 +905,7 @@
             <label data-i18n="opt.dataid"></label>
             <input type="number" id="cascade-dataid" value="0" min="0">
           </div>
-          <div class="form-group">
+          <div class="form-group" data-admin-only hidden>
             <label>GPU ID</label>
             <input type="number" id="cascade-gpu" data-i18n-placeholder="gen.gpu_ph">
           </div>
@@ -630,9 +934,10 @@
           </div>
         </div>
         <div class="form-actions">
-          <button type="submit" class="btn btn-primary" data-i18n="cascade.start"></button>
+          <button type="submit" class="btn btn-primary js-needs-gen" data-i18n="cascade.start"></button>
           <button type="button" class="btn btn-danger" id="cascade-cancel-btn" disabled data-i18n="gen.cancel"></button>
         </div>
+        <p class="quota-hint" data-quota="generate"></p>
       </form>
     </div>
     <div class="card">
@@ -641,7 +946,8 @@
       <div class="progress-bar-container" id="cascade-progress-bar" style="display:none">
         <div class="progress-bar" id="cascade-progress-fill"></div>
       </div>
-      <pre id="cascade-log" class="log-output"></pre>
+      <pre id="cascade-log" class="log-output" data-admin-only hidden></pre>
+    </div>
     </div>
   </section>
 
@@ -653,14 +959,16 @@
         <form id="eval-form" class="form-grid">
           <div class="form-group">
             <label data-i18n="eval.pt_path"></label>
-            <div class="form-inline">
-              <input type="text" id="eval-pt" placeholder="/data/.../result_0_xxx.pt" style="flex:1">
-              <button type="button" class="btn btn-secondary btn-sm" onclick="browseFiles('outputs','#eval-pt')">浏览</button>
+            <div class="file-input-combo">
+              <input type="text" id="eval-pt" placeholder="/data/.../result_0_xxx.pt">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('eval-pt', ['pt'])" data-i18n="common.browse">浏览</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('eval-pt', '.pt')" data-i18n="common.upload">上传</button>
             </div>
+            <p class="form-hint" data-i18n="eval.pt_upload_hint"></p>
           </div>
           <div class="form-row">
             <div class="form-group"><label>max_samples</label><input type="number" id="eval-max-samples" value="5" min="1"></div>
-            <div class="form-group"><label>vina_timeout (秒)</label><input type="number" id="eval-vina-timeout" value="20" min="5"></div>
+            <div class="form-group"><label data-i18n="gen.vina_timeout">vina_timeout (秒)</label><input type="number" id="eval-vina-timeout" value="20" min="5"></div>
           </div>
           <div class="form-group">
             <label data-i18n="eval.prot_root"></label>
@@ -675,8 +983,9 @@
             </div>
           </div>
           <div class="form-actions">
-            <button type="submit" class="btn btn-primary" data-i18n="eval.start"></button>
+            <button type="submit" class="btn btn-primary js-needs-eval" data-i18n="eval.start"></button>
           </div>
+          <p class="quota-hint" data-quota="eval"></p>
         </form>
       </div>
       <div class="card">
@@ -684,7 +993,11 @@
         <form id="extract-form" class="form-grid">
           <div class="form-group">
             <label data-i18n="eval.pt_path"></label>
-            <input type="text" id="extract-pt">
+            <div class="file-input-combo">
+              <input type="text" id="extract-pt">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('extract-pt', ['pt'])" data-i18n="common.browse">浏览</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('extract-pt', '.pt')" data-i18n="common.upload">上传</button>
+            </div>
           </div>
           <div class="form-group">
             <label data-i18n="eval.prot_root"></label>
@@ -702,7 +1015,7 @@
     <div class="card">
       <h3 data-i18n="eval.status_title"></h3>
       <div id="eval-status" data-i18n-placeholder="eval.idle"></div>
-      <pre id="eval-log" class="log-output"></pre>
+      <pre id="eval-log" class="log-output" data-admin-only hidden></pre>
     </div>
   </section>
 
@@ -721,20 +1034,32 @@
         <div class="form-row">
           <div class="form-group">
             <label data-i18n="pe.protein" style="color:var(--danger);font-weight:600"></label>
-            <input type="text" id="pe-protein" placeholder="/path/to/protein.pdb" required>
+            <div class="file-input-combo">
+              <input type="text" id="pe-protein" placeholder="/path/to/protein.pdb" required>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('pe-protein', ['pdb'])" data-i18n="common.browse">浏览</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('pe-protein', '.pdb')" data-i18n="common.upload">上传</button>
+            </div>
           </div>
           <div class="form-group">
             <label data-i18n="pe.ligand" style="color:var(--danger);font-weight:600"></label>
-            <input type="text" id="pe-ligand" placeholder="/path/to/ligand.sdf" required>
+            <div class="file-input-combo">
+              <input type="text" id="pe-ligand" placeholder="/path/to/ligand.sdf" required>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('pe-ligand', ['sdf','mol','mol2'])" data-i18n="common.browse">浏览</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('pe-ligand', '.sdf,.mol,.mol2')" data-i18n="common.upload">上传</button>
+            </div>
           </div>
         </div>
         <div class="form-group" id="pe-pt-group">
           <label data-i18n="pe.pt_path"></label>
-          <input type="text" id="pe-pt" placeholder="/data/.../result_0_xxx.pt">
+          <div class="file-input-combo">
+            <input type="text" id="pe-pt" placeholder="/data/.../result_0_xxx.pt">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="browseFile('pe-pt', ['pt'])" data-i18n="common.browse">浏览</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="uploadAndFill('pe-pt', '.pt')" data-i18n="common.upload">上传</button>
+          </div>
         </div>
         <div id="pe-gen-options" style="display:none">
           <div class="form-row">
-            <div class="form-group">
+            <div class="form-group" data-admin-only hidden>
               <label>GPU ID</label>
               <input type="number" id="pe-gpu" data-i18n-placeholder="gen.gpu_ph">
             </div>
@@ -749,9 +1074,10 @@
           </div>
         </div>
         <div class="form-actions">
-          <button type="submit" class="btn btn-primary" data-i18n="pe.start"></button>
+          <button type="submit" class="btn btn-primary js-needs-eval" data-i18n="pe.start"></button>
           <button type="button" class="btn btn-danger" id="pe-cancel-btn" disabled data-i18n="gen.cancel"></button>
         </div>
+        <p class="quota-hint" data-quota="eval"></p>
       </form>
     </div>
     <div class="card">
@@ -760,7 +1086,7 @@
       <div class="progress-bar-container" id="pe-progress-bar" style="display:none">
         <div class="progress-bar" id="pe-progress-fill"></div>
       </div>
-      <pre id="pe-log" class="log-output" style="max-height:200px"></pre>
+      <pre id="pe-log" class="log-output" data-admin-only hidden style="max-height:200px"></pre>
     </div>
     <div class="card">
       <h3 data-i18n="pe.scores"></h3>
@@ -792,6 +1118,9 @@
           <option value="sa_desc" data-i18n="mol.sort_sa"></option>
         </select>
         <button type="submit" class="btn btn-primary" data-i18n="mol.search"></button>
+        <button type="button" class="btn btn-secondary" id="mol-dl-xlsx" data-i18n="mol.dl_xlsx"></button>
+        <button type="button" class="btn btn-secondary" id="mol-dl-csv" data-i18n="mol.dl_csv"></button>
+        <button type="button" class="btn btn-secondary" id="mol-dl-zip" data-i18n="mol.dl_zip"></button>
       </form>
       <div id="mol-count" class="result-count"></div>
       <div class="table-container">
@@ -803,7 +1132,7 @@
               <th data-i18n="mol.th_score"></th><th>Lipinski</th>
               <th data-i18n="mol.th_lilly"></th><th data-i18n="mol.th_demerit"></th>
               <th data-i18n="mol.th_energy"></th><th data-i18n="mol.th_stable"></th><th>Tanimoto</th>
-              <th>SDF</th>
+              <th>SDF</th><th data-i18n="mol.th_redock"></th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -820,10 +1149,19 @@
         <select id="hist-action">
           <option value="" data-i18n="hist.all"></option>
           <option value="start_generation" data-i18n="hist.act_gen"></option>
+          <option value="start_batch_generation" data-i18n="batch.title">批量生成</option>
+          <option value="start_custom_generation" data-i18n="gen.custom_title">自定义口袋生成</option>
           <option value="start_evaluation" data-i18n="hist.act_eval"></option>
           <option value="start_extraction" data-i18n="hist.act_ext"></option>
+          <option value="start_optimization" data-i18n="opt.title">分子优化</option>
+          <option value="start_medchem" data-i18n="mc.title">药化检查与修复</option>
+          <option value="start_scaffold" data-i18n="nav.scaffold">骨架生成</option>
+          <option value="start_scaffold_cascade" data-i18n="cascade.title">骨架级联</option>
+          <option value="start_pocket_eval" data-i18n="nav.pocket_eval">口袋评估</option>
           <option value="generation_completed" data-i18n="hist.act_gen_done"></option>
           <option value="generation_failed" data-i18n="hist.act_gen_fail"></option>
+          <option value="cancel_job" data-i18n="gen.cancel">取消任务</option>
+          <option value="rerun" data-i18n="common.rerun">重跑任务</option>
           <option value="config_updated" data-i18n="hist.act_cfg"></option>
         </select>
         <button type="submit" class="btn btn-primary" data-i18n="common.refresh"></button>
@@ -847,6 +1185,8 @@
           <option value="generate_batch">Batch</option>
           <option value="generate_custom">Custom</option>
           <option value="optimization">Optimization</option>
+          <option value="medchem" data-i18n="mc.title">药化检查与修复</option>
+          <option value="medchem_dock" data-i18n="mc.vina_dock">额外 Vina 对接</option>
           <option value="scaffold_grow">Scaffold Grow</option>
           <option value="scaffold_evolve">Scaffold Evolve</option>
           <option value="scaffold_dynamic_locked">Scaffold Dynamic Locked</option>
@@ -864,13 +1204,22 @@
           <option value="failed" data-i18n="hist.st_failed"></option>
         </select>
         <button type="submit" class="btn btn-primary" data-i18n="common.refresh"></button>
-        <button type="button" class="btn btn-secondary" id="compare-runs-btn">对比选中</button>
+        <button type="button" class="btn btn-secondary" id="compare-runs-btn" data-i18n="hist.compare">对比选中</button>
       </form>
       <div id="compare-result"></div>
       <div class="table-container">
         <table id="runs-table">
           <thead>
-            <tr><th>ID</th><th data-i18n="hist.th_type"></th><th data-i18n="hist.th_status"></th><th data-i18n="hist.th_created"></th><th data-i18n="hist.th_finished"></th><th data-i18n="hist.th_progress"></th><th>操作</th></tr>
+            <tr>
+              <th>ID</th>
+              <th class="runs-owner-col" style="display:none">Owner</th>
+              <th data-i18n="hist.th_type"></th>
+              <th data-i18n="hist.th_status"></th>
+              <th data-i18n="hist.th_created"></th>
+              <th data-i18n="hist.th_finished"></th>
+              <th data-i18n="hist.th_progress"></th>
+              <th data-i18n="common.actions">操作</th>
+            </tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -879,14 +1228,14 @@
   </section>
 
   <!-- Config -->
-  <section id="tab-config" class="tab-panel">
+  <section id="tab-config" class="tab-panel" data-admin-only hidden>
     <div class="grid-2">
       <div class="card">
         <h3 data-i18n="cfg.title"></h3>
-        <textarea id="cfg-yaml" class="code-editor" rows="25"></textarea>
+        <textarea readonly id="cfg-yaml" class="code-editor" rows="25"></textarea>
         <div class="form-actions">
           <button class="btn btn-secondary" id="cfg-load-btn" data-i18n="cfg.load"></button>
-          <button class="btn btn-primary" id="cfg-save-btn" data-i18n="cfg.save"></button>
+
         </div>
         <div id="cfg-status"></div>
       </div>
@@ -895,8 +1244,6 @@
         <pre id="cfg-runtime" class="code-block"></pre>
         <h3 data-i18n="cfg.gpu"></h3>
         <div id="cfg-gpu"></div>
-        <h3 style="margin-top:1rem">用户标识</h3>
-        <input type="text" id="cfg-user" placeholder="用于操作审计记录" class="form-group" style="width:100%;padding:0.5rem">
       </div>
     </div>
   </section>
@@ -916,6 +1263,70 @@
   </div>
 </div>
 
-<script src="/static/js/app.js"></script>
+<!-- 3D Molecule Viewer Modal -->
+<div id="mol3d-modal" class="modal" style="display:none">
+  <div class="modal-content modal-content-wide">
+    <div class="modal-header">
+      <h3 id="mol3d-title" data-i18n="common.molecule_view">3D 分子查看</h3>
+      <button class="modal-close" onclick="closeMol3D()">&times;</button>
+    </div>
+    <div id="mol3d-viewer" class="mol3d-viewer"></div>
+    <div id="mol3d-info" class="mol3d-info"></div>
+  </div>
+</div>
+
+<!-- File Browser Modal -->
+<div id="file-browser-modal" class="modal" style="display:none">
+  <div class="modal-content modal-content-wide">
+    <div class="modal-header">
+      <h3 id="fb-title" data-i18n="common.file_browser">文件浏览</h3>
+      <button class="modal-close" onclick="closeFileBrowser()">&times;</button>
+    </div>
+    <div class="fb-body">
+      <div class="fb-toolbar">
+        <button type="button" class="btn btn-secondary btn-sm" id="fb-up-btn" data-i18n="common.parent">&uarr; 上级</button>
+        <input type="text" id="fb-path" readonly class="fb-path-input">
+        <input type="text" id="fb-search" placeholder="搜索文件名..." data-i18n-placeholder="common.file_search" class="fb-search-input">
+      </div>
+      <div id="fb-list" class="fb-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Result Summary Modal -->
+<div id="result-summary-modal" class="modal" style="display:none">
+  <div class="modal-content modal-content-wide">
+    <div class="modal-header">
+      <h3 id="rs-title" data-i18n="common.result_summary">运行结果摘要</h3>
+      <button class="modal-close" onclick="closeResultSummary()">&times;</button>
+    </div>
+    <div id="rs-body" class="rs-body"></div>
+  </div>
+</div>
+
+<script src="/static/js/scaffold-canvas.js?v=20261010-ribbon"></script>
+<script src="/static/js/molecular-viewer.js?v=20261010-ribbon"></script>
+<script src="/static/js/generation-viewer.js?v=20261010-ribbon"></script>
+<script src="/static/js/scaffold-placement.js?v=20261010-ribbon"></script>
+<!-- Ordered classic scripts preserve Alpine and inline-handler globals. -->
+<script src="/static/js/workbench/runtime.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/i18n.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/http-and-account.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/display.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/medchem.js?v=20261014-medchem"></script>
+<script src="/static/js/workbench/generation.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/evaluation.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/molecules.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/history.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/configuration.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/pocket-evaluation.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/optimization.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/scaffold.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/cascade.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/jobs.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/files.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/results.js?v=20261013-modules"></script>
+<script src="/static/js/workbench/dashboard.js?v=20261013-modules"></script>
+<script src="/static/js/app.js?v=20261013-modules"></script>
 </body>
 </html>

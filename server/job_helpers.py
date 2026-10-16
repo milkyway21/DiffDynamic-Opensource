@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from typing import Callable, Dict, List, Optional
 
 import yaml
@@ -21,7 +22,7 @@ def release_gpu_safe(allocator, gpu_id: int):
 
 def cleanup_temp_config(job_id: str):
     cfg = get_config()
-    path = os.path.join(cfg.diffdynamic_root, "configs", f"run_{job_id}.yml")
+    path = os.path.join(cfg.diffdynamic_root, ".cache", "web_job_configs", f"run_{job_id}.yml")
     try:
         if os.path.isfile(path):
             os.remove(path)
@@ -45,12 +46,25 @@ def write_patched_config(base_config_path: str, patches: dict, job_id: str) -> s
         base = yaml.safe_load(f) or {}
     deep_merge(base, patches)
     cfg = get_config()
-    out_dir = os.path.join(cfg.diffdynamic_root, "configs")
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.join(cfg.diffdynamic_root, ".cache", "web_job_configs")
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
     out_path = os.path.join(out_dir, f"run_{job_id}.yml")
     with open(out_path, "w") as f:
-        yaml.dump(base, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump(base, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     return out_path
+
+
+def dynamic_web_patches(batch_size=None):
+    """Use the existing fast parameters regardless of the research YAML mode."""
+    patches = {"sample": {
+        "mode": "dynamic",
+        "dynamic": {"skip_refine": False, "prudent": {"enable": False}},
+        "scaffold": {"enable": False},
+        "optimization": {"enable": False},
+    }}
+    if batch_size:
+        patches["sample"]["dynamic"]["large_step"] = {"batch_size": int(batch_size)}
+    return patches
 
 
 def is_important_log(line: str) -> bool:
@@ -89,8 +103,14 @@ def run_subprocess(
     timeout: Optional[int] = None,
     on_line: Optional[Callable[[str], None]] = None,
     sync_every: int = 20,
+    log_flush_seconds: float = 30.0,
 ) -> int:
-    """Run subprocess, stream stdout, enforce timeout. Returns exit code."""
+    """Run subprocess, stream stdout, enforce timeout. Returns exit code.
+
+    Log persistence is throttled to one DB write per ``log_flush_seconds``
+    (plus a final write on exit) — the in-memory ``rec.log_lines`` stream is
+    unaffected. ``sync_every`` is kept for API compatibility.
+    """
     cfg = get_config()
     if timeout is None:
         timeout = cfg.job_timeout
@@ -100,7 +120,6 @@ def run_subprocess(
         text=True, env=env, cwd=cwd, bufsize=1,
     )
 
-    sync_counter = 0
     timed_out = [False]
 
     def _killer():
@@ -117,18 +136,26 @@ def run_subprocess(
     timer.daemon = True
     timer.start()
 
+    last_flush = time.monotonic()
     try:
         for line in rec.process.stdout:
             line = line.rstrip()
             if on_line:
                 on_line(line)
-            sync_counter += 1
-            if sync_counter % sync_every == 0:
+            now = time.monotonic()
+            if now - last_flush >= log_flush_seconds:
+                last_flush = now
                 update_run(rec.run_id, progress=rec.progress,
                            log_output="\n".join(rec.log_lines[-500:]))
         rec.process.wait()
     finally:
         timer.cancel()
+        # Final flush so a crash right after the loop still persists the tail
+        try:
+            update_run(rec.run_id, progress=rec.progress,
+                       log_output="\n".join(rec.log_lines[-500:]))
+        except Exception:
+            pass
 
     if timed_out[0]:
         rec.error = f"Job timed out after {timeout}s"

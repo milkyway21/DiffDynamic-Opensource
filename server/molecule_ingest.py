@@ -5,6 +5,8 @@ DB stores the SDF path for each molecule. Duplicates (same run_id + smiles) are 
 """
 
 import glob
+import json
+import logging
 import os
 import re
 import shutil
@@ -13,11 +15,88 @@ from typing import Optional
 
 import torch
 
-from server.database import add_molecules
+from server.database import add_molecules, get_run
+
+logger = logging.getLogger(__name__)
 
 
 OUTPUTS_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs")
 SDF_STORE = os.path.join(OUTPUTS_ROOT, "sdf_store")
+
+
+def _link_or_copy(src: str, dst: str):
+    """Hardlink when possible (same filesystem); fall back to copy."""
+    try:
+        os.link(src, dst)
+        return
+    except OSError:
+        pass
+    shutil.copy2(src, dst)
+
+
+def _sdf_store_for_run(run_id: int) -> str:
+    """Prefer per-owner sdf_store under outputs/users/{owner}/sdf_store."""
+    try:
+        from server.auth import normalize_owner, user_sdf_store
+        r = get_run(run_id)
+        owner = normalize_owner(getattr(r, "owner", None) if r else None)
+        return user_sdf_store(OUTPUTS_ROOT, owner)
+    except Exception:
+        return SDF_STORE
+
+
+def _trusted_output_roots(owner: Optional[str] = None) -> list:
+    """Output roots whose .pt files are produced by this repo's own jobs.
+
+    When the run owner is known, trust only that user's tree
+    (outputs/users/{owner}/); the server-wide roots remain as fallback for
+    flows without an owner. This keeps one user's outputs from trusting
+    another user's tree during ingestion."""
+    if owner:
+        try:
+            from server.auth import user_output_root
+            root = user_output_root(OUTPUTS_ROOT, str(owner))
+            if os.path.isdir(root):
+                return [os.path.realpath(root)]
+        except Exception:
+            pass
+    cfg_output_root = ""
+    try:
+        from server.config import get_config
+        cfg_output_root = get_config().output_root
+    except Exception:
+        pass
+    roots = [cfg_output_root, OUTPUTS_ROOT]
+    return [os.path.realpath(r) for r in roots if r and os.path.isdir(r)]
+
+
+def _load_eval_pt(pt_path: str, owner: Optional[str] = None):
+    """Load an eval_results .pt written by this repo's evaluator.
+
+    These files legitimately embed RDKit Mol objects, so strict
+    ``weights_only=True`` cannot unpickle them. The untrusted
+    ``weights_only=False`` fallback is allowed only for files under
+    trusted output roots (produced by our own jobs); anything else —
+    e.g. uploads or data dirs — must load strictly or not at all.
+    """
+    real = os.path.realpath(pt_path)
+    trusted = any(os.path.commonpath([real, root]) == root
+                  for root in _trusted_output_roots(owner))
+    if not trusted:
+        from server.safe_pt import load_untrusted_pt
+        return load_untrusted_pt(real, owner)
+    try:
+        return torch.load(pt_path, map_location="cpu", weights_only=True)
+    except Exception:
+        real = os.path.realpath(pt_path)
+        for root in _trusted_output_roots(owner):
+            try:
+                if os.path.commonpath([real, root]) == root:
+                    logger.warning("weights_only fallback for trusted .pt: %s", pt_path)
+                    return torch.load(pt_path, map_location="cpu", weights_only=False)
+            except ValueError:
+                continue
+        raise
 
 
 def _find_eval_dir(pt_path: str) -> str:
@@ -41,20 +120,120 @@ def _find_eval_dir(pt_path: str) -> str:
     return parent
 
 
-def ingest_molecules_from_eval(run_id: int, eval_dir: str, pocket_name: Optional[str] = None):
-    """Parse eval_results_*.pt and SDF files, insert molecules into DB (deduped)."""
+def _eval_dirs_to_scan(eval_dir: str) -> list:
+    """Resolve extract/eval output roots to directories that contain eval_results_*.pt.
+
+    Extraction writes ``extract_<job>/eval_<ts>_.../eval_results_*.pt``; evaluation
+    may write the .pt directly in ``eval_<job>/``.
+    """
     if eval_dir.endswith(".pt"):
         eval_dir = _find_eval_dir(eval_dir)
+    if not eval_dir or not os.path.isdir(eval_dir):
+        return []
+    found = []
+
+    def _consider(d: str):
+        if glob.glob(os.path.join(d, "eval_results_*final*.pt")) or glob.glob(
+            os.path.join(d, "eval_results_*.pt")
+        ):
+            found.append(d)
+
+    _consider(eval_dir)
+    try:
+        for name in sorted(os.listdir(eval_dir)):
+            sub = os.path.join(eval_dir, name)
+            if os.path.isdir(sub) and name.startswith("eval_"):
+                _consider(sub)
+    except OSError:
+        pass
+    out, seen = [], set()
+    for d in found:
+        real = os.path.realpath(d)
+        if real not in seen:
+            seen.add(real)
+            out.append(d)
+    return out
+
+
+def _usable_smiles(smiles) -> Optional[str]:
+    if smiles is None:
+        return None
+    text = str(smiles).strip()
+    if not text or text.lower() in ("none", "nan", "n/a", "null"):
+        return None
+    return text
+
+
+def _collect_sdf_files(eval_dir: str) -> list:
+    files = []
+    for name in ("reconstructed_molecules", "original_molecules", "optimized_molecules"):
+        folder = os.path.join(eval_dir, name)
+        if os.path.isdir(folder):
+            files.extend(sorted(glob.glob(os.path.join(folder, "*.sdf"))))
+    return files
+
+
+def _read_sdf_props(path: str) -> dict:
+    """Read SMILES / Molecule_Index written by the evaluator (text, no RDKit required)."""
+    props = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        text = ""
+    # RDKit SDWriter: `>  <SMILES>  (1) \nvalue`  — the `(1)` count is optional.
+    for match in re.finditer(r">\s*<([^>]+)>\s*(?:\([^)]*\))?\s*\n([^\n]*)", text):
+        props[match.group(1).strip()] = match.group(2).strip()
+    idx = None
+    for key in ("Molecule_Index", "molecule_index", "mol_idx"):
+        if key in props:
+            try:
+                idx = int(float(props[key]))
+            except (TypeError, ValueError):
+                idx = None
+            break
+    smiles = _usable_smiles(props.get("SMILES") or props.get("smiles"))
+    mol_id = props.get("Molecule_ID") or props.get("molecule_id") or os.path.splitext(os.path.basename(path))[0]
+    return {"path": path, "index": idx, "smiles": smiles or "", "molecule_id": mol_id}
+
+
+def match_sdf_for_molecule(mol_idx, smiles: Optional[str], sdf_records: list, used_paths: set) -> Optional[str]:
+    """Pair a result row to an SDF by Molecule_Index, then SMILES. Never glob[idx]."""
+    unused = [rec for rec in sdf_records if rec["path"] not in used_paths]
+    if mol_idx is not None:
+        for rec in unused:
+            if rec.get("index") == mol_idx:
+                return rec["path"]
+    want = _usable_smiles(smiles)
+    if want:
+        for rec in unused:
+            if _usable_smiles(rec.get("smiles")) == want:
+                return rec["path"]
+    return None
+
+
+def ingest_molecules_from_eval(run_id: int, eval_dir: str, pocket_name: Optional[str] = None):
+    """Parse eval_results_*.pt and SDF files, insert molecules into DB (deduped)."""
+    owner = None
+    try:
+        r = get_run(run_id)
+        owner = getattr(r, "owner", None) or None
+    except Exception:
+        owner = None
+    for scan_dir in _eval_dirs_to_scan(eval_dir):
+        _ingest_one_eval_dir(run_id, scan_dir, pocket_name=pocket_name, owner=owner)
+
+
+def _ingest_one_eval_dir(run_id: int, eval_dir: str, pocket_name: Optional[str] = None, owner: Optional[str] = None):
     eval_pts = sorted(glob.glob(os.path.join(eval_dir, "eval_results_*final*.pt")))
     if not eval_pts:
         eval_pts = sorted(glob.glob(os.path.join(eval_dir, "eval_results_*.pt")))
 
+    sdf_records = [_read_sdf_props(path) for path in _collect_sdf_files(eval_dir)]
+
     for pt_path in eval_pts:
         try:
-            try:
-                data = torch.load(pt_path, map_location="cpu", weights_only=True)
-            except Exception:
-                data = torch.load(pt_path, map_location="cpu")
+            data = _load_eval_pt(pt_path, owner=owner)
         except Exception:
             continue
         if not isinstance(data, dict):
@@ -68,18 +247,25 @@ def ingest_molecules_from_eval(run_id: int, eval_dir: str, pocket_name: Optional
         data_id = _extract_data_id(pt_path)
         gen_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        sdf_dir = os.path.join(eval_dir, "reconstructed_molecules")
-        sdf_files = sorted(glob.glob(os.path.join(sdf_dir, "*.sdf")))
-
-        pocket_store = os.path.join(SDF_STORE, pocket_id)
+        pocket_store = os.path.join(_sdf_store_for_run(run_id), pocket_id or "unknown")
         os.makedirs(pocket_store, exist_ok=True)
 
+        used_paths = set()
         mol_list = []
         for idx, mol in enumerate(mol_results):
             if not isinstance(mol, dict):
                 continue
 
-            smiles = mol.get("smiles", "")
+            smiles = _usable_smiles(mol.get("smiles"))
+            if not smiles:
+                continue
+
+            mol_idx = mol.get("mol_idx", mol.get("molecule_index", idx))
+            try:
+                mol_idx = int(mol_idx)
+            except (TypeError, ValueError):
+                mol_idx = idx
+
             vina = _get_vina_score(mol)
             chem = mol.get("chem") or {}
             qed = _safe_float(chem.get("qed"))
@@ -109,19 +295,21 @@ def ingest_molecules_from_eval(run_id: int, eval_dir: str, pocket_name: Optional
             mol_name = f"{pocket_id}_{gen_time}_{vina_str}"
 
             sdf_path = None
-            if idx < len(sdf_files):
-                src_sdf = sdf_files[idx]
-                dst_sdf = os.path.join(pocket_store, f"{mol_name}_{idx}.sdf")
+            src_sdf = match_sdf_for_molecule(mol_idx, smiles, sdf_records, used_paths)
+            if src_sdf:
+                used_paths.add(src_sdf)
+                dst_sdf = os.path.join(pocket_store, f"{mol_name}_{mol_idx}.sdf")
                 try:
-                    shutil.copy2(src_sdf, dst_sdf)
+                    if not os.path.exists(dst_sdf):
+                        _link_or_copy(src_sdf, dst_sdf)
                     sdf_path = dst_sdf
                 except Exception:
-                    pass
+                    sdf_path = src_sdf if os.path.isfile(src_sdf) else None
 
             mol_list.append({
                 "data_id": data_id,
                 "pocket_id": pocket_id,
-                "molecule_index": idx,
+                "molecule_index": mol_idx,
                 "smiles": smiles,
                 "vina_score": vina,
                 "qed": qed,
@@ -196,3 +384,55 @@ def _extract_pocket_id(pt_path: str, data: dict) -> str:
 def _extract_data_id(pt_path: str) -> int:
     m = re.search(r"eval_(\d+)_", os.path.basename(pt_path))
     return int(m.group(1)) if m else 0
+
+
+def repair_molecule_catalog() -> dict:
+    """Delete empty-SMILES rows and re-link recent per-user extract dirs. Never drops the DB."""
+    from server.database import Molecule, Run, db_session
+
+    users_marker = f"{os.sep}outputs{os.sep}users{os.sep}"
+    deleted = 0
+    relinked_runs = []
+    with db_session() as session:
+        deleted = session.query(Molecule).filter(
+            (Molecule.smiles == None) | (Molecule.smiles == "")  # noqa: E711
+        ).delete(synchronize_session=False)
+
+        recent = (
+            session.query(Run)
+            .filter(Run.run_type.in_(["extract", "evaluate", "generate_dynamic", "generate_prudent"]))
+            .order_by(Run.id.desc())
+            .limit(40)
+            .all()
+        )
+        run_rows = [(r.id, r.output_path, r.parameters) for r in recent]
+
+    for run_id, output_path, parameters in run_rows:
+        targets = []
+        if output_path:
+            targets.append(output_path)
+        params = {}
+        if parameters:
+            try:
+                params = json.loads(parameters) if isinstance(parameters, str) else dict(parameters)
+            except Exception:
+                params = {}
+        for key in ("result_path", "eval_dir"):
+            val = params.get(key)
+            if val:
+                targets.append(val)
+        chosen = None
+        for target in targets:
+            if not target or users_marker not in os.path.realpath(target):
+                continue
+            if os.path.isdir(target) and _eval_dirs_to_scan(target):
+                chosen = target
+                break
+        if not chosen:
+            continue
+        try:
+            ingest_molecules_from_eval(run_id, chosen)
+            relinked_runs.append(run_id)
+        except Exception:
+            logger.warning("repair ingest failed run_id=%s target=%s", run_id, chosen, exc_info=True)
+    return {"deleted_empty_smiles": deleted, "relinked_runs": sorted(set(relinked_runs))}

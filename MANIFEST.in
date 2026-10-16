@@ -1,0 +1,40 @@
+include setup.py pyproject.toml MANIFEST.in
+include README*.md LICENSE* THIRD_PARTY_NOTICES.md requirements*.txt
+include weights-manifest.json publish-manifest.json start_server.sh
+include _diffdynamic_bootstrap.py
+include batch_sampleandeval_parallel.py evaluate_pt_with_correct_reconstruct.py
+include evaluate_pocket_quality.py extract_pt_to_sdf_excel.py scaffold_cascade_pipeline.py
+include run_prudent_generations.py refine_saved_pt_baseline_then_eval.py
+include split_and_eval_parallel.py show_sampling_steps.py
+recursive-include src *.py *.gz
+recursive-include datasets *.py
+recursive-include models *.py
+recursive-include utils *.py
+recursive-include server *.py
+include server/server_config.example.json server/pt-loader-requirements.txt
+include scripts/__init__.py scripts/sample_diffusion.py scripts/sample_for_pocket.py
+include scripts/evaluate_diffusion.py scripts/check_model_type.py scripts/setup_pt_loader.sh
+recursive-include paper_plot_scripts *.py
+include ui/__init__.py
+recursive-include ui/templates *
+recursive-include ui/static *
+recursive-include ui/content *
+include configs/sampling.yml configs/benchmark_reference.yml
+recursive-include configs/sampling_strategies *.yml
+recursive-include rdkit-structure-repair/src *.py *.yaml
+recursive-include rdkit-structure-repair/configs *.yaml *.yml
+include rdkit-structure-repair/README.md rdkit-structure-repair/LICENSE*
+exclude utils/gspt1_class_setup.py utils/gspt1_interface_setup.py utils/ikzf2_scaffold_setup.py
+prune local
+prune outputs
+prune uploads
+prune data
+prune pretrained_models
+prune runs
+prune analysis
+prune .cache
+prune .git
+prune ui/tests
+exclude server/server_config.json server/.internal_api_key
+exclude diffdynamic.db diffdynamic.db-*
+global-exclude *.py[cod] __pycache__ .DS_Store .internal_api_key

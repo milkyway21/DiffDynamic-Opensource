@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "source_commit": "b296a653621374522242c329a520bc140352a188",
+  "weights": [
+    {
+      "name": "pretrained_diffusion.pt",
+      "path": "pretrained_models/pretrained_diffusion.pt",
+      "url": "https://raw.githubusercontent.com/milkyway21/DiffDynamic-Opensource/b296a653621374522242c329a520bc140352a188/pretrained_models/pretrained_diffusion.pt",
+      "sha256": "d08cf553d71d7706fdc77f6dd9b306f2ea7318d5c74e5e0fbe454d372f94c12c",
+      "required": true,
+      "remote_verified": true,
+      "size_bytes": 33092718
+    },
+    {
+      "name": "pretrained_GlintDM.pt",
+      "path": "pretrained_models/pretrained_GlintDM.pt",
+      "url": "https://raw.githubusercontent.com/milkyway21/DiffDynamic-Opensource/b296a653621374522242c329a520bc140352a188/pretrained_models/pretrained_GlintDM.pt",
+      "sha256": "ac328ed9cd1b2284b8dc258b3a87ca6b752f29f9aa650b6e9ce7d33cad36411f",
+      "required": false,
+      "remote_verified": true,
+      "size_bytes": 33171226
+    }
+  ]
+}

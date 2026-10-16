@@ -1,0 +1,43 @@
+tier: T2
+description: 构象锁定与成环
+transforms:
+- id: T2_ETHYLENE_TO_ETHER
+  name: 链内 CH2 → 醚氧
+  smarts: '[#6:1][CH2;!R:2][CH2;!R:3][#6:4]>>[#6:1][O:2][CH2:3][#6:4]'
+  delta_heavy: 0
+  cost: 1.0
+  rationale: 探索链内醚氧对极性及构象偏好的影响；该替换本身并不形成构象锁或必然减少可转动键。
+  positive_examples:
+  - CCCCc1ccccc1
+  negative_examples:
+  - C1CCCCC1
+- id: T2_HYDROXYALKYL_TO_THF
+  name: 1,4-羟基烷基 → 四氢呋喃
+  smarts: '[CX4H1,CX4H2,CX4H3;!R:1][CH2;!R:2][CH2;!R:3][CH2;!R:4][OH:5]>>[C:1]1[CH2:2][CH2:3][CH2:4][O:5]1'
+  delta_heavy: 0
+  cost: 2.0
+  rationale: 将可闭合的羟基链设计为四氢呋喃以探索构象限制；需验证可合成性和结合姿势。
+  positive_examples:
+  - OCCCCc1ccccc1
+  negative_examples:
+  - OCCCc1ccccc1
+- id: T2_CATECHOL_TO_BENZODIOXOLE
+  name: 邻苯二酚 → 苯并二噁茂
+  smarts: '[c:1]1[c:2]([OH:7])[c:3]([OH:8])[c:4][c:5][c:6]1>>[c:1]1[c:2]2[c:3]([c:4][c:5][c:6]1)[O:8]C[O:7]2'
+  delta_heavy: 1
+  cost: 1.5
+  rationale: 探索邻苯二酚到苯并二氧杂环的替换；减少游离酚并不证明消除反应性或毒性风险。
+  positive_examples:
+  - Oc1ccccc1O
+  negative_examples:
+  - Oc1ccc(O)cc1
+- id: T2_GEM_DIMETHYL
+  name: 亚甲基 → gem-二甲基
+  smarts: '[#6:1][CH2;!R:2][#6:3]>>[#6:1][C:2](C)(C)[#6:3]'
+  delta_heavy: 2
+  cost: 1.8
+  rationale: 探索偕二甲基对构象分布与疏水性的影响；不保证构象锁定或活性提升。
+  positive_examples:
+  - CCCc1ccccc1
+  negative_examples:
+  - CC(C)c1ccccc1

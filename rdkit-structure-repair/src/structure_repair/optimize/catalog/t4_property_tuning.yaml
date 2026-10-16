@@ -1,0 +1,73 @@
+tier: T4
+description: 理化性质微调（溶解度、pKa、配体效率）
+transforms:
+- id: T4_ARYL_HALIDE_TO_MORPHOLINE
+  name: 芳卤 → 吗啉
+  smarts: '[c:1][F,Cl,Br,I]>>[c:1]N1CCOCC1'
+  delta_heavy: 5
+  cost: 3.0
+  rationale: 探索引入吗啉的极性、碱性及溶解性变化；结合与细胞暴露需验证。
+  positive_examples:
+  - Fc1ccccc1
+  negative_examples:
+  - CCF
+- id: T4_ARYL_HALIDE_TO_METHYLPIPERAZINE
+  name: 芳卤 → N-甲基哌嗪
+  smarts: '[c:1][F,Cl,Br,I]>>[c:1]N1CCN(C)CC1'
+  delta_heavy: 6
+  cost: 3.0
+  rationale: 探索 N-甲基哌嗪引入可离子化位点后的性质；不保证溶解性或暴露改善。
+  positive_examples:
+  - Fc1ccccc1
+  negative_examples:
+  - CCF
+- id: T4_ARYL_HALIDE_TO_SULFONAMIDE
+  name: 芳卤 → 甲磺酰胺
+  smarts: '[c:1][F,Cl,Br,I]>>[c:1][NH]S(=O)(=O)C'
+  delta_heavy: 4
+  cost: 3.0
+  rationale: 探索芳基甲磺酰胺的极性和氢键特征；合成可及性与代谢稳定性需验证。
+  positive_examples:
+  - Fc1ccccc1
+  negative_examples:
+  - CCF
+- id: T4_MAGIC_METHYL
+  name: 芳环 CH → CH3（magic methyl）
+  smarts: '[cH:1]>>[c:1]C'
+  delta_heavy: 1
+  cost: 2.0
+  rationale: 探索芳基甲基取代对疏水接触和构象的影响；效力可能升高或降低。
+  positive_examples:
+  - c1ccccc1
+  negative_examples:
+  - C1CCCCC1
+- id: T4_ALIPHATIC_CH_TO_CF
+  name: 胺邻位亚甲基氟化
+  smarts: '[NX3;!$(NC=O):1][CH2;!R:2][#6:3]>>[N:1][CH:2](F)[#6:3]'
+  delta_heavy: 1
+  cost: 2.5
+  rationale: 探索胺邻位氟化的碱性与构象效应；渗透性、hERG 和活性均需测定。
+  positive_examples:
+  - NCCc1ccccc1
+  negative_examples:
+  - CC(=O)NCC
+- id: T4_TRUNCATE_TERMINAL_ETHYL
+  name: 末端乙基 → 甲基
+  smarts: '[#6:1][CH2;!R:2][CH3]>>[#6:1][CH3:2]'
+  delta_heavy: -1
+  cost: 1.5
+  rationale: 探索末端乙基缩短后分子量和疏水接触的变化；保留结合贡献需要验证。
+  positive_examples:
+  - CCCc1ccccc1
+  negative_examples:
+  - CC(C)c1ccccc1
+- id: T4_TRUNCATE_TERMINAL_PROPYL
+  name: 末端丙基 → 甲基
+  smarts: '[#6:1][CH2;!R:2][CH2;!R][CH3]>>[#6:1][CH3:2]'
+  delta_heavy: -2
+  cost: 1.5
+  rationale: 探索丙基尾缩短后的亲脂性和结合变化；配体效率不由删原子自动保证。
+  positive_examples:
+  - CCCCc1ccccc1
+  negative_examples:
+  - CCc1ccccc1

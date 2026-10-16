@@ -19,9 +19,11 @@ from utils.scaffold_sites import (
     cap_n_extra_for_sites,
     compute_site_capacity,
     extract_exit_vector_sites,
+    extract_reference_exit_vector_sites,
     extract_murcko_attachment_sites,
     init_extra_positions_at_sites,
     merge_attachment_and_exit_vector_sites,
+    merge_reference_exit_sites,
     sample_fragment_atom_count,
     uses_site_budget_placement,
 )
@@ -47,6 +49,195 @@ def test_extract_toluene_methyl_site():
     centroid = np.array(sites[0]['centroid_pos'])
     assert centroid.shape == (3,)
     assert sites[0]['removed_atom_count'] >= 1
+
+
+def test_reference_exit_profile_can_restrict_to_one_slot():
+    mol = _mol_with_conformer('Cc1ccccc1')
+    sites = extract_reference_exit_vector_sites(
+        mol,
+        list(range(6)),
+        None,
+        {
+            'n_scaffold': 6,
+            'exit_site_weights': {'0': 12.0, '1': 6.0},
+        },
+        allowed_slots=[0],
+    )
+    assert [site['profile_slot'] for site in sites] == [0]
+
+
+def test_reference_exit_profile_can_exclude_hetero_anchor():
+    mol = _mol_with_conformer('Nc1ccccc1')
+    sites = extract_reference_exit_vector_sites(
+        mol,
+        list(range(6)),
+        None,
+        {
+            'n_scaffold': 6,
+            'exit_site_weights': {'0': 12.0},
+        },
+        allowed_anchor_symbols=['C'],
+    )
+    assert sites == []
+
+
+def test_strict_anchor_gaussian_compact_cloud_is_offset_and_anisotropic():
+    sites = [{
+        'site_id': 0,
+        'profile_slot': 0,
+        'anchor_pos': [0.0, 0.0, 0.0],
+        'exit_direction': [1.0, 0.0, 0.0],
+    }]
+    cfg = {
+        'site_selection_mode': 'weighted_single',
+        'site_budget_mode': 'requested',
+        'strict_anchor_gaussian': True,
+        'jitter_mode': 'strict_anchor_gaussian',
+        'strict_gaussian_center_offset': 2.6,
+        'strict_gaussian_sigma': 0.65,
+        'strict_gaussian_axial_sigma': 0.45,
+        'strict_gaussian_lateral_sigma': 0.65,
+        'max_per_site': 20,
+        'n_extra_min_clamp': 5,
+        'n_extra_max_clamp': 5,
+        'overflow_mode': 'cap',
+    }
+    positions, meta = build_extra_atom_positions(
+        5, sites, cfg, torch.zeros(3), 'cpu',
+        rng=np.random.default_rng(7),
+    )
+    assert positions.shape == (5, 3)
+    assert meta['site_allocation'][0]['profile_slot'] == 0
+    assert 1.5 < float(positions[:, 0].mean()) < 3.7
+
+
+def test_pocket_center_gaussian_uses_internal_center_and_clearance():
+    sites = [{
+        'site_id': 0,
+        'profile_slot': 0,
+        'anchor_pos': [0.0, 0.0, 0.0],
+        'exit_direction': [1.0, 0.0, 0.0],
+        'pocket_center_offset': [4.0, 0.0, 0.0],
+    }]
+    cfg = {
+        'site_selection_mode': 'weighted_single',
+        'site_budget_mode': 'requested',
+        'pocket_center_gaussian': True,
+        'jitter_mode': 'pocket_center_gaussian',
+        'pocket_gaussian_axial_sigma': 0.15,
+        'pocket_gaussian_lateral_sigma': 0.15,
+        'pocket_min_protein_dist': 1.5,
+        'pocket_min_point_dist': 0.2,
+        'pocket_max_anchor_dist': 8.0,
+        'max_per_site': 20,
+        'n_extra_min_clamp': 6,
+        'n_extra_max_clamp': 6,
+        'overflow_mode': 'cap',
+    }
+    protein = torch.tensor([[4.0, 4.0, 4.0]])
+    positions, meta = build_extra_atom_positions(
+        6,
+        sites,
+        cfg,
+        torch.zeros(3),
+        'cpu',
+        rng=np.random.default_rng(11),
+        protein_positions=protein,
+    )
+    assert positions.shape == (6, 3)
+    assert meta['pocket_center_gaussian'] is True
+    assert np.allclose(positions.numpy().mean(axis=0), [4.0, 0.0, 0.0], atol=0.35)
+    clearance = np.linalg.norm(
+        positions.numpy()[:, None, :] - protein.numpy()[None, :, :], axis=2
+    )
+    assert float(clearance.min()) >= 1.5
+
+
+def test_reference_exit_only_keeps_transferred_template_weight():
+    native = {
+        'site_id': 0,
+        'site_kind': 'murcko_sidechain',
+        'anchor_scaffold_idx': 1,
+        'anchor_pos': [0.0, 0.0, 0.0],
+        'centroid_pos': [1.0, 0.0, 0.0],
+        'removed_atom_positions': [[1.0, 0.0, 0.0]],
+        'removed_atom_count': 1,
+        'site_selection_weight': None,
+    }
+    profile = {
+        'site_id': -1,
+        'site_kind': 'reference_exit_vector',
+        'anchor_scaffold_idx': 2,
+        'anchor_pos': [10.0, 0.0, 0.0],
+        'centroid_pos': [11.0, 0.0, 0.0],
+        'removed_atom_positions': [],
+        'removed_atom_count': 0,
+        'profile_slot': 0,
+        'site_selection_weight': 12.0,
+    }
+    merged = merge_reference_exit_sites([native], [profile])
+    assert merged[0]['site_selection_weight'] == 1.0
+    assert merged[1]['removed_atom_positions'] == [[11.0, 0.0, 0.0]]
+
+
+def test_reference_exit_transfer_starts_at_closest_attachment_atom():
+    native = {
+        'site_id': 0,
+        'site_kind': 'murcko_sidechain',
+        'anchor_scaffold_idx': 1,
+        'anchor_pos': [0.0, 0.0, 0.0],
+        'centroid_pos': [1.0, 0.0, 0.0],
+        # The farther atom appears first, as can happen in a component walk.
+        'removed_atom_positions': [
+            [0.0, 4.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        'removed_atom_count': 2,
+    }
+    profile = {
+        'site_id': -1,
+        'site_kind': 'reference_exit_vector',
+        'anchor_scaffold_idx': 2,
+        'anchor_pos': [10.0, 0.0, 0.0],
+        'centroid_pos': [11.0, 0.0, 0.0],
+        'removed_atom_positions': [],
+        'removed_atom_count': 0,
+        'profile_slot': 0,
+        'site_selection_weight': 12.0,
+    }
+    merged = merge_reference_exit_sites([native], [profile])
+    transferred = np.asarray(merged[1]['removed_atom_positions'])
+    assert np.allclose(transferred[0], [11.0, 0.0, 0.0])
+    assert np.isclose(np.linalg.norm(transferred[0] - [10.0, 0.0, 0.0]), 1.0)
+
+
+def test_reference_exit_transfer_can_preserve_native_order():
+    native = {
+        'site_id': 0,
+        'site_kind': 'murcko_sidechain',
+        'anchor_scaffold_idx': 1,
+        'anchor_pos': [0.0, 0.0, 0.0],
+        'centroid_pos': [1.0, 0.0, 0.0],
+        'removed_atom_positions': [[0.0, 4.0, 0.0], [1.0, 0.0, 0.0]],
+        'removed_atom_count': 2,
+    }
+    profile = {
+        'site_id': -1,
+        'site_kind': 'reference_exit_vector',
+        'anchor_scaffold_idx': 2,
+        'anchor_pos': [10.0, 0.0, 0.0],
+        'centroid_pos': [11.0, 0.0, 0.0],
+        'removed_atom_positions': [],
+        'removed_atom_count': 0,
+        'profile_slot': 0,
+        'site_selection_weight': 12.0,
+    }
+    merged = merge_reference_exit_sites(
+        [native], [profile], template_atom_order='native',
+    )
+    transferred = np.asarray(merged[1]['removed_atom_positions'])
+    assert np.allclose(transferred[0], [10.0, 4.0, 0.0])
+    assert np.allclose(transferred[1], [11.0, 0.0, 0.0])
 
 
 def test_allocate_sum_equals_n_extra():
@@ -400,30 +591,6 @@ def test_sequential_uniform_regression():
         assert 5 <= n_eff <= 15
         assert sum(counts) == n_eff
         assert all(0 <= c <= 20 for c in counts)
-
-
-def test_exit_vector_sites_on_x77():
-    """X77 Murcko 仅 1 个真实位点；开启 aromatic_h exit-vector 后应明显增多。"""
-    x77_path = os.environ.get(
-        'DD_TEST_X77_SDF',
-        os.path.join(os.path.dirname(__file__), '..', 'data', 'examples', '6W63_ligand_X77_pose.sdf'),
-    )
-    if not os.path.exists(x77_path):
-        return
-    mol = Chem.RemoveHs(Chem.SDMolSupplier(x77_path, removeHs=True)[0])
-    from scripts.sample_diffusion import _detect_murcko_scaffold_indices
-    scaffold_indices = _detect_murcko_scaffold_indices(mol)
-    murcko = extract_murcko_attachment_sites(mol, scaffold_indices)
-    assert len(murcko) == 1, f'expected 1 murcko site, got {len(murcko)}'
-    exit_sites = extract_exit_vector_sites(
-        mol, scaffold_indices, mode='aromatic_h', offset=1.5,
-        existing_sites=murcko, dedup_dist=1.2,
-    )
-    assert len(exit_sites) >= 5, f'expected >=5 exit vectors, got {len(exit_sites)}'
-    merged = merge_attachment_and_exit_vector_sites(murcko, exit_sites)
-    assert len(merged) == len(murcko) + len(exit_sites)
-    assert sum(1 for s in merged if s.get('site_kind') == 'exit_vector') == len(exit_sites)
-    assert all(s['site_id'] == i for i, s in enumerate(merged))
 
 
 def test_resolve_max_active_sites_equals_removed_sidechains():

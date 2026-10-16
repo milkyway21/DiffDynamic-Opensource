@@ -5,7 +5,12 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from utils.reconstruct import reconstruct_from_generated
+from utils.reconstruct import (
+    _reconnect_scaffold_extra_components,
+    _repair_scaffold_extra_bonds,
+    reconstruct_from_generated,
+    reconstruct_from_type_indices,
+)
 
 
 def _benzene_scaffold_with_nearby_extra():
@@ -64,13 +69,169 @@ def test_scaffold_bonds_preserve_benzene_ring():
     assert 'c1ccccc1' in smi or smi.count('c') >= 6 or 'C1=CC=CC=C1' in smi, smi
 
 
+def test_scaffold_attachment_bond_keeps_distant_generated_branch():
+    xyz, atomic, bonds, n_sc = _benzene_scaffold_with_nearby_extra()
+    xyz[-1] = xyz[0] + np.array([4.0, 0.0, 0.0])
+    mol = reconstruct_from_generated(
+        xyz, atomic, aromatic=[True] * n_sc + [False],
+        basic_mode=False,
+        scaffold_bonds=bonds,
+        n_scaffold=n_sc,
+        extra_attachment_bonds=[(0, n_sc, 1, False)],
+    )
+    assert mol is not None
+    assert len(Chem.GetMolFrags(mol, asMols=False)) == 1
+    assert mol.GetBondBetweenAtoms(0, n_sc) is not None
+
+
+def test_scaffold_distance_mode_does_not_force_distant_generated_bond():
+    xyz, atomic, bonds, n_sc = _benzene_scaffold_with_nearby_extra()
+    xyz[-1] = xyz[0] + np.array([4.0, 0.0, 0.0])
+    mol = reconstruct_from_generated(
+        xyz, atomic, aromatic=[True] * n_sc + [False],
+        basic_mode=False,
+        scaffold_bonds=bonds,
+        n_scaffold=n_sc,
+        covalent_factor=1.3,
+    )
+    assert mol is not None
+    assert mol.GetBondBetweenAtoms(0, n_sc) is None
+
+
+def test_scaffold_component_reconnect_prefers_generated_atoms():
+    mol = Chem.MolFromSmiles('c1ccccc1C.C')
+    conformer = Chem.Conformer(mol.GetNumAtoms())
+    for idx in range(mol.GetNumAtoms()):
+        conformer.SetAtomPosition(idx, (float(idx), 0.0, 0.0))
+    conformer.SetAtomPosition(6, (1.5, 0.0, 0.0))
+    conformer.SetAtomPosition(7, (3.3, 0.0, 0.0))
+    mol.AddConformer(conformer)
+
+    repaired = _reconnect_scaffold_extra_components(mol, n_scaffold=6)
+    assert len(Chem.GetMolFrags(repaired, asMols=False)) == 1
+    assert repaired.GetBondBetweenAtoms(6, 7) is not None
+
+
 def test_without_scaffold_bonds_still_runs():
     xyz, atomic, _, _ = _benzene_scaffold_with_nearby_extra()
     mol = reconstruct_from_generated(xyz, atomic, basic_mode=True)
     assert mol is not None
 
 
+def test_scaffold_repair_downgrades_erroneous_aromatic_external_double_bond():
+    scaffold = Chem.MolFromSmiles('c1ccccc1')
+    editable = Chem.RWMol(scaffold)
+    extra_idx = editable.AddAtom(Chem.Atom(6))
+    editable.AddBond(0, extra_idx, Chem.BondType.DOUBLE)
+    noisy = editable.GetMol()
+    scaffold_bonds = [
+        (
+            bond.GetBeginAtomIdx(),
+            bond.GetEndAtomIdx(),
+            1,
+            True,
+        )
+        for bond in scaffold.GetBonds()
+    ]
+
+    repaired = _repair_scaffold_extra_bonds(
+        noisy, scaffold_bonds, n_scaffold=6,
+    )
+    external = repaired.GetBondBetweenAtoms(0, extra_idx)
+    assert external is not None
+    assert external.GetBondType() == Chem.BondType.SINGLE
+    Chem.SanitizeMol(repaired)
+
+
+def _embedded_mol(smiles, seed=0):
+    mol = Chem.MolFromSmiles(smiles)
+    assert mol is not None, smiles
+    AllChem.EmbedMolecule(mol, randomSeed=seed)
+    AllChem.UFFOptimizeMolecule(mol)
+    conf = mol.GetConformer()
+    xyz = []
+    atomic = []
+    aromatic = []
+    bonds = []
+    for i in range(mol.GetNumAtoms()):
+        p = conf.GetAtomPosition(i)
+        xyz.append([p.x, p.y, p.z])
+        atom = mol.GetAtomWithIdx(i)
+        atomic.append(atom.GetAtomicNum())
+        aromatic.append(bool(atom.GetIsAromatic()))
+    for b in mol.GetBonds():
+        i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+        is_aro = b.GetIsAromatic() or b.GetBondType() == Chem.BondType.AROMATIC
+        order = 5 if is_aro else int(round(b.GetBondTypeAsDouble()))
+        bonds.append((i, j, order, is_aro))
+    return np.asarray(xyz, dtype=np.float64), atomic, aromatic, bonds
+
+
+def _count_aromatic_atoms(mol, start=0):
+    return sum(
+        1 for atom in mol.GetAtoms()
+        if atom.GetIdx() >= start and atom.GetIsAromatic()
+    )
+
+
+def test_extra_benzene_keeps_aromatic_smiles():
+    xyz, atomic, aromatic, _ = _embedded_mol('c1ccccc1')
+    mol = reconstruct_from_generated(
+        xyz, atomic, aromatic, basic_mode=False,
+    )
+    assert mol is not None
+    smi = Chem.MolToSmiles(mol)
+    assert 'c' in smi, smi
+    assert _count_aromatic_atoms(mol) >= 6, smi
+
+
+def test_extra_aromatic_flags_honored_without_basic_mode_false():
+    xyz, atomic, aromatic, _ = _embedded_mol('c1ccccc1')
+    mol = reconstruct_from_generated(xyz, atomic, aromatic)
+    assert mol is not None
+    smi = Chem.MolToSmiles(mol)
+    assert 'c' in smi, smi
+    assert _count_aromatic_atoms(mol) >= 6, smi
+
+
+def test_scaffold_lock_plus_aromatic_extra_keeps_both_rings():
+    xyz, atomic, aromatic, bonds = _embedded_mol('c1ccc2ccccc2c1')
+    n_sc = 6
+    scaffold_bonds = [
+        (i, j, order, aro)
+        for i, j, order, aro in bonds
+        if i < n_sc and j < n_sc
+    ]
+    mol = reconstruct_from_generated(
+        xyz, atomic, aromatic, basic_mode=False,
+        scaffold_bonds=scaffold_bonds,
+        n_scaffold=n_sc,
+    )
+    assert mol is not None
+    smi = Chem.MolToSmiles(mol)
+    assert _count_aromatic_atoms(mol, start=0) >= 6, smi
+    assert _count_aromatic_atoms(mol, start=n_sc) >= 3, smi
+    assert 'c' in smi, smi
+
+
+def test_reconstruct_from_type_indices_keeps_c1_aromatic():
+    xyz, atomic, aromatic, _ = _embedded_mol('c1ccccc1')
+    # add_aromatic: C|0 = 1, C|1 = 2
+    type_indices = [2 if flag else 1 for flag in aromatic]
+    mol = reconstruct_from_type_indices(
+        xyz, type_indices, ligand_atom_mode='add_aromatic',
+    )
+    assert mol is not None
+    smi = Chem.MolToSmiles(mol)
+    assert 'c' in smi, smi
+    assert _count_aromatic_atoms(mol) >= 6, smi
+
+
 if __name__ == '__main__':
     test_scaffold_bonds_preserve_benzene_ring()
     test_without_scaffold_bonds_still_runs()
+    test_extra_benzene_keeps_aromatic_smiles()
+    test_extra_aromatic_flags_honored_without_basic_mode_false()
+    test_scaffold_lock_plus_aromatic_extra_keeps_both_rings()
+    test_reconstruct_from_type_indices_keeps_c1_aromatic()
     print('All reconstruct scaffold bond tests passed.')

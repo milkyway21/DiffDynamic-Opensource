@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 
 from server.config import get_config
 from server.database import update_run, log_history
-from server.job_helpers import parse_pocket_scores_from_csv, store_pocket_evaluations
+from server.job_helpers import (
+    dynamic_web_patches, parse_pocket_scores_from_csv,
+    store_pocket_evaluations, write_patched_config,
+)
 from server.runners.base import (
     mark_completed,
     mark_failed,
@@ -17,6 +20,7 @@ from server.runners.base import (
     parse_generation_progress,
     run_cmd,
     append_log,
+    strict_load_env_for_pt,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,9 +32,12 @@ def run_pocket_evaluation(scheduler, rec, params: dict):
         update_run(rec.run_id, status="running", started_at=datetime.now(timezone.utc))
 
         if params.get("generate_first") and not params.get("pt_path"):
+            generation_config = write_patched_config(
+                cfg.sampling_config, dynamic_web_patches(params.get("batch_size")), rec.job_id,
+            )
             gen_cmd = [
                 cfg.python_bin, cfg.sample_script(),
-                cfg.sampling_config,
+                generation_config,
                 "--device", f"cuda:{params['gpu_id']}",
                 "--protein_path", params["protein_path"],
             ]
@@ -58,8 +65,14 @@ def run_pocket_evaluation(scheduler, rec, params: dict):
             update_run(rec.run_id, progress=0.3)
 
         pt_path = params.get("pt_path")
+        if pt_path:
+            from server.safe_pt import prepare_job_pt
+            pt_path = prepare_job_pt(pt_path, rec.owner)
         protein_path = params.get("protein_path")
         ligand_path = params.get("ligand_path")
+        vis_root = None
+        if params.get("result_path"):
+            vis_root = os.path.join(params["result_path"], f"pocket_eval_{rec.job_id}")
 
         if pt_path:
             cmd = [
@@ -80,6 +93,8 @@ def run_pocket_evaluation(scheduler, rec, params: dict):
 
         if params.get("max_samples"):
             cmd += ["--idea_e_expected_n_molecules", str(params["max_samples"])]
+        if vis_root:
+            cmd += ["--vis_dir", vis_root]
 
         rec.log_lines.append(f"Running: {' '.join(cmd)}")
 
@@ -87,11 +102,12 @@ def run_pocket_evaluation(scheduler, rec, params: dict):
             append_log(rec, line)
             parse_pocket_eval_progress(rec, line)
 
-        rc = run_cmd(rec, cmd, on_line=on_line)
+        rc = run_cmd(rec, cmd, on_line=on_line, env_extra=strict_load_env_for_pt(pt_path))
         if rc == 0:
             rec.progress = 1.0
             csv_path = os.path.join(
-                cfg.diffdynamic_root, "pocket_quality_vis", "evaluation_records.csv",
+                vis_root or os.path.join(cfg.diffdynamic_root, "pocket_quality_vis"),
+                "evaluation_records.csv",
             )
             # If progress parser missed the subfolder, recover from CSV by pt_path
             if (
@@ -120,6 +136,7 @@ def run_pocket_evaluation(scheduler, rec, params: dict):
             log_history(
                 "pocket_eval_completed",
                 {"job_id": rec.job_id, "vis_dir": rec.output_path, "scores": rec.scores},
+                user=getattr(rec, "owner", None) or "legacy",
             )
         else:
             mark_failed(rec, rec.error or f"Exit code {rc}")

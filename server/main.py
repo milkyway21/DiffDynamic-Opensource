@@ -23,9 +23,14 @@ def main():
     cfg = get_config()
     host = os.environ.get("DD_HOST", cfg.host)
     port = int(os.environ.get("DD_PORT", str(cfg.port)))
+    from server.auth import auth_mode
+    if auth_mode() == "off" and host not in ("127.0.0.1", "localhost", "::1"):
+        raise RuntimeError("Local off-mode authentication requires a loopback bind")
     print(f"Starting DiffDynamic server on {host}:{port}")
-    print(f"  API docs:  http://{host}:{port}/docs")
     print(f"  Web UI:    http://{host}:{port}/")
+    print(f"  API:       http://{host}:{port}/api/health")
+    print(f"  Auth mode: {auth_mode()}")
+    print(f"  Public prefix (DD_ROOT_PATH): {os.environ.get('DD_ROOT_PATH', '/') or '/'}")
     uvicorn.run(app, host=host, port=port)
 
 

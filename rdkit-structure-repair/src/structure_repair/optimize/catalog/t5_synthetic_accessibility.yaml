@@ -1,0 +1,53 @@
+tier: T5
+description: 合成可及性导向的结构简化
+transforms:
+- id: T5_CYCLOPROPYL_TO_ISOPROPYL
+  name: 环丙基 → 异丙基
+  smarts: '[#6:4][CH;r3:1]1[CH2;r3:2][CH2;r3:3]1>>[#6:4][CH:1]([CH3:2])[CH3:3]'
+  delta_heavy: 0
+  cost: 2.0
+  rationale: 探索环丙基开环到异丙基后的构象与合成路径；环丙基可能是关键药效团。
+  positive_examples:
+  - CC1CC1
+  negative_examples:
+  - C1CCC1
+- id: T5_TBU_TO_IPR
+  name: 叔丁基 → 异丙基
+  smarts: '[#6:1][CX4:2]([CH3:3])([CH3:4])[CH3]>>[#6:1][CH:2]([CH3:3])[CH3:4]'
+  delta_heavy: -1
+  cost: 1.5
+  rationale: 探索叔丁基减小为异丙基后的疏水性与空间占据；需要验证结合。
+  positive_examples:
+  - CC(C)(C)c1ccccc1
+  negative_examples:
+  - CC(C)c1ccccc1
+- id: T5_QUATERNARY_CARBON_DEMETHYL
+  name: 季碳去甲基
+  smarts: '[#6:1][CX4:2]([#6:3])([#6:4])[CH3]>>[#6:1][CH:2]([#6:3])[#6:4]'
+  delta_heavy: -1
+  cost: 2.0
+  rationale: 探索季碳去甲基后的构象、立体异构和合成难度；不保证合成可及性改善。
+  positive_examples:
+  - CCC(C)(C)c1ccccc1
+  negative_examples:
+  - CCC(C)c1ccccc1
+- id: T5_OPEN_STRAINED_CYCLOBUTANE
+  name: 环丁烷开环
+  smarts: '[CH2;r4:1]1[CH2;r4:2][CH2;r4:3][CH2;r4:4]1>>[CH3:1][CH2:2][CH2:3][CH3:4]'
+  delta_heavy: 0
+  cost: 3.0
+  rationale: 探索环丁烷开环后构象自由度的变化；四元环并不必然难以合成。
+  positive_examples:
+  - C1CCC1
+  negative_examples:
+  - C1CCCC1
+- id: T5_GEM_DIFLUORO_TO_CH2
+  name: gem-二氟 → 亚甲基
+  smarts: '[#6:1][CX4:2](F)(F)[#6:3]>>[#6:1][CH2:2][#6:3]'
+  delta_heavy: -2
+  cost: 2.0
+  rationale: 探索偕二氟去除对分子量、代谢和构象的影响；氟的结合贡献需验证。
+  positive_examples:
+  - CC(F)(F)c1ccccc1
+  negative_examples:
+  - CC(F)c1ccccc1

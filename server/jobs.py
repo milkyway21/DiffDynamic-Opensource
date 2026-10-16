@@ -7,6 +7,7 @@ from server.scheduler import (  # noqa: F401
     GPUAllocator,
     JobRecord,
     JobScheduler,
+    JobSubmitError,
     get_scheduler,
     VALID_SCAFFOLD_MODES,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "GPUAllocator",
     "JobRecord",
     "JobScheduler",
+    "JobSubmitError",
     "get_scheduler",
     "VALID_SCAFFOLD_MODES",
 ]

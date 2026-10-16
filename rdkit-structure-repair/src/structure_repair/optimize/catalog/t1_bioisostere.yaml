@@ -1,0 +1,63 @@
+tier: T1
+description: 生物电子等排替换
+transforms:
+- id: T1_ESTER_TO_AMIDE
+  name: 酯 → 酰胺
+  smarts: '[CX3:1](=[OX1:2])[OX2H0;!R:3][#6:4]>>[C:1](=[O:2])[NH:3][#6:4]'
+  delta_heavy: 0
+  cost: 1.0
+  rationale: 探索酯到酰胺替换以改变水解敏感性和氢键特征；稳定性、活性及渗透性需实验验证。
+  positive_examples:
+  - CCOC(=O)c1ccccc1
+  negative_examples:
+  - CC(=O)O
+- id: T1_COOH_TO_TETRAZOLE
+  name: 羧酸 → 四氮唑
+  smarts: '[CX3:1](=[OX1])[OX2H1]>>[c:1]1nnn[nH]1'
+  delta_heavy: 2
+  cost: 2.5
+  rationale: 探索羧酸的四氮唑酸性等排体；pKa、结合方式和暴露量需验证。
+  positive_examples:
+  - O=C(O)Cc1ccccc1
+  negative_examples:
+  - COC(=O)c1ccccc1
+- id: T1_PHENOL_TO_FLUORIDE
+  name: 酚 OH → F
+  smarts: '[c:1][OX2H1:2]>>[c:1][F:2]'
+  delta_heavy: 0
+  cost: 1.5
+  rationale: 用芳基氟替换酚羟基以探索代谢和电子效应；会丢失酚的氢键供体能力，不保证保留结合。
+  positive_examples:
+  - Oc1ccccc1
+  negative_examples:
+  - OCCc1ccccc1
+- id: T1_CH2_TO_O
+  name: 脂肪 CH2 → O
+  smarts: '[#6:1][CH2;!R:2][#6:3]>>[#6:1][O:2][#6:3]'
+  delta_heavy: 0
+  cost: 1.2
+  rationale: 以链内醚氧替换亚甲基，探索极性与亲脂性变化；构象和代谢结果需验证。
+  positive_examples:
+  - CCCc1ccccc1
+  negative_examples:
+  - C1CCCCC1
+- id: T1_S_TO_SO2
+  name: 硫醚 → 砜
+  smarts: '[#6:1][S;X2:2][#6:3]>>[#6:1][S:2](=O)(=O)[#6:3]'
+  delta_heavy: 2
+  cost: 2.0
+  rationale: 探索硫醚氧化为砜后的极性和构象；代谢稳定性及活性不能由规则推断。
+  positive_examples:
+  - CSCc1ccccc1
+  negative_examples:
+  - CS(=O)(=O)Cc1ccccc1
+- id: T1_OME_TO_OCHF2
+  name: 芳甲醚 → 二氟甲醚
+  smarts: '[c:1][OX2:2][CH3:3]>>[c:1][O:2][CH:3](F)F'
+  delta_heavy: 2
+  cost: 2.0
+  rationale: 探索二氟甲氧基对 O-脱烷基代谢和亲脂性的影响；需要实验确认。
+  positive_examples:
+  - COc1ccccc1
+  negative_examples:
+  - CCOc1ccccc1

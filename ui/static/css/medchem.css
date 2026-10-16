@@ -1,0 +1,53 @@
+/* The comparison rail keeps chemical identity, edits, and pose provenance together. */
+.mc-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: start; margin-bottom: 1.25rem; }
+.mc-provenance { color: var(--navy); font: .75rem var(--font-mono); border-left: 3px solid var(--ion); padding: .25rem .7rem; white-space: nowrap; }
+.mc-generation, .mc-options fieldset { border: 1px solid var(--border); padding: 1rem; border-radius: var(--radius); margin: 1rem 0; min-width: 0; }
+.mc-generation legend { padding: 0 .5rem; font-weight: 600; }
+.mc-generation legend input { width: auto; margin-right: .35rem; }
+.mc-options fieldset legend { font-size: .9rem; font-weight: 600; padding: 0 .35rem; }
+.mc-choices { display: flex; gap: .7rem; flex-wrap: wrap; }
+.mc-choice { flex: 1 1 190px; position: relative; cursor: pointer; }
+.mc-choice input { position: absolute; top: .9rem; left: .8rem; width: auto; accent-color: var(--primary); }
+.mc-choice span { display: block; padding: .7rem .8rem .7rem 2.2rem; border: 1px solid var(--border); border-radius: 7px; font-weight: 600; height: 100%; }
+.mc-choice input:checked + span { background: var(--surface-soft); border-color: var(--primary); box-shadow: inset 0 -2px var(--primary); }
+.mc-choice input:focus-visible + span { outline: 2px solid var(--primary); outline-offset: 3px; }
+.mc-options details, .mc-pocket { border-top: 1px solid var(--border-light); margin: 1rem 0; padding-top: .7rem; }
+.mc-options summary, .mc-pocket summary { cursor: pointer; color: var(--navy); font-weight: 600; margin-bottom: .7rem; }
+.mc-options .form-row { margin-top: .75rem; }
+.mc-note { color: var(--text-secondary); padding: .7rem 0; font-size: .88rem; }
+.mc-aggressive-note { color: #98520b; background: #fff7e5; border-left: 3px solid var(--warning); padding: .65rem .8rem; margin-top: .75rem; }
+.mc-aligned { display: flex; gap: .5rem; align-items: baseline; }
+.mc-aligned input { width: auto; }
+.mc-pocket-viewer { margin-top: .75rem; height: 330px; }
+#mc-smiles { width: 100%; resize: vertical; min-height: 115px; font-family: var(--font-mono); }
+.mc-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .7rem; }
+.mc-summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-block: 1px solid var(--border); margin: 1rem 0; }
+.mc-summary div { padding: .8rem .6rem; border-right: 1px solid var(--border-light); }
+.mc-summary strong { display: block; font: 1.6rem var(--font-mono); color: var(--navy); }
+.mc-summary span { color: var(--text-secondary); font-size: .8rem; }
+.mc-record-picker { width: 100%; margin: .6rem 0 1rem; }
+.mc-comparison { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; align-items: start; }
+.mc-variant { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); padding: .9rem; background: white; }
+.mc-variant[data-stage="primary"] { border-top: 3px solid var(--primary); }
+.mc-variant[data-stage="candidate"] { border-top: 3px solid #16a085; }
+.mc-variant h4 { color: var(--navy); font-family: var(--font-display); margin-bottom: .4rem; }
+.mc-depiction { display: block; width: 100%; height: 210px; object-fit: contain; background: white; border: 1px solid var(--border-light); border-radius: 6px; }
+.mc-structure { height: 245px; position: relative; background: #f7fafe; margin-top: .7rem; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.mc-smiles { display: block; font: .75rem/1.5 var(--font-mono); overflow-wrap: anywhere; margin: .6rem 0; }
+.mc-properties { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: .7rem 0; gap: .45rem; }
+.mc-properties div { border-bottom: 1px solid var(--border-light); padding-bottom: .3rem; }
+.mc-properties dt { color: var(--text-secondary); font-size: .7rem; }
+.mc-properties dd { font: .82rem var(--font-mono); }
+.mc-changes { padding-left: 1.2rem; font-size: .82rem; margin: .6rem 0; }
+.mc-changes li { margin-bottom: .35rem; overflow-wrap: anywhere; }
+.mc-label { font-size: .75rem; color: var(--text-secondary); }
+.mc-state { font-size: .82rem; margin: .35rem 0; overflow-wrap: anywhere; }
+.mc-record-error { color: var(--danger); margin: .5rem 0; }
+.mc-detail { border-top: 1px solid var(--border-light); padding-top: .5rem; margin-top: .6rem; }
+.mc-detail summary { cursor: pointer; font-size: .82rem; }
+.mc-detail pre { overflow: auto; max-height: 180px; font-size: .72rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mc-candidate-select { width: 100%; margin-bottom: .7rem; }
+.mc-empty { color: var(--text-secondary); font-size: .9rem; padding: .9rem 0; }
+[hidden] { display: none !important; }
+@media (max-width: 1024px) { .mc-comparison { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mc-comparison > :last-child { grid-column: 1 / -1; } }
+@media (max-width: 600px) { .mc-heading { flex-direction: column; } .mc-comparison { grid-template-columns: 1fr; } .mc-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); } .mc-generation, .mc-options fieldset { padding: .7rem; } .mc-choices { gap: .5rem; } .mc-choice { flex-basis: 100%; } .mc-actions .btn { white-space: normal; } }

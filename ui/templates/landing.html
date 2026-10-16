@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
+<title>DiffDynamic · 从噪声到分子的生成之旅</title>
+<link rel="stylesheet" href="/static/css/landing.css?v=20261013-modules">
+<script type="importmap">
+{ "imports": {
+  "three": "/static/libs/three/three.module.js",
+  "three/addons/": "/static/libs/three/addons/"
+} }
+</script>
+</head>
+<body>
+<div id="diag"></div>
+<script src="/static/js/landing/diagnostics.js?v=20261013-modules"></script>
+
+<!-- ===== HERO ===== -->
+<section class="hero" id="hero">
+  <canvas class="hero-canvas" id="heroCanvas"></canvas>
+  <div class="hero-overlay"></div>
+  <h1 class="hero-brand" aria-label="DiffDynamic">
+    <span class="hero-brand-word" aria-hidden="true">
+      <span class="hero-brand-letter" style="--letter-index:0">D</span>
+      <span class="hero-brand-letter" style="--letter-index:1">i</span>
+      <span class="hero-brand-letter" style="--letter-index:2">f</span>
+      <span class="hero-brand-letter" style="--letter-index:3">f</span>
+      <span class="hero-brand-letter" style="--letter-index:4">D</span>
+      <span class="hero-brand-letter" style="--letter-index:5">y</span>
+      <span class="hero-brand-letter" style="--letter-index:6">n</span>
+      <span class="hero-brand-letter" style="--letter-index:7">a</span>
+      <span class="hero-brand-letter" style="--letter-index:8">m</span>
+      <span class="hero-brand-letter" style="--letter-index:9">i</span>
+      <span class="hero-brand-letter" style="--letter-index:10">c</span>
+    </span>
+  </h1>
+  <aside class="hero-phase-label" id="heroPhaseLabel" role="status" aria-live="polite" aria-atomic="true">
+    <span class="hero-phase-index" id="heroPhaseIndex" aria-hidden="true">01</span>
+    <span class="hero-phase-text" id="heroPhaseText">放入呈高斯离散态的原子</span>
+  </aside>
+  <div class="hero-content">
+    <p class="hero-subtitle">从噪声到分子 · 动态扩散的蛋白质配体生成之旅</p>
+    <div class="hero-cta-row" style="margin-top:2rem;display:flex;gap:1rem;justify-content:center;pointer-events:auto;flex-wrap:wrap">
+      <a href="/app" class="hero-enter-btn" style="display:inline-flex;align-items:center;gap:0.5rem;padding:0.85rem 2.2rem;background:linear-gradient(135deg,#1a5a9e,#3976bd);color:#fff;text-decoration:none;border-radius:999px;font-weight:600;font-size:1.05rem;letter-spacing:0.02em;box-shadow:0 4px 20px rgba(57,118,189,0.4);transition:transform .2s,box-shadow .2s;backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.15)">进入工作台 &rarr;</a>
+      <a href="#molecule-section" class="hero-explore-btn" style="display:inline-flex;align-items:center;gap:0.5rem;padding:0.85rem 2.2rem;background:rgba(255,255,255,0.08);color:#c8dcf0;text-decoration:none;border-radius:999px;font-weight:500;font-size:1rem;border:1px solid rgba(110,198,255,0.3);backdrop-filter:blur(8px);transition:background .2s">了解更多</a>
+    </div>
+  </div>
+  <div class="hero-scroll-hint">向下滚动探索</div>
+</section>
+
+<!-- ===== SECTION 1: MOLECULE DEMO ===== -->
+<section class="section section-molecule" id="molecule-section">
+  <div class="section-header reveal">
+    <div class="section-label">01 · Diffusion Process</div>
+    <h2 class="section-title">从噪声中生成分子</h2>
+    <p class="section-desc">扩散模型通过逐步去噪，将随机噪声转化为具有明确结构的药物分子</p>
+  </div>
+  <div class="molecule-demo-container">
+    <div class="molecule-canvas-card reveal">
+      <canvas id="demoCanvas"></canvas>
+      <div class="molecule-timeline">
+        <button class="timeline-play-btn" id="playBtn" aria-label="播放/暂停">&#9654;</button>
+        <span class="timeline-label" id="timelineLabel">t = 999</span>
+        <input type="range" class="timeline-slider" id="timelineSlider" min="0" max="1000" value="999">
+      </div>
+    </div>
+    <div class="molecule-info reveal">
+      <h3>两阶段动态去噪</h3>
+      <ul class="molecule-features">
+        <li class="molecule-feature">
+          <div class="feature-icon">&#128293;</div>
+          <div class="feature-text">
+            <h4>高噪声探索阶段</h4>
+            <p>大步长跳跃，快速搜索分子拓扑空间，构建整体骨架</p>
+          </div>
+        </li>
+        <li class="molecule-feature">
+          <div class="feature-icon">&#9889;</div>
+          <div class="feature-text">
+            <h4>梯度融合策略</h4>
+            <p>全局 x&#8320; 预测与局部后验均值按时间衰减权重混合，兼顾方向与精度</p>
+          </div>
+        </li>
+        <li class="molecule-feature">
+          <div class="feature-icon">&#128295;</div>
+          <div class="feature-text">
+            <h4>低噪声精修阶段</h4>
+            <p>小步长精细优化，配合结构修复机制修正键角与几何缺陷</p>
+          </div>
+        </li>
+        <li class="molecule-feature">
+          <div class="feature-icon">&#127919;</div>
+          <div class="feature-text">
+            <h4>三十步达成</h4>
+            <p>仅需约 30 步即可生成高质量分子，比传统 DDPM 快 30 倍</p>
+          </div>
+        </li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ===== SECTION 2: FOUR PANELS ===== -->
+<section class="section section-panels" id="panels-section">
+  <div class="section-header reveal">
+    <div class="section-label">02 · Path Comparison</div>
+    <h2 class="section-title">四种扩散策略路径对比</h2>
+    <p class="section-desc">同一能量景观上的四种去噪路径，展现不同采样策略的形态差异</p>
+  </div>
+  <div class="panels-inner">
+    <div class="logo-wrap">
+      <canvas class="logo-canvas" id="logoCanvas" width="360" height="460"></canvas>
+      <canvas class="logo-canvas sunflower" id="logoCanvas2" width="360" height="460"></canvas>
+      <canvas class="logo-canvas sunflower" id="logoCanvas4" width="360" height="460"></canvas>
+      <canvas class="logo-canvas" id="logoCanvas3" width="360" height="460"></canvas>
+    </div>
+    <div class="panels-header reveal">
+      <div class="legend">
+        <div class="legend-item"><span class="legend-dot b1"></span> TargetDiff · 标准 DDPM</div>
+        <div class="legend-item"><span class="legend-dot b2"></span> DiffDynamic · 梯度融合</div>
+        <div class="legend-item"><span class="legend-line od"></span> Transformer 修复</div>
+        <div class="legend-item"><span class="legend-dot b3"></span> GlintDM · t/T 融合</div>
+        <div class="legend-item"><span class="legend-dot b5"></span> Prudent · 两层三叉搜索</div>
+      </div>
+    </div>
+    <div class="main-grid reveal" id="maingrid">
+      <div class="panel" id="panel1">
+        <div class="panel-header"><div class="panel-title">TargetDiff</div><div class="panel-subtitle">Posterior Mean · 1000 steps</div></div>
+        <div class="panel-canvas-wrap" id="wrap1"></div>
+        <div class="panel-info"><div class="formula">x_{t-1} = &#956;&#952;(x_t,t) + &#963;_t·noise</div><div class="steps-label">路径特点</div><div class="steps">随机后验均值采样 · 1000 步 · 容易在能量谷中缓慢漂移</div></div>
+      </div>
+      <div class="panel" id="panel2">
+        <div class="panel-header"><div class="panel-title">DiffDynamic</div><div class="panel-subtitle">Gradient Fusion · ~30 steps + repair</div></div>
+        <div class="panel-canvas-wrap" id="wrap2"></div>
+        <div class="panel-info"><div class="formula">grad = &#955;(t)·global + (1-&#955;)·local</div><div class="steps-label">路径特点</div><div class="steps">少步候选路径 · 梯度融合避开局部弯折 · 末端 Transformer 修复贴近目标</div></div>
+      </div>
+      <div class="panel" id="panel3">
+        <div class="panel-header"><div class="panel-title">GlintDM</div><div class="panel-subtitle">t/T Ratio · 50 steps</div></div>
+        <div class="panel-canvas-wrap" id="wrap3"></div>
+        <div class="panel-info"><div class="formula">grad = t/T·global + (1-t/T)·local</div><div class="steps-label">路径特点</div><div class="steps">按 t/T 比例切换全局与局部方向 · 50 步 · 路径更短但更依赖时间调度</div></div>
+      </div>
+      <div class="panel" id="panel4">
+        <div class="panel-header"><div class="panel-title">Prudent</div><div class="panel-subtitle">Tree Search · 2-level ternary branching · 9 endpoints</div></div>
+        <div class="panel-canvas-wrap" id="wrap4" role="img" aria-label="Prudent 两层三叉树状路径图"></div>
+        <div class="panel-info"><div class="formula">26% trunk · 28% ternary branches · 46% leaves</div><div class="steps-label">路径特点</div><div class="steps">主干复用 DiffDynamic 核心路径 · 三阶段采样球为 6/8/10 · 九条终点分散，胜出终点高亮显示</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FOOTER ===== -->
+<footer class="site-footer">
+  DiffDynamic · 基于动态扩散的蛋白质配体生成框架 · &copy; 2026
+
+<a href="/app" class="floating-enter-btn" style="position:fixed;bottom:1.5rem;right:1.5rem;z-index:9999;display:inline-flex;align-items:center;gap:0.5rem;padding:0.75rem 1.5rem;background:linear-gradient(135deg,#1a5a9e,#3976bd);color:#fff;text-decoration:none;border-radius:999px;font-weight:600;font-size:0.95rem;box-shadow:0 4px 16px rgba(26,90,158,0.45);border:1px solid rgba(255,255,255,0.15);transition:transform .2s;backdrop-filter:blur(8px)" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+  工作台
+</a>
+
+</footer>
+
+<script type="module" src="/static/js/landing/app.js?v=20261013-modules"></script>
+
+</body>
+</html>

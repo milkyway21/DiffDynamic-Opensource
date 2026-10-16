@@ -1,0 +1,8 @@
+[build-system]
+requires = ["setuptools>=61,<76", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["local", "outputs", "data", ".cache"]
+markers = ["installation: offline distribution and disposable-environment checks"]

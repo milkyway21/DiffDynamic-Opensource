@@ -1,135 +1,97 @@
 # DiffDynamic
 
-**DiffDynamic** 是面向 3D 结构化药物设计（SBDD）的扩散模型推理框架：在 [TargetDiff](https://github.com/DeepGraphLearning/TargetDiff) 骨干上，提供两阶段动态跳步采样、梯度融合、Prudent 多轮过滤与骨架约束生成，并附带 Web 演示界面。
+DiffDynamic generates and evaluates 3D molecules in protein pockets using pretrained
+diffusion models. It includes baseline/dynamic sampling, Prudent selection,
+scaffold generation, optimization, batch orchestration, pocket analysis and a Web UI.
 
-- 技术原理（英文）：[README.en.md](README.en.md)
-- 中文补充：[README.zh-CN.md](README.zh-CN.md)
-- 许可：[LICENSE](LICENSE)
+[中文说明](README.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Medchem](docs/MEDCHEM.md) · [Publication](docs/PUBLICATION.md)
 
-## 仓库内容
+## Maintained code
 
-```
-DiffDynamic-Opensource/
-├── README.md                 # 本使用引导（仓库主页）
-├── README.en.md              # 英文技术说明
-├── README.zh-CN.md           # 中文说明
-├── pretrained_models/        # 预训练权重（已入库）
-├── configs/sampling.yml      # 采样主配置
-├── scripts/sample_diffusion.py
-├── evaluate_pt_with_correct_reconstruct.py
-├── evaluate_pocket_quality.py
-├── extract_pt_to_sdf_excel.py
-├── server/ + ui/             # FastAPI + Web 前端
-└── start_server.sh
+```text
+src/diffdynamic/
+├── models/       Networks, probability, schedules and diffusion
+├── data/         Protein/ligand parsing, graph containers and features
+├── sampling/     Baseline, dynamic, Prudent, scaffold and optimization
+├── chemistry/    Reconstruction, fragments, profiles and placement
+├── evaluation/   Metrics, docking, isolated workers and result writers
+├── analysis/     Pocket metrics, visualization and reusable plots
+├── batch/        Resource selection, subprocess tasks and aggregation
+├── io/           Paths, configuration, PT interchange and records
+└── cli/          Public command adapters
 ```
 
-## 环境准备
+`server/` holds API schemas/routes, job configuration, scheduling and runners.
+`ui/` holds the workbench and landing-page assets. Old commands/imports are
+compatibility adapters; algorithms are maintained once in the library.
+Historical scripts/results are local-only under `local/archive` and
+`local/research`. File-location maps and migration journals live in `local/inventory`.
 
-- Python 3.8+
-- Conda 环境建议命名为 `diffdynamic`（PyTorch 1.12+、CUDA、RDKit、AutoDock Vina）
-- NVIDIA GPU（生成与对接评估）
+## Install in the existing scientific environment
+
+This refactor supports the validated Python 3.8 environment and does not upgrade
+PyTorch, RDKit or GPU extensions. See `requirements-validated.txt` for the versions.
 
 ```bash
-git clone https://github.com/milkyway21/DiffDynamic-Opensource.git
-cd DiffDynamic-Opensource
-
 conda activate diffdynamic
-pip install -r requirements.txt
-# Web 服务额外依赖（可选）
-pip install -r requirements-web.txt
-
-export PYTHONPATH="$(pwd):${PYTHONPATH}"
+python -m pip install --no-deps --no-build-isolation -e .
+python tools/project.py weights --download
+# Optional comparison checkpoint:
+python tools/project.py weights --download --include-optional
 ```
 
-## 预训练权重
+Downloads are pinned and verified using `weights-manifest.json`. The default stays
+`pretrained_models/pretrained_diffusion.pt`. Mismatching existing files are never replaced.
+New machines need scientific dependencies plus OpenBabel/AutoDock Vina; geometric
+extensions must match PyTorch/CUDA. The version list is a record, not an automatic migration.
 
-Clone 后权重已在 `pretrained_models/`：
-
-| 文件 | 用途 |
-|------|------|
-| `pretrained_models/pretrained_diffusion.pt` | 默认采样检查点（必需） |
-| `pretrained_models/pretrained_GlintDM.pt` | 相关对照权重 |
-
-`configs/sampling.yml` 中默认指向：
-
-```yaml
-model:
-  checkpoint: ./pretrained_models/pretrained_diffusion.pt
-```
-
-无需再单独下载权重即可开始采样。
-
-## 快速开始
-
-### 1. 单口袋采样（测试集 data_id）
+## Commands
 
 ```bash
-python scripts/sample_diffusion.py configs/sampling.yml \
-    --data_id 0 --device cuda:0
+diffdynamic sample configs/sampling.yml --data_id 0 --device cuda:0
+diffdynamic sample configs/sampling.yml --protein_path pocket.pdb --ligand_path ligand.sdf --device cuda:0
+diffdynamic batch --start 0 --end 9 --gpus 0,1
+diffdynamic evaluate outputs/result.pt --protein_root data/crossdocked_pocket10_test_only
+diffdynamic extract outputs/result.pt
+diffdynamic pocket --help
+diffdynamic cascade --help
+diffdynamic plot --help
 ```
 
-自定义蛋白 / 参考配体：
+Established commands such as `python scripts/sample_diffusion.py` and
+`python evaluate_pt_with_correct_reconstruct.py` keep their arguments/defaults,
+progress messages and result formats. Optional benchmarks require external baseline installations.
 
-```bash
-python scripts/sample_diffusion.py configs/sampling.yml \
-    --protein_path /path/to/protein.pdb \
-    --ligand_path /path/to/reference.sdf \
-    --device cuda:0
-```
-
-结果默认写入 `outputs/`（运行时生成，不在仓库中）。
-
-### 2. 评估与提取
-
-```bash
-# 重建 + Vina / QED / SA 等评估
-python evaluate_pt_with_correct_reconstruct.py \
-    outputs/result_0_*.pt \
-    --protein_root ./data/crossdocked_v1.1_rmsd1.0_pocket10
-
-# .pt → SDF / Excel
-python extract_pt_to_sdf_excel.py outputs/result_0_*.pt
-```
-
-口袋质量评估：
-
-```bash
-python evaluate_pocket_quality.py --help
-```
-
-> CrossDocked 测试口袋数据（`data/`）需自行准备；仓库不包含该数据集。
-
-### 3. Web 演示界面
+## Web
 
 ```bash
 bash start_server.sh
+# Explicit loopback-only local development:
+DD_AUTH_MODE=off DD_HOST=127.0.0.1 bash start_server.sh
 ```
 
-- 界面：http://localhost:7860/
-- API 文档：http://localhost:7860/docs
+Default bind: `127.0.0.1:7860`. Platform authentication and reverse proxy prefixes
+retain their behavior. Actual settings in `server/server_config.json` remain local;
+see `server/server_config.example.json`. Explicit `DD_ROOT`, `DD_DATA`, `DD_OUTPUT`,
+`DD_UPLOAD`, `DD_MODELS`, `DD_SAMPLING_YML` override saved paths.
 
-## 配置入口
+The UI retains custom/dataset pockets, batch generation, scaffold placement,
+optimization, evaluation/extraction, molecular downloads, progress/cancellation,
+history/reruns, user isolation and administrative limits.
 
-所有生成行为以 [`configs/sampling.yml`](configs/sampling.yml) 为准：
+## Verify and prepare a release
 
-| 字段 | 说明 |
-|------|------|
-| `sample.mode` | `baseline` / `dynamic` / `prudent` / `optimization` |
-| `sample.dynamic.time_boundary` | 大步跳跃与精修分界（默认约 650） |
-| `model.use_grad_fusion` | 是否启用梯度融合 |
-| `sample.scaffold` | 骨架约束（grow / evolve） |
+```bash
+python tools/checks.py
+node ui/tests/check-contracts.cjs
+python tools/project.py audit
+python tools/project.py export --destination /path/to/new-release-candidate
+```
 
-更多说明见 [README.en.md](README.en.md)、[SEEDFORGE.md](SEEDFORGE.md)。
+Checks use temporary runtime storage. Export uses an explicit allowlist and builds
+a flat repository candidate plus checksums. It never stages, commits, pushes,
+changes remotes or includes private research/runtime data.
 
-## 数据说明：仓库内 vs 自备
-
-| 内容 | 是否入库 | 说明 |
-|------|----------|------|
-| 源码、配置、脚本、Web | 是 | 本仓库主体 |
-| `pretrained_models/*.pt` | 是 | 预训练权重 ~64MB |
-| `data/`（CrossDocked 等） | 否 | 需自行准备测试口袋 |
-| `outputs/`、`experiments/` | 否 | 运行时生成 |
-
-## 致谢
-
-本项目基于 [TargetDiff](https://github.com/DeepGraphLearning/TargetDiff)（Guan et al., ICLR 2023）构建。感谢其在扩散模型结构化药物设计方面的奠基性工作。
+Checkpoint keys, historical PT graph names, strict loading, reconstruction policies,
+metrics, result directories and API role contracts are regression-tested.
+See `LICENSE`, source headers and `THIRD_PARTY_NOTICES.md` for retained attribution.

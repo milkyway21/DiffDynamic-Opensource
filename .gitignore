@@ -1,72 +1,59 @@
-# Python
+# Local research, snapshots, archives, inventories and release candidates
+/local/
+
+# Runtime state
+.cache/
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 *.py[cod]
 *.egg-info/
-*.egg
-dist/
 build/
-.eggs/
-*.so
+dist/
 .venv*/
-venv/
-env/
-
-# IDE / OS
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-.cursorignore
-.claude/
-CLAUDE.md
-
-# Runtime config (machine-local paths — never commit)
 server/server_config.json
+server/.internal_api_key
 .env
-.env.*
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.lock
 
-# Database (runtime)
-diffdynamic.db
-diffdynamic.db-shm
-diffdynamic.db-wal
-
-# Large data / outputs (download or generate separately)
-data/
-outputs/
-docktmp/
-experiments/
-third_party/
-tmp/
-backups/
-
-# Model weights and checkpoints (allow-list pretrained only)
+# Downloads and generated results
+/data/
+/uploads/
+/$upload/
+/outputs/
+/docktmp/
+/tmp/
+/tmp_bench/
+/experiments/
+/runs/
+/analysis/
+/ablationstudy/
+/diagnostics/
+/batchsummary/
+/pocket_quality_vis/
+/jsdpt3010*/
+/molecules_score_*/
+/fig7/
+/pics/
+/gspt1_handoff/
+/workspace-*/
+/.zcode/
+/.trae/
+/configs/prop/
+/configs/backups/
+/configs/run_*.yml
+/configs/cascade_*.yml
 *.pt
 *.pth
 *.ckpt
-!pretrained_models/
-!pretrained_models/pretrained_diffusion.pt
-!pretrained_models/pretrained_GlintDM.pt
-
-# Molecule / table artifacts
-*.sdf
-*.mol2
-*.pdbqt
-*.xlsx
-*.xls
-*.csv
-*.pkl
-*.pkl.gz
-
-# LMDB / scientific binaries
 *.lmdb
 *.lmdb-lock
-*.npy
-*.npz
-*.h5
-*.hdf5
+*.xlsx
+*.csv
+# Source assets in src/ and ui/ remain publication inputs; see publish-manifest.json.
 
-# Logs
-*.log
-server_run.log
+!src/diffdynamic/evaluation/fpscores.pkl.gz

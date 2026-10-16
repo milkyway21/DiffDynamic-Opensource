@@ -1,6 +1,4 @@
-"""Generate sampling steps description text for output metadata."""
-
-
-def generate_sampling_steps_text(config_dict):
-    """Return a text description of the sampling configuration steps."""
-    return ""
+"""Compatibility import for diffdynamic.analysis.sampling_steps."""
+import _diffdynamic_bootstrap
+from diffdynamic._compat import alias_module
+alias_module(__name__, "diffdynamic.analysis.sampling_steps")
