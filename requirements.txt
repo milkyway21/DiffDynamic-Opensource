@@ -1,23 +1,52 @@
-# DiffDynamic — core + web dependencies
-# Install into conda env `diffdynamic` (preferred) or: pip install -r requirements.txt
+# DiffDynamic — pinned Python dependencies (Python 3.8, CUDA 11.8)
+#
+# Install order on a fresh machine (details in README "Set up from scratch"):
+#
+#   conda create -n diffdynamic python=3.8 -y
+#   conda activate diffdynamic
+#   pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu118
+#   pip install torch_geometric==2.6.1
+#   pip install torch_scatter==2.1.2 torch_sparse==0.6.18 \
+#       -f https://data.pyg.org/whl/torch-2.4.1+cu118.html
+#   conda install -c conda-forge openbabel=3.1.0 -y
+#   pip install -r requirements.txt
+#   python -m pip install --no-deps --no-build-isolation -e .
+#
+# torch / torch_geometric / torch_scatter / torch_sparse are NOT listed below on
+# purpose: pip would resolve them against the wrong PyTorch/CUDA build. The GPU
+# graph extension wheels must match the installed PyTorch and CUDA version.
+# requirements-validated.txt is the exact record of the validated environment.
+#
+# openbabel provides the Python bindings used by reconstruction and docking
+# (`from openbabel import pybel`); install it via conda, not pip.
 
 # Web / API
-fastapi>=0.100.0
-uvicorn>=0.20.0
-sqlalchemy>=2.0
-pydantic>=1.10
-pyyaml>=5.4
-python-multipart>=0.0.5
+fastapi==0.124.4
+uvicorn==0.33.0
+sqlalchemy==2.0.32
+pydantic==2.10.6
+pyyaml==6.0.2
+python-multipart==0.0.20
 
-# Deep learning / chemistry (typically provided by conda env)
-torch>=1.12.0
-numpy>=1.21
-pandas>=1.3
-rdkit-pypi>=2022.3.0; platform_system!="Linux" or python_version>="3.9"
-scipy>=1.7
-tqdm>=4.62
-openpyxl>=3.0
-biopython>=1.79
+# Scientific stack / chemistry
+numpy==1.24.4
+scipy==1.10.1
+pandas==2.0.3
+scikit-learn==1.3.2
+rdkit==2024.3.5
+tqdm==4.67.1
+easydict==1.13
+lmdb==1.5.1
+psutil==6.0.0
+networkx==3.1
+matplotlib==3.7.3
+openpyxl==3.1.5
+biopython==1.83
 
-# Optional docking helpers (system AutoDock Vina still required)
-meeko>=0.5.0
+# Docking / validation
+meeko==0.1.dev3        # Python 3.8 pin; meeko >= 0.7 requires Python >= 3.9
+vina==1.2.2            # AutoDock Vina Python bindings used for scoring/docking
+
+# Test suite
+pytest==8.3.5
+httpx==0.28.1

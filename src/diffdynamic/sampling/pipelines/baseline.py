@@ -8,7 +8,7 @@ def run_baseline(args, model, data, config, logger):
     from diffdynamic.sampling.baseline import sample_diffusion_ligand
 
     pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, time_list, init_list = sample_diffusion_ligand(
-        model, data, config.sample.num_samples,
+        model, data, config.sample.get('num_samples', args.batch_size),
         batch_size=args.batch_size, device=args.device,
         num_steps=config.sample.num_steps,
         pos_only=config.sample.pos_only,

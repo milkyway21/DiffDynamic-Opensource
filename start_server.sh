@@ -107,12 +107,6 @@ if command -v ss &>/dev/null; then
   fi
 fi
 
-# ── Run DB migration if migration script exists ──────────────────────
-if [[ -f "server/migrate_db.py" ]]; then
-  echo "[INFO] Running DB migration..."
-  "$PYTHON_BIN" -m server.migrate_db || echo "[WARN] Migration reported issues (continuing)" 2>&1
-fi
-
 # ── Temp-file cleanup (docktmp + intermediate .pt only) ───────────────
 # Removes rebuildable scratch older than DD_CLEANUP_AGE_DAYS (default 7).
 # Disable with DD_CLEANUP_ON_START=0.
